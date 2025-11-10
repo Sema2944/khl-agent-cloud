@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+
+[project]
+name = "khl-agent"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "requests>=2.31",
+  "pandas>=2.1",
+  "numpy>=1.26",
+  "python-telegram-bot==21.6"
+]
