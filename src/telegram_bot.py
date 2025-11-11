@@ -1,66 +1,94 @@
 from __future__ import annotations
-import os, asyncio, pandas as pd, requests
+
+import os
+import logging
+from typing import Final
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-API_BASE = os.getenv("API_BASE", "https://khl-agent-api.onrender.com")
+log = logging.getLogger("svc.bot")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я KHL Agent. Команды: /bets, /refresh, /help")
+# ==== Handlers ===============================================================
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши /bets — пришлю демо-подборку. /refresh — переобновлю данные (демо).")
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "Привет! 🤖 Бот запущен и работает.\n\n"
+        "Команды:\n"
+        "/health — проверка\n"
+        "/bets — показать активные ставки\n"
+        "/addbet <текст> — добавить ставку\n"
+        "/clearbets <PIN> — очистить ставки\n"
+    )
+    await update.effective_chat.send_message(text)
 
-def _demo_rows():
-    # мини-демо строка для /bets без внешних ключей
-    return [{
-        "game_id": "demo1","date":"2025-11-10","team_id":"ЦСКА","opp_id":"Спартак","is_home":1,
-        "odds_1":1.95,"odds_x":3.60,"odds_2":3.50,"market":"1X2_60","selection":"best"
-    }]
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_chat.send_message("✅ Всё работает нормально!")
 
-def _call_bets(rows, edge_min=0.02, kelly_k=0.25, max_picks=5):
-    url = f"{API_BASE}/khl/bets_1x2"
-    payload = {"rows": rows, "edge_min": edge_min, "kelly_k": kelly_k, "max_picks": max_picks}
-    r = requests.post(url, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.json()
+# Заглушки под БД — команды останутся рабочими, логика хранения может быть в db.py
+async def cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # тут потом подставишь выборку из БД
+    await update.effective_chat.send_message("📊 Пока нет активных ставок.")
 
-def _fmt(p: dict) -> str:
-    m = {"1":"П1 (осн.)","X":"Ничья (осн.)","2":"П2 (осн.)"}
-    return (f"Матч: {p['home']} — {p['away']}\n"
-            f"Исход: {m.get(p['selection'], p['selection'])}\n"
-            f"Коэф.: {p['odds']:.2f}\n"
-            f"Модель p: {p['p_model']:.3f}\n"
-            f"Edge: {p['edge']:.3f}\n"
-            f"Ставка: {p['stake']:.2f}")
+async def cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    note = " ".join(context.args) if context.args else ""
+    if not note:
+        await update.effective_chat.send_message("Использование: /addbet <текст>")
+        return
+    # тут потом сохранишь в БД
+    await update.effective_chat.send_message(f"📝 Ставка добавлена: {note}")
 
-async def bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Считаю (демо)…")
-    try:
-        rows = _demo_rows()  # заменим на реальные снапшоты, когда подключим ключи
-        resp = _call_bets(rows)
-        picks = resp.get("picks", [])
-        if not picks:
-            await update.message.reply_text("Пока без value. Попробуй позже.")
-            return
-        text = "🎯 Рекомендации:\n\n" + "\n\n".join(_fmt(p) for p in picks[:5])
-        await update.message.reply_text(text)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+async def cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pin = " ".join(context.args) if context.args else ""
+    # при необходимости сверяй PIN через env
+    need_pin: Final[str] = os.getenv("ADMIN_PIN", "").strip()
+    if need_pin and pin != need_pin:
+        await update.effective_chat.send_message("❌ Неверный PIN.")
+        return
+    # тут очистишь БД
+    await update.effective_chat.send_message("🧹 Ставки очищены.")
 
-async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Обновляю (демо)… Готово ✓")
+async def on_text_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    txt = update.effective_message.text or ""
+    log.info("[BOT] text: %s", txt)
+    await update.effective_chat.send_message(f"Ты написал: {txt}")
 
-async def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+# ==== Builder ================================================================
+
+def build_bot_app() -> Application:
+    """
+    Создаёт и возвращает telegram.ext.Application.
+    НЕ запускает polling — это делает service.py через initialize/start/updater.start_polling.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("bets", bets))
-    app.add_handler(CommandHandler("refresh", refresh))
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения.")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .parse_mode(ParseMode.HTML)
+        .concurrent_updates(True)  # можно выключить, если не нужно
+        .build()
+    )
+
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("bets", cmd_bets))
+    app.add_handler(CommandHandler("addbet", cmd_addbet))
+    app.add_handler(CommandHandler("clearbets", cmd_clearbets))
+
+    # Эхо для обычного текста
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_echo))
+
+    return app
+
