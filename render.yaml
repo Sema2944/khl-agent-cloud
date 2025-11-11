@@ -6,25 +6,17 @@ services:
     buildCommand: pip install -e . && pip install python-telegram-bot==21.6
     startCommand: PYTHONPATH=. python scripts/serve.py
     envVars:
-      - key: CFG_PATH
-        value: configs/settings.yaml
       - key: API_BASE
-        # Render подставит реальный домен после деплоя; можно оставить так
         value: https://khl-agent-api.onrender.com
-      # (когда будут ключи) добавишь:
-      # - key: LSPORTS_API_KEY
-      #   sync: false
-      # - key: STATORIUM_API_KEY
-      #   sync: false
 
   - type: worker
     name: khl-agent-bot
     runtime: python
     plan: free
     buildCommand: pip install -e . && pip install python-telegram-bot==21.6
-    startCommand: python scripts/run_telegram.py
+    startCommand: PYTHONPATH=. python scripts/run_telegram.py
     envVars:
       - key: API_BASE
         value: https://khl-agent-api.onrender.com
       - key: TELEGRAM_BOT_TOKEN
-        sync: false   # введёшь секрет в панели Render
+        sync: false   # токен добавим через панель Render
