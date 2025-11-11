@@ -1,8 +1,9 @@
+# src/telegram_bot.py
 from __future__ import annotations
 
 import os
 import logging
-from typing import Final
+from typing import Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -12,71 +13,88 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    Defaults,
     filters,
 )
 
+from .db import async_session, Bet, Reminder  # модели БД, если нужны в хендлерах
+from sqlmodel import select
+
 log = logging.getLogger("svc.bot")
 
-# ==== Handlers ===============================================================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "Привет! 🤖 Бот запущен и работает.\n\n"
         "Команды:\n"
         "/health — проверка\n"
         "/bets — показать активные ставки\n"
         "/addbet <текст> — добавить ставку\n"
-        "/clearbets <PIN> — очистить ставки\n"
+        "/clearbets <PIN> — очистить"
     )
-    await update.effective_chat.send_message(text)
 
-async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_chat.send_message("✅ Всё работает нормально!")
 
-# Заглушки под БД — команды останутся рабочими, логика хранения может быть в db.py
-async def cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # тут потом подставишь выборку из БД
-    await update.effective_chat.send_message("📊 Пока нет активных ставок.")
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Всё работает нормально!")
 
-async def cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    note = " ".join(context.args) if context.args else ""
-    if not note:
-        await update.effective_chat.send_message("Использование: /addbet <текст>")
+
+async def cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with async_session() as session:
+        res = await session.exec(select(Bet).order_by(Bet.created_at.desc()).limit(20))
+        items = res.all()
+    if not items:
+        await update.message.reply_text("📊 Пока нет активных ставок.")
         return
-    # тут потом сохранишь в БД
-    await update.effective_chat.send_message(f"📝 Ставка добавлена: {note}")
+    lines = [f"• #{b.id}: {b.text}" for b in items]
+    await update.message.reply_text("📊 Активные ставки:\n" + "\n".join(lines))
 
-async def cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pin = " ".join(context.args) if context.args else ""
-    # при необходимости сверяй PIN через env
-    need_pin: Final[str] = os.getenv("ADMIN_PIN", "").strip()
-    if need_pin and pin != need_pin:
-        await update.effective_chat.send_message("❌ Неверный PIN.")
+
+async def cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /addbet <текст>")
         return
-    # тут очистишь БД
-    await update.effective_chat.send_message("🧹 Ставки очищены.")
+    bet = Bet(text=text)
+    async with async_session() as session:
+        session.add(bet)
+        await session.commit()
+        await session.refresh(bet)
+    await update.message.reply_text(f"✅ Ставка добавлена: #{bet.id}")
 
-async def on_text_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    txt = update.effective_message.text or ""
-    log.info("[BOT] text: %s", txt)
-    await update.effective_chat.send_message(f"Ты написал: {txt}")
 
-# ==== Builder ================================================================
+async def cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pin = (context.args[0].strip() if context.args else "")
+    admin_pin = os.getenv("ADMIN_PIN", "")
+    if not admin_pin or pin != admin_pin:
+        await update.message.reply_text("❌ Неверный PIN.")
+        return
+    async with async_session() as session:
+        # мягкая очистка таблицы ставок
+        res = await session.exec(select(Bet))
+        for b in res:
+            await session.delete(b)
+        await session.commit()
+    await update.message.reply_text("🧹 Готово, ставки очищены.")
 
-def build_bot_app() -> Application:
-    """
-    Создаёт и возвращает telegram.ext.Application.
-    НЕ запускает polling — это делает service.py через initialize/start/updater.start_polling.
-    """
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения.")
+
+async def echo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # простая заглушка на любые тексты
+    await update.message.reply_text("Команда не распознана. Напишите /start.")
+
+
+async def build_bot_app() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+
+    # ВАЖНО: parse_mode через Defaults
+    defaults = Defaults(parse_mode=ParseMode.HTML)
 
     app = (
         ApplicationBuilder()
-        .token(token)
-        .parse_mode(ParseMode.HTML)
-        .concurrent_updates(True)  # можно выключить, если не нужно
+        .token(BOT_TOKEN)
+        .defaults(defaults)
         .build()
     )
 
@@ -87,8 +105,9 @@ def build_bot_app() -> Application:
     app.add_handler(CommandHandler("addbet", cmd_addbet))
     app.add_handler(CommandHandler("clearbets", cmd_clearbets))
 
-    # Эхо для обычного текста
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_echo))
+    # Фоллбек на текст
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_text))
 
     return app
+
 
