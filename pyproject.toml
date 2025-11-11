@@ -1,47 +1,23 @@
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "khl-agent"
 version = "0.1.0"
-description = "KHL Agent Telegram Bot with FastAPI backend"
+description = ""
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
-    "pydantic>=2.7",
-    "requests>=2.31",
-    "pandas>=2.1",
-    "numpy>=1.26",
-    "python-telegram-bot==21.6",
-    "sqlmodel>=0.0.22",
-    "sqlalchemy>=2.0",
-    "aiosqlite>=0.19.0"
+  "fastapi>=0.121.1",
+  "uvicorn[standard]>=0.38.0",
+  "pydantic>=2.12.4",
+  "requests>=2.31.0",
+  "pandas>=2.3.3",
+  "numpy>=2.3.4",
+  "python-telegram-bot==21.6",
+  "sqlmodel>=0.0.27",
+  "sqlalchemy>=2.0",
+  "aiosqlite>=0.21.0",
+  "httpx>=0.28.1",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"*" = ["*.yaml", "*.json", "*.db"]
-
-[tool.poetry]
-name = "khl-agent"
-version = "0.1.0"
-description = "Telegram bot for KHL Agent service"
-authors = ["Sema2944 <you@example.com>"]
-
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-fastapi = ">=0.115"
-uvicorn = {extras = ["standard"], version = ">=0.30"}
-pydantic = ">=2.7"
-requests = ">=2.31"
-pandas = ">=2.1"
-numpy = ">=1.26"
-python-telegram-bot = "==21.6"
-sqlmodel = ">=0.0.22"
-sqlalchemy = ">=2.0"
-aiosqlite = ">=0.19.0"
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
