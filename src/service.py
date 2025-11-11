@@ -2,130 +2,238 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional
-
+from datetime import datetime, timedelta
 from fastapi import FastAPI
-from pydantic import BaseModel
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     filters,
+    ContextTypes,
 )
+from sqlmodel import select
+from .db import init_db, async_session, Bet, Reminder
 
+# --- Настройки логирования ---
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("svc")
 
+# --- Основное приложение FastAPI ---
 app = FastAPI(title="KHL Agent API")
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "time": datetime.utcnow().isoformat()}
+_bot_app: Application | None = None
+_bot_task: asyncio.Task | None = None
+_reminder_task: asyncio.Task | None = None
 
-class EchoReq(BaseModel):
-    text: str
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_PIN = os.getenv("ADMIN_PIN", "1234")
 
-@app.post("/echo")
-def echo(body: EchoReq):
-    return {"echo": body.text}
 
-# ---------- Telegram ----------
-_TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-_bot_task: Optional[asyncio.Task] = None
-_bot_app = None
-_stop_event: Optional[asyncio.Event] = None
+# ========================
+# Telegram-команды
+# ========================
 
-# --- handlers ---
-async def _cmd_start(update: Update, context):
-    await update.message.reply_text(
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
         "Привет! 🤖 Бот запущен и работает.\n\n"
         "Команды:\n"
         "/health — проверка\n"
-        "/bets — показать активные ставки (пока заглушка)\n"
-        "/addbet <текст> — добавить ставку (заглушка)\n"
-        "/clearbets <PIN> — очистить (заглушка)"
+        "/bets — показать активные ставки\n"
+        "/addbet <текст> — добавить ставку\n"
+        "/clearbets <PIN> — очистить ставки\n"
+        "/remind <текст> через Nмин|Nчас|Nд — напоминание\n"
     )
+    await update.message.reply_text(text)
 
-async def _cmd_health(update: Update, context):
+
+async def _cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Всё работает нормально!")
 
-async def _cmd_bets(update: Update, context):
-    await update.message.reply_text("📊 Пока нет активных ставок.")
 
-async def _on_text(update: Update, context):
-    if update.message and update.message.text:
-        await update.message.reply_text(f"Ты написал: {update.message.text}")
+async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text("Использование: /addbet <текст ставки>")
+        return
+    user = update.effective_user
+    async with async_session() as s:
+        bet = Bet(user_id=user.id, username=user.username, text=text)
+        s.add(bet)
+        await s.commit()
+        await s.refresh(bet)
+    await update.message.reply_text(f"✅ Ставка сохранена (#{bet.id})")
 
-def _build_application():
-    if not _TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
-    app = (
-        ApplicationBuilder()
-        .token(_TELEGRAM_TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", _cmd_start))
-    app.add_handler(CommandHandler("health", _cmd_health))
-    app.add_handler(CommandHandler("bets", _cmd_bets))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
-    return app
+
+async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with async_session() as s:
+        res = await s.exec(select(Bet).order_by(Bet.id.desc()).limit(10))
+        rows = list(res)
+    if not rows:
+        await update.message.reply_text("📊 Пока нет активных ставок.")
+        return
+    lines = [f"#{b.id} [{b.username or b.user_id}] {b.text}" for b in rows]
+    await update.message.reply_text("Последние ставки:\n" + "\n".join(lines))
+
+
+async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pin = context.args[0] if context.args else ""
+    if pin != ADMIN_PIN:
+        await update.message.reply_text("❌ Неверный PIN.")
+        return
+    async with async_session() as s:
+        await s.exec("DELETE FROM bet")
+        await s.commit()
+    await update.message.reply_text("🗑️ Все ставки очищены.")
+
+
+# ========================
+# Напоминания
+# ========================
+
+def _parse_delay(args: list[str]) -> timedelta | None:
+    joined = " ".join(args).lower()
+    if "через" not in joined:
+        return None
+    after = joined.split("через", 1)[1].strip()
+    num = ""
+    unit = ""
+    for ch in after:
+        if ch.isdigit():
+            num += ch
+        elif ch.isalpha():
+            unit += ch
+        elif ch.isspace():
+            continue
+        else:
+            break
+    if not num:
+        return None
+    n = int(num)
+    if unit.startswith("мин"):
+        return timedelta(minutes=n)
+    if unit.startswith("час"):
+        return timedelta(hours=n)
+    if unit.startswith("д"):
+        return timedelta(days=n)
+    return None
+
+
+async def _cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /remind <текст> через <Nмин|Nчас|Nд>")
+        return
+    delay = _parse_delay(args)
+    if not delay:
+        await update.message.reply_text("Не понял время. Пример: /remind Позвонить через 15мин")
+        return
+    text = " ".join(args).split("через")[0].strip()
+    if not text:
+        await update.message.reply_text("Укажи текст напоминания до слова 'через'.")
+        return
+    run_at = datetime.utcnow() + delay
+    async with async_session() as s:
+        r = Reminder(
+            user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            text=text,
+            run_at=run_at,
+        )
+        s.add(r)
+        await s.commit()
+        await s.refresh(r)
+    await update.message.reply_text(f"⏰ Напоминание #{r.id} запланировано.")
+
+
+async def _reminder_worker():
+    try:
+        while True:
+            now = datetime.utcnow()
+            async with async_session() as s:
+                res = await s.exec(
+                    select(Reminder).where(Reminder.done == False, Reminder.run_at <= now)
+                )
+                due = list(res)
+                for r in due:
+                    try:
+                        await _bot_app.bot.send_message(chat_id=r.chat_id, text=f"🔔 Напоминание: {r.text}")
+                        r.done = True
+                        s.add(r)
+                        await s.commit()
+                    except Exception as e:
+                        log.error("[REM] Ошибка отправки: %s", e)
+            await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        log.info("[REM] Воркер остановлен.")
+
+
+# ========================
+# Telegram Bot запуск
+# ========================
 
 async def _run_bot_polling():
-    """
-    Инициализируем и запускаем PTB в уже идущем uvicorn event loop
-    без run_polling(), чтобы не трогать цикл.
-    """
-    global _bot_app, _stop_event
-    _stop_event = asyncio.Event()
-    _bot_app = _build_application()
+    global _bot_app
+    log.info("[BOT] Запускаю polling…")
 
-    # 1) initialize PTB (создает внутренние ресурсы)
-    await _bot_app.initialize()
-
-    # 2) start PTB (поднимает Request, JobQueue и т.п.)
-    await _bot_app.start()
-
-    # 3) запуск getUpdates-поллинга (drop старых апдейтов)
-    #    ВАЖНО: здесь НЕТ собственного event loop-менеджмента
-    await _bot_app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+    _bot_app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
     )
 
-    log.info("[BOT] Polling запущен")
+    _bot_app.add_handler(CommandHandler("start", _cmd_start))
+    _bot_app.add_handler(CommandHandler("health", _cmd_health))
+    _bot_app.add_handler(CommandHandler("addbet", _cmd_addbet))
+    _bot_app.add_handler(CommandHandler("bets", _cmd_bets))
+    _bot_app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
+    _bot_app.add_handler(CommandHandler("remind", _cmd_remind))
+    _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _cmd_start))
 
-    # 4) ждем сигнала остановки
-    await _stop_event.wait()
+    try:
+        await _bot_app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,
+            drop_pending_updates=True,
+        )
+    except Exception as e:
+        log.error("[BOT] Ошибка в run_polling: %s", e)
 
-    log.info("[BOT] Останавливаюсь…")
 
-    # 5) остановка поллинга и приложения в обратном порядке
-    await _bot_app.updater.stop()
-    await _bot_app.stop()
-    await _bot_app.shutdown()
+# ========================
+# FastAPI endpoints
+# ========================
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 
 @app.on_event("startup")
 async def on_startup():
-    global _bot_task
-    if _bot_task is None:
-        log.info("[BOT] Создаю фоновую задачу polling")
+    log.info("[APP] Запуск приложения...")
+    await init_db()
+    global _bot_task, _reminder_task
+    if _bot_task is None or _bot_task.done():
         _bot_task = asyncio.create_task(_run_bot_polling())
+    if _reminder_task is None or _reminder_task.done():
+        _reminder_task = asyncio.create_task(_reminder_worker())
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _bot_task, _stop_event
+    log.info("[APP] Остановка приложения...")
+    global _bot_task, _reminder_task
     try:
-        if _stop_event is not None:
-            _stop_event.set()
-        if _bot_task is not None and not _bot_task.done():
-            # дождаться корректной остановки
-            await _bot_task
+        if _bot_task:
+            _bot_task.cancel()
     except Exception as e:
         log.warning("[BOT] Ошибка при остановке: %s", e)
-    finally:
-        _bot_task = None
+    try:
+        if _reminder_task:
+            _reminder_task.cancel()
+    except Exception as e:
+        log.warning("[REM] Ошибка при остановке: %s", e)
+
 
 
