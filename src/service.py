@@ -4,29 +4,26 @@ import asyncio
 import os
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-# --- FastAPI приложение ---
 app = FastAPI(title="KHL Agent API")
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
-# --- Telegram bot (python-telegram-bot) ---
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+# ---------- Telegram Bot ----------
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram import Update
 
 API_BASE = os.getenv("API_BASE", "https://khl-agent-api.onrender.com")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Глобальная ссылка на приложение бота и задачу
 _bot_app = None
 _bot_task: asyncio.Task | None = None
 
-# Команды бота (минимум)
+# Команды
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я KHL Agent. Команды: /bets, /refresh, /health")
+    await update.message.reply_text("Привет! Я KHL Agent. Команды: /bets /refresh /health")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Доступно: /bets — демо; /refresh — обновить; /health — пинг API")
@@ -42,33 +39,45 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{API_BASE}/healthz")
-            await update.message.reply_text(f"API /healthz → {r.status_code}: {r.text}")
+        await update.message.reply_text(f"API /healthz → {r.status_code}: {r.text}")
     except Exception as e:
         await update.message.reply_text(f"Ошибка запроса к API: {e}")
 
+# Эхо + лог входящих апдейтов (для диагностики)
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uname = update.effective_user.username if update.effective_user else "unknown"
+        txt = update.message.text if update.message else ""
+        print(f"[BOT] Incoming message from @{uname}: {txt}")
+    except Exception:
+        print("[BOT] Incoming update (no text)")
+    if update.message and update.message.text:
+        await update.message.reply_text("Эхо: " + update.message.text[:200])
+
 async def _run_bot_polling():
-    """Фоновая задача: запустить polling и держать бота активным."""
     global _bot_app
     if not TELEGRAM_BOT_TOKEN:
         print("[BOT] TELEGRAM_BOT_TOKEN не задан — бот не будет запущен")
         return
 
     _bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Регистрация команд
     _bot_app.add_handler(CommandHandler("start", start_cmd))
     _bot_app.add_handler(CommandHandler("help", help_cmd))
     _bot_app.add_handler(CommandHandler("bets", bets_cmd))
     _bot_app.add_handler(CommandHandler("refresh", refresh_cmd))
     _bot_app.add_handler(CommandHandler("health", health_cmd))
 
+    # Эхо-хэндлер для всех текстов без слеша — ПОСЛЕ команд
+    _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
     print("[BOT] Запускаю polling…")
-    # run_polling — корутина; будет работать пока не отменят задачу
     await _bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Хуки FastAPI старта/остановки
 @app.on_event("startup")
 async def on_startup():
     global _bot_task
-    # Запускаем бота фоном, если есть токен
     if TELEGRAM_BOT_TOKEN and (_bot_task is None or _bot_task.done()):
         loop = asyncio.get_running_loop()
         _bot_task = loop.create_task(_run_bot_polling())
@@ -77,7 +86,6 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     global _bot_app, _bot_task
-    # Аккуратно останавливаем бота
     try:
         if _bot_app is not None:
             await _bot_app.shutdown()
@@ -94,3 +102,4 @@ async def on_shutdown():
             pass
         _bot_task = None
         print("[BOT] Фоновая задача остановлена")
+
