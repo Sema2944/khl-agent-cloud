@@ -1,33 +1,114 @@
-# src/service.py
-import os
+# === BOT LIFECYCLE (без run_polling) ===
+from telegram import Update
+from .telegram_bot import build_bot_app  # как у тебя раньше
+
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from fastapi import FastAPI
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-from sqlmodel import select
-from .db import init_db, async_session, Bet, Reminder
 
-# --- Настройки логирования ---
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("svc")
 
-# --- Основное приложение FastAPI ---
-app = FastAPI(title="KHL Agent API")
-
-_bot_app: Application | None = None
+_bot_app = None        # type: ignore
 _bot_task: asyncio.Task | None = None
-_reminder_task: asyncio.Task | None = None
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_PIN = os.getenv("ADMIN_PIN", "1234")
+async def _bot_start() -> None:
+    """Инициализация и старт polling без блокировки event loop."""
+    global _bot_app
+    if _bot_app is None:
+        _bot_app = build_bot_app()
+    try:
+        # ВАЖНО: три шага вместо run_polling
+        await _bot_app.initialize()
+        await _bot_app.start()
+        await _bot_app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        log.info("[BOT] Polling started")
+    except Exception as e:
+        log.exception("[BOT] Ошибка при запуске polling: %s", e)
+
+async def _bot_stop() -> None:
+    """Корректная остановка polling и приложения бота."""
+    if _bot_app is None:
+        return
+    try:
+        # Останавливаем polling, затем само приложение
+        await _bot_app.updater.stop()
+    except Exception as e:
+        log.warning("[BOT] updater.stop() error: %s", e)
+    try:
+        await _bot_app.stop()
+        await _bot_app.shutdown()
+    except Exception as e:
+        log.warning("[BOT] stop/shutdown error: %s", e)
+    log.info("[BOT] Stopped")
+
+
+# === ВКЛЮЧЕНИЕ В СТАРТ/ШАТДАУН FASTAPI ===
+from fastapi import FastAPI
+
+app = FastAPI()
+
+# если у тебя есть init_db() — вызывай здесь же
+from .db import init_db
+@app.on_event("startup")
+async def on_startup():
+    log.info("[APP] Запуск приложения...")
+    await init_db()
+
+    # стартуем LINE-воркер, если он у тебя есть
+    # (оставь как было; ниже пример, если уже реализовал)
+    global _line_task
+    try:
+        _line_task  # просто обращаемся, чтобы mypy не ругался
+    except NameError:
+        _line_task = None  # если нет — игнорируй
+
+    if _line_task is None:
+        try:
+            _line_task = asyncio.create_task(_upsert_line())  # если функция есть в файле
+            log.info("[LINE] Background task started")
+        except NameError:
+            pass  # если нет линии — ничего
+
+    # стартуем бота неблокирующим таском
+    global _bot_task
+    if _bot_task is None:
+        _bot_task = asyncio.create_task(_bot_start())
+        log.info("[BOT] Запускаю polling…")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    log.info("[APP] Остановка приложения...")
+
+    # останавливаем бота
+    await _bot_stop()
+    global _bot_task
+    if _bot_task:
+        try:
+            await _bot_task
+        except Exception:
+            pass
+        _bot_task = None
+
+    # останавливаем LINE-воркер (если он есть)
+    global _line_task
+    try:
+        if _line_task:
+            _line_task.cancel()
+            try:
+                await _line_task
+            except asyncio.CancelledError:
+                pass
+            _line_task = None
+    except NameError:
+        pass  # линии нет — ок
+
+
+# === Простейший health endpoint (оставь твой, если уже есть) ===
+@app.get("/")
+async def root():
+    return {"ok": True}
 
 
 # ========================
