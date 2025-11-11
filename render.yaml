@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -e . && pip install python-telegram-bot==21.6
-    startCommand: python scripts/serve.py
+    startCommand: PYTHONPATH=. python scripts/serve.py
     envVars:
       - key: CFG_PATH
         value: configs/settings.yaml
