@@ -1,4 +1,9 @@
-import uvicorn, os
-if __name__ == "__main__":
-    port = int(os.getenv("PORT","8000"))
-    uvicorn.run("src.service:app", host="0.0.0.0", port=port, reload=False)
+# src/service.py
+from fastapi import FastAPI
+
+# ВАЖНО: имя ПЕРЕМЕННОЙ — именно "app"
+app = FastAPI(title="KHL Agent API")
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
