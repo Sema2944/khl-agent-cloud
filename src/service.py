@@ -1,320 +1,171 @@
-# === BOT LIFECYCLE (без run_polling) ===
-from telegram import Update
-from .telegram_bot import build_bot_app  # как у тебя раньше
+# src/service.py
+from __future__ import annotations
 
+import os
 import asyncio
 import logging
+from contextlib import suppress
+from typing import Optional
 
+from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+
+from telegram import Update
+from telegram.ext import ContextTypes
+
+# твои модули
+from .telegram_bot import build_bot_app
+from .db import init_db, async_session, Bet, Reminder  # если Bet/Reminder понадобятся в ручках
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("svc")
 
-_bot_app = None        # type: ignore
-_bot_task: asyncio.Task | None = None
+app = FastAPI(title="KHL Agent API")
 
-async def _bot_start() -> None:
-    """Инициализация и старт polling без блокировки event loop."""
-    global _bot_app
-    if _bot_app is None:
-        _bot_app = build_bot_app()
-    try:
-        # ВАЖНО: три шага вместо run_polling
-        await _bot_app.initialize()
-        await _bot_app.start()
-        await _bot_app.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        log.info("[BOT] Polling started")
-    except Exception as e:
-        log.exception("[BOT] Ошибка при запуске polling: %s", e)
-
-async def _bot_stop() -> None:
-    """Корректная остановка polling и приложения бота."""
-    if _bot_app is None:
-        return
-    try:
-        # Останавливаем polling, затем само приложение
-        await _bot_app.updater.stop()
-    except Exception as e:
-        log.warning("[BOT] updater.stop() error: %s", e)
-    try:
-        await _bot_app.stop()
-        await _bot_app.shutdown()
-    except Exception as e:
-        log.warning("[BOT] stop/shutdown error: %s", e)
-    log.info("[BOT] Stopped")
+# Глобальные ссылки на приложение бота и фоновую таску polling
+_bot_app = None
+_bot_task: Optional[asyncio.Task] = None
 
 
-# === ВКЛЮЧЕНИЕ В СТАРТ/ШАТДАУН FASTAPI ===
-from fastapi import FastAPI
-
-app = FastAPI()
-
-# если у тебя есть init_db() — вызывай здесь же
-from .db import init_db
-@app.on_event("startup")
-async def on_startup():
-    log.info("[APP] Запуск приложения...")
-    await init_db()
-
-    # стартуем LINE-воркер, если он у тебя есть
-    # (оставь как было; ниже пример, если уже реализовал)
-    global _line_task
-    try:
-        _line_task  # просто обращаемся, чтобы mypy не ругался
-    except NameError:
-        _line_task = None  # если нет — игнорируй
-
-    if _line_task is None:
-        try:
-            _line_task = asyncio.create_task(_upsert_line())  # если функция есть в файле
-            log.info("[LINE] Background task started")
-        except NameError:
-            pass  # если нет линии — ничего
-
-    # стартуем бота неблокирующим таском
-    global _bot_task
-    if _bot_task is None:
-        _bot_task = asyncio.create_task(_bot_start())
-        log.info("[BOT] Запускаю polling…")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    log.info("[APP] Остановка приложения...")
-
-    # останавливаем бота
-    await _bot_stop()
-    global _bot_task
-    if _bot_task:
-        try:
-            await _bot_task
-        except Exception:
-            pass
-        _bot_task = None
-
-    # останавливаем LINE-воркер (если он есть)
-    global _line_task
-    try:
-        if _line_task:
-            _line_task.cancel()
-            try:
-                await _line_task
-            except asyncio.CancelledError:
-                pass
-            _line_task = None
-    except NameError:
-        pass  # линии нет — ок
-
-
-# === Простейший health endpoint (оставь твой, если уже есть) ===
-@app.get("/")
+@app.get("/", response_class=PlainTextResponse)
 async def root():
-    return {"ok": True}
+    return "OK"
 
 
-# ========================
-# Telegram-команды
-# ========================
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "healthy"
 
+
+# ==== Примеры команд-хендлеров, которые регистрируются в telegram_bot.build_bot_app ====
+# Оставлены тут, если тебе нужно быстро подсмотреть сигнатуры
 async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "Привет! 🤖 Бот запущен и работает.\n\n"
         "Команды:\n"
         "/health — проверка\n"
         "/bets — показать активные ставки\n"
         "/addbet <текст> — добавить ставку\n"
-        "/clearbets <PIN> — очистить ставки\n"
-        "/remind <текст> через Nмин|Nчас|Nд — напоминание\n"
+        "/clearbets <PIN> — очистить"
     )
-    await update.message.reply_text(text)
 
 
 async def _cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Всё работает нормально!")
 
 
-async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args) if context.args else ""
-    if not text:
-        await update.message.reply_text("Использование: /addbet <текст ставки>")
-        return
-    user = update.effective_user
-    async with async_session() as s:
-        bet = Bet(user_id=user.id, username=user.username, text=text)
-        s.add(bet)
-        await s.commit()
-        await s.refresh(bet)
-    await update.message.reply_text(f"✅ Ставка сохранена (#{bet.id})")
-
-
 async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with async_session() as s:
-        res = await s.exec(select(Bet).order_by(Bet.id.desc()).limit(10))
-        rows = list(res)
-    if not rows:
+    # пример чтения из БД
+    from sqlmodel import select
+    async with async_session() as session:
+        res = await session.exec(select(Bet).order_by(Bet.created_at.desc()))
+        items = res.all()
+    if not items:
         await update.message.reply_text("📊 Пока нет активных ставок.")
         return
-    lines = [f"#{b.id} [{b.username or b.user_id}] {b.text}" for b in rows]
-    await update.message.reply_text("Последние ставки:\n" + "\n".join(lines))
+    lines = [f"• #{b.id}: {b.text}" for b in items[:20]]
+    await update.message.reply_text("📊 Активные ставки:\n" + "\n".join(lines))
 
 
-async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pin = context.args[0] if context.args else ""
-    if pin != ADMIN_PIN:
-        await update.message.reply_text("❌ Неверный PIN.")
-        return
-    async with async_session() as s:
-        await s.exec("DELETE FROM bet")
-        await s.commit()
-    await update.message.reply_text("🗑️ Все ставки очищены.")
-
-
-# ========================
-# Напоминания
-# ========================
-
-def _parse_delay(args: list[str]) -> timedelta | None:
-    joined = " ".join(args).lower()
-    if "через" not in joined:
-        return None
-    after = joined.split("через", 1)[1].strip()
-    num = ""
-    unit = ""
-    for ch in after:
-        if ch.isdigit():
-            num += ch
-        elif ch.isalpha():
-            unit += ch
-        elif ch.isspace():
-            continue
-        else:
-            break
-    if not num:
-        return None
-    n = int(num)
-    if unit.startswith("мин"):
-        return timedelta(minutes=n)
-    if unit.startswith("час"):
-        return timedelta(hours=n)
-    if unit.startswith("д"):
-        return timedelta(days=n)
-    return None
-
-
-async def _cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-    if not args:
-        await update.message.reply_text("Использование: /remind <текст> через <Nмин|Nчас|Nд>")
-        return
-    delay = _parse_delay(args)
-    if not delay:
-        await update.message.reply_text("Не понял время. Пример: /remind Позвонить через 15мин")
-        return
-    text = " ".join(args).split("через")[0].strip()
-    if not text:
-        await update.message.reply_text("Укажи текст напоминания до слова 'через'.")
-        return
-    run_at = datetime.utcnow() + delay
-    async with async_session() as s:
-        r = Reminder(
-            user_id=update.effective_user.id,
-            chat_id=update.effective_chat.id,
-            text=text,
-            run_at=run_at,
-        )
-        s.add(r)
-        await s.commit()
-        await s.refresh(r)
-    await update.message.reply_text(f"⏰ Напоминание #{r.id} запланировано.")
-
-
-async def _reminder_worker():
-    try:
-        while True:
-            now = datetime.utcnow()
-            async with async_session() as s:
-                res = await s.exec(
-                    select(Reminder).where(Reminder.done == False, Reminder.run_at <= now)
-                )
-                due = list(res)
-                for r in due:
-                    try:
-                        await _bot_app.bot.send_message(chat_id=r.chat_id, text=f"🔔 Напоминание: {r.text}")
-                        r.done = True
-                        s.add(r)
-                        await s.commit()
-                    except Exception as e:
-                        log.error("[REM] Ошибка отправки: %s", e)
-            await asyncio.sleep(10)
-    except asyncio.CancelledError:
-        log.info("[REM] Воркер остановлен.")
-
-
-# ========================
-# Telegram Bot запуск
-# ========================
-
-async def _run_bot_polling():
-    global _bot_app
-    log.info("[BOT] Запускаю polling…")
-
-    _bot_app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
-
-    _bot_app.add_handler(CommandHandler("start", _cmd_start))
-    _bot_app.add_handler(CommandHandler("health", _cmd_health))
-    _bot_app.add_handler(CommandHandler("addbet", _cmd_addbet))
-    _bot_app.add_handler(CommandHandler("bets", _cmd_bets))
-    _bot_app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
-    _bot_app.add_handler(CommandHandler("remind", _cmd_remind))
-    _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _cmd_start))
-
-    try:
-        await _bot_app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False,
-            drop_pending_updates=True,
-        )
-    except Exception as e:
-        log.error("[BOT] Ошибка в run_polling: %s", e)
-
-
-# ========================
-# FastAPI endpoints
-# ========================
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
+# ========================= Жизненный цикл FastAPI =========================
 
 @app.on_event("startup")
 async def on_startup():
+    global _bot_app, _bot_task
+
     log.info("[APP] Запуск приложения...")
+    # 1) Инициализируем БД (создаст таблицы, если их нет)
     await init_db()
-    global _bot_task, _reminder_task
-    if _bot_task is None or _bot_task.done():
-        _bot_task = asyncio.create_task(_run_bot_polling())
-    if _reminder_task is None or _reminder_task.done():
-        _reminder_task = asyncio.create_task(_reminder_worker())
+
+    # 2) Строим приложение Telegram-бота
+    #    Внутри build_bot_app ты регистрируешь хендлеры (команды, сообщения и т.д.)
+    _bot_app = await build_bot_app()
+
+    # 3) Запускаем polling НЕ блокирующим способом
+    #    run_polling вызывать нельзя (он пытается рулить своим loop), поэтому вручную:
+    async def _polling():
+        try:
+            log.info("[BOT] Инициализация...")
+            await _bot_app.initialize()
+            await _bot_app.start()
+            # Важно: использовать updater.start_polling внутри уже запущенного event loop.
+            await _bot_app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                poll_interval=1.0,
+                bootstrap_retries=0,
+                drop_pending_updates=True,
+            )
+            log.info("[BOT] Polling запущен")
+            # Ждём, пока нас не отменят при shutdown
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            # Нормальная остановка
+            log.info("[BOT] Остановка (cancelled)")
+            raise
+        except Exception as e:
+            log.error("[BOT] Ошибка в polling: %s", e, exc_info=True)
+        finally:
+            # Аккуратная остановка апдейтера/приложения
+            with suppress(Exception):
+                if _bot_app.updater:
+                    await _bot_app.updater.stop()
+            with suppress(Exception):
+                await _bot_app.stop()
+            with suppress(Exception):
+                await _bot_app.shutdown()
+            log.info("[BOT] Остановлен")
+
+    log.info("[BOT] Запускаю polling…")
+    _bot_task = asyncio.create_task(_polling(), name="tg-polling")
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    global _bot_task
     log.info("[APP] Остановка приложения...")
-    global _bot_task, _reminder_task
-    try:
-        if _bot_task:
-            _bot_task.cancel()
-    except Exception as e:
-        log.warning("[BOT] Ошибка при остановке: %s", e)
-    try:
-        if _reminder_task:
-            _reminder_task.cancel()
-    except Exception as e:
-        log.warning("[REM] Ошибка при остановке: %s", e)
+    # Останавливаем фонового бота
+    if _bot_task and not _bot_task.done():
+        _bot_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _bot_task
+    log.info("[APP] Остановлено.")
+
+
+# ========================= Примеры HTTP-ручек к БД (по желанию) =========================
+
+from pydantic import BaseModel
+
+
+class AddBetBody(BaseModel):
+    text: str
+
+
+@app.post("/api/bets")
+async def add_bet(body: AddBetBody):
+    """Добавить ставку через HTTP (опционально, для интеграций)."""
+    from sqlmodel import select
+    bet = Bet(text=body.text)
+    async with async_session() as session:
+        session.add(bet)
+        await session.commit()
+        await session.refresh(bet)
+        # вернём последние 10 ставок
+        res = await session.exec(select(Bet).order_by(Bet.created_at.desc()).limit(10))
+        latest = res.all()
+    return {"ok": True, "created": {"id": bet.id, "text": bet.text}, "latest": [
+        {"id": b.id, "text": b.text} for b in latest
+    ]}
+
+
+@app.get("/api/bets")
+async def list_bets():
+    from sqlmodel import select
+    async with async_session() as session:
+        res = await session.exec(select(Bet).order_by(Bet.created_at.desc()).limit(50))
+        items = res.all()
+    return [{"id": b.id, "text": b.text} for b in items]
 
 
 
