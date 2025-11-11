@@ -20,7 +20,6 @@ log = logging.getLogger("svc")
 
 app = FastAPI(title="KHL Agent API")
 
-# ---------- Простые ручки ----------
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
@@ -32,11 +31,13 @@ class EchoReq(BaseModel):
 def echo(body: EchoReq):
     return {"echo": body.text}
 
-# ---------- Telegram Bot ----------
+# ---------- Telegram ----------
 _TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 _bot_task: Optional[asyncio.Task] = None
-_bot_app = None  # PTB Application
+_bot_app = None
+_stop_event: Optional[asyncio.Event] = None
 
+# --- handlers ---
 async def _cmd_start(update: Update, context):
     await update.message.reply_text(
         "Привет! 🤖 Бот запущен и работает.\n\n"
@@ -60,82 +61,71 @@ async def _on_text(update: Update, context):
 def _build_application():
     if not _TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
-    return (
+    app = (
         ApplicationBuilder()
         .token(_TELEGRAM_TOKEN)
-        .concurrent_updates(True)  # немного повышает устойчивость
+        .concurrent_updates(True)
         .build()
     )
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("health", _cmd_health))
+    app.add_handler(CommandHandler("bets", _cmd_bets))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
+    return app
 
 async def _run_bot_polling():
     """
-    Фоновая корутина polling’а. Делает мягкие ретраи при Conflict/сетевых сбоях.
-    Не закрывает event loop uvicorn (close_loop=False).
+    Инициализируем и запускаем PTB в уже идущем uvicorn event loop
+    без run_polling(), чтобы не трогать цикл.
     """
-    global _bot_app
+    global _bot_app, _stop_event
+    _stop_event = asyncio.Event()
     _bot_app = _build_application()
 
-    # хэндлеры
-    _bot_app.add_handler(CommandHandler("start", _cmd_start))
-    _bot_app.add_handler(CommandHandler("health", _cmd_health))
-    _bot_app.add_handler(CommandHandler("bets", _cmd_bets))
-    _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
+    # 1) initialize PTB (создает внутренние ресурсы)
+    await _bot_app.initialize()
 
-    backoff = 1
-    max_backoff = 30
+    # 2) start PTB (поднимает Request, JobQueue и т.п.)
+    await _bot_app.start()
 
-    while True:
-        try:
-            log.info("[BOT] Запускаю polling…")
-            # ВАЖНО: drop_pending_updates=True — чтобы обрубить незавершённые старые getUpdates
-            await _bot_app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                stop_signals=None,     # управляем остановкой сами
-                close_loop=False,      # НЕ закрывать uvicorn loop
-                drop_pending_updates=True,
-            )
-            log.info("[BOT] Polling завершён штатно")
-            return
-        except Exception as e:
-            msg = str(e)
-            # Наиболее частая — Conflict: другой getUpdates
-            if "Conflict" in msg or "terminated by other getUpdates request" in msg:
-                log.warning("[BOT] Conflict: бот уже запущен где-то ещё. Проверяю через %ss…", backoff)
-            else:
-                log.exception("[BOT] Ошибка в run_polling: %s", msg)
+    # 3) запуск getUpdates-поллинга (drop старых апдейтов)
+    #    ВАЖНО: здесь НЕТ собственного event loop-менеджмента
+    await _bot_app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
-            await asyncio.sleep(backoff)
-            backoff = min(max_backoff, backoff * 2)
+    log.info("[BOT] Polling запущен")
+
+    # 4) ждем сигнала остановки
+    await _stop_event.wait()
+
+    log.info("[BOT] Останавливаюсь…")
+
+    # 5) остановка поллинга и приложения в обратном порядке
+    await _bot_app.updater.stop()
+    await _bot_app.stop()
+    await _bot_app.shutdown()
 
 @app.on_event("startup")
 async def on_startup():
     global _bot_task
     if _bot_task is None:
-        log.info("[BOT] Фоновая задача создана")
+        log.info("[BOT] Создаю фоновую задачу polling")
         _bot_task = asyncio.create_task(_run_bot_polling())
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """
-    Корректно останавливаем polling, не трогая event loop.
-    """
-    global _bot_task, _bot_app
+    global _bot_task, _stop_event
     try:
-        if _bot_app is not None:
-            # мягкая остановка
-            await _bot_app.stop()
-            await _bot_app.shutdown()
-            log.info("[BOT] Application остановлен")
+        if _stop_event is not None:
+            _stop_event.set()
+        if _bot_task is not None and not _bot_task.done():
+            # дождаться корректной остановки
+            await _bot_task
     except Exception as e:
         log.warning("[BOT] Ошибка при остановке: %s", e)
-
-    if _bot_task is not None:
-        # отменим задачу, если она ещё активна
-        if not _bot_task.done():
-            _bot_task.cancel()
-            try:
-                await _bot_task
-            except asyncio.CancelledError:
-                pass
+    finally:
         _bot_task = None
+
 
