@@ -1,4 +1,6 @@
-# src/telegram_bot.py
+# src/telegram_bot.pyfrom dotenv import load_dotenv
+load_dotenv()
+
 import os
 import logging
 from datetime import datetime
