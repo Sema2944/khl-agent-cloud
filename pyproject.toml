@@ -21,3 +21,4 @@ dependencies = [
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+python-telegram-bot = { version = "==21.6", extras = ["job-queue"] }
