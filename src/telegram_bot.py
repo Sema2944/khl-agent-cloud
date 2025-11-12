@@ -1,9 +1,7 @@
 # src/telegram_bot.py
-from __future__ import annotations
-
-import asyncio
-import logging
 import os
+import logging
+from datetime import datetime
 from typing import Optional
 
 from telegram import Update
@@ -16,148 +14,182 @@ from telegram.ext import (
     Defaults,
 )
 
-from .db import async_session, Bet  # твои модели/сессия из src/db.py
+from sqlmodel import select
 
-log = logging.getLogger("svc")
+# Импорт из вашего модуля БД
+# Ожидается, что в src/db.py есть:
+#   - async_session (AsyncSession factory)
+#   - Bet модель (id: int | None, text: str, created_at: datetime)
+#   - Reminder (если понадобится дальше)
+from .db import async_session, Bet  # Reminder не используем здесь
+
+log = logging.getLogger("svc.bot")
 
 
-# =============== Бизнес-логика =================
-async def _add_bet_to_db(text: str) -> int:
+# ======================
+# Вспомогательные функции
+# ======================
+
+def _get_clear_pin() -> str:
+    """
+    PIN для команды /clearbets берём из переменной окружения CLEAR_PIN.
+    Если нет — используем строку "100182" (как вы присылали ранее).
+    """
+    return os.getenv("CLEAR_PIN", "100182")
+
+
+async def _add_bet_to_db(text: str) -> Bet:
     async with async_session() as session:
-        bet = Bet(text=text)
+        bet = Bet(text=text, created_at=datetime.utcnow())  # type: ignore[arg-type]
         session.add(bet)
         await session.commit()
         await session.refresh(bet)
-        return bet.id
+    return bet
 
-async def _get_bets_from_db(limit: int = 50) -> list[Bet]:
+
+async def _list_bets_from_db(limit: int = 50) -> list[Bet]:
     async with async_session() as session:
-        res = await session.execute(
-            Bet.__table__.select().order_by(Bet.id.desc()).limit(limit)
+        result = await session.exec(
+            select(Bet).order_by(Bet.id.desc()).limit(limit)
         )
-        rows = res.fetchall()
-        # rows -> list[Row]; приведём к Bet-подобным объектам с атрибутами
-        return [Bet(id=r.id, text=r.text, created_at=r.created_at) for r in rows]  # type: ignore
+        rows = list(result)
+    return rows
 
-async def _clear_bets_if_pin_ok(user_pin: str) -> bool:
-    needed = os.getenv("ADMIN_PIN", "100182")
-    if user_pin != needed:
-        return False
+
+async def _clear_bets_in_db() -> int:
     async with async_session() as session:
-        await session.execute(Bet.__table__.delete())
+        # лучший способ — выполнить raw SQL удаление, чтобы быстро почистить
+        # но тут сделаем безопасно через ORM: выбрать и удалить
+        result = await session.exec(select(Bet))
+        rows = list(result)
+        count = len(rows)
+        for r in rows:
+            await session.delete(r)
         await session.commit()
-    return True
+    return count
 
 
-# =============== Команды бота =================
-async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_chat.send_message(
-        "Привет! Я бот.\n"
-        "Команды:\n"
-        "<b>/addbet &lt;текст&gt;</b> — добавить ставку\n"
-        "<b>/bets</b> — показать последние ставки\n"
-        "<b>/clearbets &lt;PIN&gt;</b> — очистить ставки (для админа)\n"
-        "<b>/help</b> — помощь",
+# ======================
+# Хэндлеры команд
+# ======================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "Привет! Я готов 😊\n\n"
+        "<b>Команды:</b>\n"
+        "/addbet &lt;текст&gt; — добавить ставку\n"
+        "/bets — список последних ставок\n"
+        f"/clearbets &lt;PIN&gt; — очистить (PIN: <code>{_get_clear_pin()}</code>)"
     )
+    await update.message.reply_text(text)
 
-async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_chat.send_message(
-        "Доступные команды:\n"
-        "• /addbet <i>текст</i>\n"
-        "• /bets\n"
-        "• /clearbets <i>PIN</i>",
-    )
 
-async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args_text = " ".join(context.args).strip() if context.args else ""
-    if not args_text:
-        await update.effective_chat.send_message(
-            "Укажи текст: <code>/addbet Тестовая ставка</code>"
+async def cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    payload = (update.message.text or "").split(maxsplit=1)
+    if len(payload) < 2:
+        await update.message.reply_text(
+            "❗ Использование: <code>/addbet Текст ставки</code>"
         )
         return
-    bet_id = await _add_bet_to_db(args_text)
-    await update.effective_chat.send_message(f"✅ Ставка добавлена: #{bet_id}")
 
-async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    bets = await _get_bets_from_db(50)
-    if not bets:
-        await update.effective_chat.send_message("Пока ставок нет.")
+    bet_text = payload[1].strip()
+    if not bet_text:
+        await update.message.reply_text("❗ Текст пустой.")
         return
-    lines = [f"#{b.id}: {b.text}" for b in bets[::-1]]  # старые сверху
-    await update.effective_chat.send_message("<b>Ставки:</b>\n" + "\n".join(lines))
 
-async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pin = " ".join(context.args).strip() if context.args else ""
-    ok = await _clear_bets_if_pin_ok(pin)
-    if not ok:
-        await update.effective_chat.send_message("❌ Неверный PIN.")
+    try:
+        bet = await _add_bet_to_db(bet_text)
+        await update.message.reply_text(f"✅ Ставка добавлена: #{bet.id}")
+    except Exception as e:
+        log.exception("Ошибка добавления ставки: %s", e)
+        await update.message.reply_text("❌ Ошибка при добавлении ставки.")
+
+
+async def cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
         return
-    await update.effective_chat.send_message("🧹 Ставки очищены.")
+
+    try:
+        rows = await _list_bets_from_db(limit=50)
+        if not rows:
+            await update.message.reply_text("Ставок пока нет.")
+            return
+
+        lines = []
+        for b in rows[::-1]:  # старые сверху
+            created = getattr(b, "created_at", None)
+            created_str = (
+                created.strftime("%Y-%m-%d %H:%M") if isinstance(created, datetime) else "-"
+            )
+            lines.append(f"#{b.id} — {b.text} (at {created_str})")
+        answer = "<b>Ставки:</b>\n" + "\n".join(lines)
+        await update.message.reply_text(answer)
+    except Exception as e:
+        log.exception("Ошибка получения списка ставок: %s", e)
+        await update.message.reply_text("❌ Ошибка получения списка.")
 
 
-# =============== Периодические задачи =================
-async def _job_refresh_line(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Здесь парсинг линии букмекера, обновление кэша и т.п.
-    # Пока просто логируем, чтобы не падало.
-    log.info("[JOB] Обновление линии…")
+async def cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    parts = (update.message.text or "").split(maxsplit=1)
+    pin = parts[1].strip() if len(parts) > 1 else ""
+    if pin != _get_clear_pin():
+        await update.message.reply_text("❌ Неверный PIN.")
+        return
+
+    try:
+        count = await _clear_bets_in_db()
+        await update.message.reply_text(f"🧹 Удалено ставок: {count}")
+    except Exception as e:
+        log.exception("Ошибка очистки ставок: %s", e)
+        await update.message.reply_text("❌ Ошибка при очистке.")
 
 
-# =============== Построение Application =================
+# ======================
+# Сборка приложения бота
+# ======================
+
 async def build_bot_app() -> Application:
-    # Defaults: сразу включаем HTML
-    defaults = Defaults(parse_mode=ParseMode.HTML)
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    """
+    Создаёт и возвращает PTB Application.
+    Используется из FastAPI (в service.py) в on_startup.
+    """
+    token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
+        raise RuntimeError("Не задан TELEGRAM_TOKEN в переменных окружения.")
 
     app = (
         ApplicationBuilder()
         .token(token)
-        .concurrent_updates(True)  # безопасней для веб-приложений
-        .defaults(defaults)
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
     )
 
-    # Команды
-    app.add_handler(CommandHandler("start", _cmd_start))
-    app.add_handler(CommandHandler("help", _cmd_help))
-    app.add_handler(CommandHandler("addbet", _cmd_addbet))
-    app.add_handler(CommandHandler("bets", _cmd_bets))
-    app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
+    # Регистрация хэндлеров
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("addbet", cmd_addbet))
+    app.add_handler(CommandHandler("bets", cmd_bets))
+    app.add_handler(CommandHandler("clearbets", cmd_clearbets))
 
-    # Планировщик: безопасно работаем без extra, если не установлен
-    jq = app.job_queue
-    if jq is None:
-        log.warning(
-            "[BOT] JobQueue недоступен. Установи extra: python-telegram-bot[job-queue]"
-        )
+    # Периодический парсинг линии — включится, если установлен extra "job-queue"
+    # в pyproject.toml: python-telegram-bot = { version = "==21.6", extras = ["job-queue"] }
+    if app.job_queue is not None:
+        # Заглушка задачи: поставь сюда свой парсер линии
+        async def _job_refresh_line(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+            # TODO: тут вызывай свой парсер линии/запись в БД
+            pass
+
+        app.job_queue.run_repeating(_job_refresh_line, interval=300, first=5)
     else:
-        jq.run_repeating(_job_refresh_line, interval=300, first=5)
+        log.info("JobQueue недоступен (не установлен extra 'job-queue'). Автопарсинг выключен.")
 
     return app
 
-
-# =============== Локальный запуск (опционально) =================
-async def _main() -> None:
-    app = await build_bot_app()
-    # polling внутри отдельной задачи — как на сервере
-    await app.initialize()
-    try:
-        await app.start()
-        await app.updater.start_polling()  # type: ignore[attr-defined]
-        log.info("[BOT] Polling запущен.")
-        # держим процесс
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()  # type: ignore[attr-defined]
-        await app.stop()
-        await app.shutdown()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(_main())
 
 
 
