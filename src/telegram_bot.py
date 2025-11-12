@@ -1,4 +1,4 @@
-# src/telegram_bot.pyfrom dotenv import load_dotenv
+from dotenv import load_dotenv
 load_dotenv()
 
 import os
