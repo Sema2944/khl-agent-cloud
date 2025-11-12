@@ -133,6 +133,10 @@ async def stop_polling(app: Application) -> None:
     await app.stop()
     await app.shutdown()
     logger.info("[BOT] Остановлен.")
+# --- Совместимость со старым service.py ---
+# В старом коде ожидалась функция run_polling, оставим алиас:
+async def run_polling(app: Application) -> None:
+    await start_polling(app)
 
 
 
