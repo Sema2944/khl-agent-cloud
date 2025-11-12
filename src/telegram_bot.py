@@ -1,121 +1,139 @@
-import os
+# src/telegram_bot.py
+import asyncio
 import logging
+import os
 from typing import Optional
 
-from telegram import Update, BotCommand
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    Defaults,
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.INFO)
 
-# ===================== Команды =====================
+# ----- Простейшее "хранилище" ставок в памяти (замените своей БД при желании)
+_bets = []  # список строк
+_PIN = os.getenv("CLEAR_PIN", "100182")  # PIN можно задать через переменную окружения
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот KHL Agent Cloud. Команды: /addbet, /bets, /clearbets")
 
-async def add_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("⚠️ Использование: /addbet <текст ставки>")
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "👋 Привет! Я бот.\n\n"
+        "Команды:\n"
+        "/addbet <текст> — добавить ставку\n"
+        "/bets — показать ставки\n"
+        f"/clearbets <PIN> — очистить (PIN по умолчанию {_PIN})"
+    )
+    await update.message.reply_text(text)
+
+
+async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("⚠️ Укажи текст ставки: /addbet <текст>")
         return
-    # тут могла бы быть запись в БД
-    await update.message.reply_text(f"✅ Ставка добавлена: {text}")
+    bet_text = " ".join(context.args).strip()
+    _bets.append(bet_text)
+    await update.message.reply_text(f"✅ Ставка добавлена: #{len(_bets)}")
 
-async def bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # демо-ответ
-    await update.message.reply_text("🧾 Пока ставок нет (демо).")
 
-async def clear_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Команда недоступна в демо-режиме.")
+async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _bets:
+        await update.message.reply_text("Пока ставок нет.")
+        return
+    lines = [f"#{i+1}. {b}" for i, b in enumerate(_bets)]
+    await update.message.reply_text("📋 Ставки:\n" + "\n".join(lines))
 
-# ===================== Инициализация =====================
+
+async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Укажи PIN: /clearbets <PIN>")
+        return
+    pin = context.args[0]
+    if pin != _PIN:
+        await update.message.reply_text("❌ Неверный PIN.")
+        return
+    _bets.clear()
+    await update.message.reply_text("🧹 Очищено.")
+
+
+async def _job_refresh_line(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # сюда поместите парсинг линии букмекера
+    logger.info("[JOB] refresh line tick")
+    # пример уведомления (по желанию): если есть chat_id — отправляем
+    # await context.bot.send_message(chat_id=<your_chat_id>, text="Обновил линию.")
+
+
+def _make_application(token: str) -> Application:
+    """
+    Создаёт Application с правильной настройкой parse_mode для PTB v21.
+    ВАЖНО: никаких .parse_mode(...) у билдера — только Defaults(parse_mode=...).
+    """
+    return (
+        ApplicationBuilder()
+        .token(token)
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
+        .build()
+    )
+
 
 async def build_bot_app() -> Optional[Application]:
+    """
+    Вызывается из FastAPI при старте. Возвращает Application или None,
+    если токен не задан (чтобы сервис не падал).
+    """
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         logger.warning("⚠️ TELEGRAM_TOKEN не задан — бот не будет запущен.")
         return None
 
-    # Собираем Application
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .parse_mode(ParseMode.HTML)            # PTB v21: метод билдера .parse_mode(...)
-        .concurrent_updates(True)              # безопасная обработка апдейтов параллельно
-        .build()
-    )
+    app = _make_application(token)
 
-    # Регистрируем команды/хэндлеры
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addbet", add_bet))
-    app.add_handler(CommandHandler("bets", bets))
-    app.add_handler(CommandHandler("clearbets", clear_bets))
+    # Хендлеры
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("addbet", _cmd_addbet))
+    app.add_handler(CommandHandler("bets", _cmd_bets))
+    app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
 
-    # Команды для меню Telegram
-    try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "Запустить бота"),
-            BotCommand("addbet", "Добавить ставку"),
-            BotCommand("bets", "Список ставок"),
-            BotCommand("clearbets", "Очистить ставки (демо)"),
-        ])
-    except Exception:
-        logger.exception("[BOT] Не удалось установить команды меню")
+    # Периодическая задача — только если установлен extra "job-queue"
+    # (иначе app.job_queue будет None)
+    if getattr(app, "job_queue", None) is not None:
+        # каждые 5 минут, первый запуск через 5 сек
+        app.job_queue.run_repeating(_job_refresh_line, interval=300, first=5)
+    else:
+        logger.info("JobQueue не доступен (установите python-telegram-bot[job-queue], если нужен автопарсинг).")
 
-    logger.info("[BOT] Приложение Telegram собрано.")
     return app
 
-# ===================== Запуск/остановка polling =====================
 
-async def run_polling(app: Application):
+async def start_polling(app: Application) -> None:
     """
-    Полный корректный цикл для polling в PTB v21:
-      - удалить webhook (если был)
-      - initialize/start
-      - start_polling (через app.updater)
+    Запускает polling неблокирующе (для интеграции с FastAPI lifespan).
     """
-    # На всякий случай убираем webhook
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        logger.exception("[BOT] Не удалось удалить webhook")
-
-    # initialize() -> start() -> start polling
     await app.initialize()
     await app.start()
+    # start_polling внутри start() в v21 не запускается — запускаем вручную:
+    await app.updater.start_polling()  # type: ignore[attr-defined]
+    logger.info("[BOT] Polling запущен.")
 
-    # В PTB v21 polling запускается через updater.start_polling()
-    # Он работает в фоне, метод возвращается сразу.
-    await app.updater.start_polling()
-    logger.info("[BOT] Updater polling запущен.")
 
-    # Ничего не ждём здесь: polling работает в фоновых тасках PTB.
-    # Функция завершается, FastAPI продолжает жить.
-
-async def stop_polling(app: Application):
-    """Аккуратная остановка бота."""
+async def stop_polling(app: Application) -> None:
+    """
+    Останавливает polling и бот.
+    """
     try:
-        await app.updater.stop()
+        await app.updater.stop()  # type: ignore[attr-defined]
     except Exception:
-        logger.exception("[BOT] Ошибка при остановке updater")
+        pass
+    await app.stop()
+    await app.shutdown()
+    logger.info("[BOT] Остановлен.")
 
-    try:
-        await app.stop()
-    except Exception:
-        logger.exception("[BOT] Ошибка при остановке app")
-
-    try:
-        await app.shutdown()
-    except Exception:
-        logger.exception("[BOT] Ошибка при shutdown app")
-
-    logger.info("[BOT] Polling остановлен и приложение закрыто.")
 
 
 
