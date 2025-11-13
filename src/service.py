@@ -1,120 +1,72 @@
-import os
+import asyncio
 import logging
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+from fastapi import FastAPI
 
-logger = logging.getLogger(__name__)
+from src.telegram_bot import build_bot_app, start_bot_polling, stop_bot_polling
 
+# Если у тебя есть init_db в src/db.py — можно раскомментировать:
+# from src.db import init_db
 
-# ==== Команды бота ====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("svc")
 
+app = FastAPI(title="khl-agent-api")
 
-async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ на /start."""
-    text = (
-        "Привет! 👋\n\n"
-        "Я бот для трекинга ставок.\n\n"
-        "Доступные команды:\n"
-        "  /start – показать это сообщение\n"
-        "  /help – помощь\n"
-        "  /addbet <текст> – добавить ставку\n"
-        "  /clearbets – очистить ставки\n"
-    )
-    await update.message.reply_text(text)
-    logger.info("Handled /start from chat_id=%s", update.effective_chat.id)
+# Глобальные ссылки на приложение бота и таску polling
+_bot_app = None
+_bot_task: asyncio.Task | None = None
 
 
-async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Помощь по боту:\n\n"
-        "/start – приветствие и список команд\n"
-        "/addbet <текст> – сохранить новую ставку\n"
-        "/clearbets – удалить все сохранённые ставки\n"
-    )
-    await update.message.reply_text(text)
-    logger.info("Handled /help from chat_id=%s", update.effective_chat.id)
+@app.on_event("startup")
+async def on_startup() -> None:
+    global _bot_app, _bot_task
 
+    logger.info("[APP] Запуск приложения...")
 
-async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Тупо эхо, чтобы проверить, что команда работает."""
-    args_text = " ".join(context.args) if context.args else "(пусто)"
-    text = f"Добавлена ставка: {args_text}"
-    await update.message.reply_text(text)
-    logger.info(
-        "Handled /addbet from chat_id=%s, text=%r",
-        update.effective_chat.id,
-        args_text,
-    )
+    # Если используется БД, можешь включить:
+    # try:
+    #     await init_db()
+    #     logger.info("[DB] Инициализирована.")
+    # except Exception:
+    #     logger.exception("[DB] Ошибка инициализации.")
 
-
-async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Тут потом можно подвязать БД. Пока просто заглушка.
-    await update.message.reply_text("Все ставки очищены (пока это просто заглушка).")
-    logger.info("Handled /clearbets from chat_id=%s", update.effective_chat.id)
-
-
-# ==== Построение Application ====
-
-
-def build_bot_app() -> Application | None:
-    """Создаёт и настраивает Telegram Application.
-
-    Если TELEGRAM_TOKEN не задан — возвращает None.
-    """
-    token = os.getenv("TELEGRAM_TOKEN")
-    if not token:
-        logger.warning("⚠️ TELEGRAM_TOKEN не задан — бот не будет запущен.")
-        return None
-
-    app = ApplicationBuilder().token(token).build()
-
-    # Регистрируем хэндлеры
-    app.add_handler(CommandHandler("start", _cmd_start))
-    app.add_handler(CommandHandler("help", _cmd_help))
-    app.add_handler(CommandHandler("addbet", _cmd_addbet))
-    app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
-
-    logger.info("✅ Telegram Application создан.")
-    return app
-
-
-# ==== Запуск / остановка в рамках FastAPI ====
-
-async def start_bot_polling(app: Application) -> None:
-    """Запускает бота в режиме long polling (НЕ блокируя FastAPI).
-
-    Важно: НЕ используем app.run_polling(), потому что он сам управляет loop.
-    Тут — "ручной" запуск для интеграции с FastAPI.
-    """
-    if app is None:
-        logger.warning("start_bot_polling вызван с app=None, выходим.")
+    # Создаём Telegram Application
+    _bot_app = build_bot_app()
+    if _bot_app is None:
+        logger.warning("[BOT] TELEGRAM_TOKEN отсутствует — бот не будет запущен.")
         return
 
-    logger.info("[BOT] Инициализация Application...")
-    await app.initialize()
-    await app.start()
-
-    # Сбрасываем старые непрочитанные обновления, чтобы не обрабатывать древние /start
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("[BOT] Polling запущен.")
+    # Запускаем polling в фоне, чтобы не блокировать event loop FastAPI
+    loop = asyncio.get_event_loop()
+    _bot_task = loop.create_task(start_bot_polling(_bot_app))
+    logger.info("[BOT] Задача polling запущена.")
 
 
-async def stop_bot_polling(app: Application) -> None:
-    """Корректная остановка бота при выключении сервиса."""
-    if app is None:
-        return
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global _bot_app, _bot_task
 
-    logger.info("[BOT] Остановка polling...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    logger.info("[BOT] Остановлен.")
+    logger.info("[APP] Остановка приложения...")
+
+    if _bot_app is not None:
+        try:
+            await stop_bot_polling(_bot_app)
+        except Exception:
+            logger.exception("[BOT] Ошибка при остановке polling.")
+
+    if _bot_task is not None:
+        _bot_task.cancel()
+        _bot_task = None
+
+    logger.info("[APP] Остановка завершена.")
+
+
+@app.get("/")
+async def root():
+    """Простой health-check, чтобы Render видел, что сервис живой."""
+    return {"status": "ok", "service": "khl-agent-api", "bot_running": _bot_app is not None}
+
 
 
 
