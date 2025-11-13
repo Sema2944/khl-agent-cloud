@@ -1,71 +1,52 @@
-import asyncio
 import logging
 
 from fastapi import FastAPI
 
-from src.telegram_bot import build_bot_app, start_bot_polling, stop_bot_polling
+from src.db import init_db
+from src.telegram_bot import build_bot_app, start_bot_polling_in_thread, stop_bot_polling_in_thread
 
-# Если у тебя есть init_db в src/db.py — можно раскомментировать:
-# from src.db import init_db
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("svc")
 
-app = FastAPI(title="khl-agent-api")
-
-# Глобальные ссылки на приложение бота и таску polling
-_bot_app = None
-_bot_task: asyncio.Task | None = None
+app = FastAPI(title="KHL Agent API")
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global _bot_app, _bot_task
-
     logger.info("[APP] Запуск приложения...")
 
-    # Если используется БД, можешь включить:
-    # try:
-    #     await init_db()
-    #     logger.info("[DB] Инициализирована.")
-    # except Exception:
-    #     logger.exception("[DB] Ошибка инициализации.")
+    # Инициализация БД (как у тебя было)
+    try:
+        await init_db()
+        logger.info("[DB] init_db выполнен.")
+    except Exception as e:
+        logger.exception(f"[DB] Ошибка init_db: {e}")
 
-    # Создаём Telegram Application
-    _bot_app = build_bot_app()
-    if _bot_app is None:
+    # Инициализация бота
+    bot_app = await build_bot_app()
+    if bot_app is None:
         logger.warning("[BOT] TELEGRAM_TOKEN отсутствует — бот не будет запущен.")
-        return
-
-    # Запускаем polling в фоне, чтобы не блокировать event loop FastAPI
-    loop = asyncio.get_event_loop()
-    _bot_task = loop.create_task(start_bot_polling(_bot_app))
-    logger.info("[BOT] Задача polling запущена.")
+    else:
+        logger.info("[BOT] Application создан, запускаем polling в отдельном потоке...")
+        start_bot_polling_in_thread()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    global _bot_app, _bot_task
-
     logger.info("[APP] Остановка приложения...")
 
-    if _bot_app is not None:
-        try:
-            await stop_bot_polling(_bot_app)
-        except Exception:
-            logger.exception("[BOT] Ошибка при остановке polling.")
-
-    if _bot_task is not None:
-        _bot_task.cancel()
-        _bot_task = None
+    # Сейчас stop_bot_polling_in_thread — no-op, просто логирует
+    try:
+        stop_bot_polling_in_thread()
+    except Exception as e:
+        logger.exception(f"[BOT] Ошибка при остановке бота: {e}")
 
     logger.info("[APP] Остановка завершена.")
 
 
 @app.get("/")
 async def root():
-    """Простой health-check, чтобы Render видел, что сервис живой."""
-    return {"status": "ok", "service": "khl-agent-api", "bot_running": _bot_app is not None}
+    return {"status": "ok", "message": "KHL Agent API is running"}
+
 
 
 
