@@ -1,22 +1,21 @@
 import logging
 import os
-import threading
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
 logger = logging.getLogger(__name__)
 
-# Глобальные объекты бота
-_bot_app: Application | None = None
-_bot_thread: threading.Thread | None = None
+# Глобальный объект приложения бота
+_bot_app: Optional[Application] = None
 
 
 # ====================== HANDLERS ======================
@@ -25,7 +24,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None:
         return
 
-    # ВАЖНО: НИКАКОЙ разметки <текст>, <b> и т.п. — только обычный текст
+    # ВАЖНО: только обычный текст, без <b>, <i>, <текст> и т.п.
     text = (
         "Привет! Я бот учёта ставок.\n\n"
         "Доступные команды:\n"
@@ -55,8 +54,6 @@ async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if update.message is None:
         return
 
-    # Минимальный функционал: просто подтверждаем приём ставки
-    # (сюда позже можно подвезти твою реальную логику с БД)
     if not context.args:
         await update.message.reply_text("Использование: /addbet Описание ставки")
         return
@@ -69,7 +66,7 @@ async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
 
-    # Здесь можно будет вызвать очистку из БД, пока просто сообщение
+    # Здесь позже можно будет вызвать очистку из БД
     await update.message.reply_text("Все ставки очищены (заглушка).")
 
 
@@ -77,19 +74,18 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
-    # Простой echo-ответ на любое текстовое сообщение
     await update.message.reply_text(
         "Я пока понимаю только команды.\n"
         "Напиши /help, чтобы посмотреть список доступных команд."
     )
 
 
-# ====================== ИНИЦИАЛИЗАЦИЯ БОТА ======================
+# ====================== ВСПОМОГАТЕЛЬНОЕ ======================
 
-def _build_application(token: str) -> Application:
+def _create_application(token: str) -> Application:
     """
-    Создаём объект Application и регистрируем хендлеры.
-    Без parse_mode, чтобы не ловить ошибки парсинга сущностей.
+    Создаём Application и регистрируем хендлеры.
+    НИКАКОГО parse_mode здесь нет.
     """
     app = ApplicationBuilder().token(token).build()
 
@@ -105,10 +101,10 @@ def _build_application(token: str) -> Application:
     return app
 
 
-async def build_bot_app() -> Application | None:
+async def build_bot_app() -> Optional[Application]:
     """
-    Строит Application, если задан TELEGRAM_TOKEN.
-    Никакого run_polling здесь не вызываем.
+    Создаёт и кэширует Application, если задан TELEGRAM_TOKEN.
+    Ничего не запускает, только строит.
     """
     global _bot_app
 
@@ -118,53 +114,69 @@ async def build_bot_app() -> Application | None:
         return None
 
     if _bot_app is None:
-        _bot_app = _build_application(token)
+        _bot_app = _create_application(token)
         logger.info("[BOT] Application создан.")
 
     return _bot_app
 
 
-# ====================== ЗАПУСК В ОТДЕЛЬНОМ ПОТОКЕ ======================
+# ====================== ЗАПУСК / ОСТАНОВКА (ASGI-style) ======================
 
-def start_bot_polling_in_thread() -> None:
+_bot_started: bool = False  # наш флаг, чтобы не стартовать несколько раз
+
+
+async def start_bot_polling() -> None:
     """
-    Запускает run_polling в отдельном потоке, чтобы не конфликтовать
-    с event loop uvicorn'а. Поэтому НЕТ ошибки
-    'RuntimeError: this event loop is already running'.
+    Стартуем бота внутри того же event loop, что и FastAPI/uvicorn.
+    Без run_polling, без потоков — только initialize/start/updater.start_polling.
     """
-    global _bot_app, _bot_thread
+    global _bot_app, _bot_started
 
     if _bot_app is None:
-        logger.warning("[BOT] Нечего запускать: _bot_app is None.")
+        logger.warning("[BOT] start_bot_polling вызван, но _bot_app is None.")
         return
 
-    if _bot_thread is not None and _bot_thread.is_alive():
-        logger.info("[BOT] Поток уже запущен, повторный запуск не нужен.")
+    if _bot_started:
+        logger.info("[BOT] Уже запущен, пропускаем повторный start.")
         return
 
-    def _runner() -> None:
-        logger.info("[BOT] Polling-поток стартовал.")
-        # run_polling блокирующий, но крутится в отдельном потоке
-        _bot_app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            stop_signals=None,   # Управлять сигналами будет сам Render/процесс
-        )
-        logger.info("[BOT] Polling-поток завершился.")
+    # Инициализация Application
+    await _bot_app.initialize()
+    await _bot_app.start()
 
-    _bot_thread = threading.Thread(
-        target=_runner,
-        name="telegram-bot-polling",
-        daemon=True,
-    )
-    _bot_thread.start()
+    # На всякий случай чистим webhook и сбрасываем старые апдейты
+    try:
+        await _bot_app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.exception("[BOT] Не удалось удалить webhook: %s", e)
+
+    # Запускаем polling через updater
+    if _bot_app.updater is not None:
+        await _bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("[BOT] Polling запущен.")
+        _bot_started = True
+    else:
+        logger.warning("[BOT] У Application нет updater — polling не запущен.")
 
 
-def stop_bot_polling_in_thread() -> None:
+async def stop_bot_polling() -> None:
     """
-    На Render процесс и так будет убит, а поток — daemon.
-    Делаем no-op, чтобы не городить сложную синхронизацию event loop'ов.
+    Корректно останавливает бота при остановке приложения.
     """
-    logger.info("[BOT] stop_bot_polling_in_thread вызван (no-op, поток завершится с процессом).")
+    global _bot_app, _bot_started
+
+    if _bot_app is None or not _bot_started:
+        logger.info("[BOT] stop_bot_polling: бот уже остановлен или не запускался.")
+        return
+
+    if _bot_app.updater is not None:
+        await _bot_app.updater.stop()
+
+    await _bot_app.stop()
+    await _bot_app.shutdown()
+
+    _bot_started = False
+    logger.info("[BOT] Остановлен.")
 
 
 
