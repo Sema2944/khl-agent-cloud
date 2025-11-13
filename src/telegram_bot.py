@@ -1,9 +1,9 @@
-from datetime import timezone
-from src import khl_client
+from __future__ import annotations
+
 import logging
 import os
-import inspect
-from typing import Optional
+from datetime import timezone
+from typing import Optional, List
 
 from telegram import Update
 from telegram.ext import (
@@ -14,6 +14,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from src import khl_client
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None:
         return
 
-    # ВАЖНО: только обычный текст, без <b>, <i>, <текст> и т.п.
+    # ВАЖНО: только обычный текст, без HTML-тегов (<b>, <i> и т.п.)
     text = (
         "Привет! Я бот учёта ставок.\n\n"
         "Доступные команды:\n"
@@ -75,90 +77,100 @@ async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("Все ставки очищены (заглушка).")
 
 
+def _format_edge(edge: Optional[float]) -> str:
+    if edge is None:
+        return "-"
+    # edge=0.04 -> "+4%"
+    sign = "+" if edge > 0 else ""
+    return f"{sign}{round(edge * 100, 1)}%"
+
+
+def _format_prob(prob: Optional[float]) -> str:
+    if prob is None:
+        return "-"
+    return f"{round(prob * 100, 1)}%"
+
+
 async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Показывает пользователю актуальные линии и простые рекомендации.
-
-    Здесь сделана аккуратная интеграция с khl_client:
-    - если в khl_client есть функция get_latest_lines (sync или async) — пытаемся её вызвать;
-    - если нет или она падает — показываем понятный текст-заглушку, но НЕ роняем бота.
+    Показывает пользователю актуальные линии на сегодня на основе khl_client.get_today_lines().
+    Использует твою датакласс-модель BetLine.
     """
     if update.message is None:
         return
 
-    bets_text: str | None = None
-
-    # Пытаемся мягко использовать khl_client, не ломая бота
-    if hasattr(khl_client, "get_latest_lines"):
-        try:
-            raw_result = khl_client.get_latest_lines()  # может быть sync или async
-
-            if inspect.iscoroutine(raw_result):
-                raw_result = await raw_result
-
-            # Дальше пытаемся красиво отформатировать разные варианты ответа
-
-            # 1) Если вернули строку — отправляем как есть
-            if isinstance(raw_result, str):
-                bets_text = raw_result
-
-            # 2) Если вернули список — предполагаем, что там словари или объекты с атрибутами
-            elif isinstance(raw_result, list) and raw_result:
-                lines_lines: list[str] = ["Актуальные линии:\n"]
-                for item in raw_result[:10]:  # не больше 10, чтобы не спамить
-                    try:
-                        # Пытаемся вытащить поля по «типовым» именам
-                        league = getattr(item, "league", None) or getattr(item, "champ", None) or ""
-                        teams = getattr(item, "teams", None) or getattr(item, "match", None) or ""
-                        coef = getattr(item, "coef", None) or getattr(item, "odds", None) or ""
-                        reco = getattr(item, "recommendation", None) or ""
-
-                        # Если это dict
-                        if isinstance(item, dict):
-                            league = item.get("league") or item.get("champ") or league
-                            teams = item.get("teams") or item.get("match") or teams
-                            coef = item.get("coef") or item.get("odds") or coef
-                            reco = item.get("recommendation") or item.get("reco") or reco
-
-                        line_parts = []
-                        if league:
-                            line_parts.append(f"[{league}]")
-                        if teams:
-                            line_parts.append(str(teams))
-                        if coef:
-                            line_parts.append(f"кэф: {coef}")
-                        if reco:
-                            line_parts.append(f"рекомендуем: {reco}")
-
-                        if line_parts:
-                            lines_lines.append(" • " + " | ".join(map(str, line_parts)))
-                    except Exception as e:
-                        logger.exception("Ошибка форматирования линии: %s", e)
-                        continue
-
-                if len(lines_lines) > 1:
-                    bets_text = "\n".join(lines_lines)
-
-            # 3) На всякий случай — просто превращаем в строку
-            if bets_text is None and raw_result is not None:
-                bets_text = f"Актуальные данные по линиям:\n{raw_result}"
-
-        except Exception as e:
-            logger.exception("Ошибка при обращении к khl_client.get_latest_lines: %s", e)
-
-    # Если khl_client ничего не дал или его функции нет — выводим заглушку
-    if not bets_text:
-        bets_text = (
-            "Пока я показываю только заглушку по линиям.\n\n"
-            "В ближайшее время сюда можно будет подтянуть реальные линии и рекомендации "
-            "через khl_client (функция get_latest_lines или аналогичная).\n\n"
-            "Сейчас доступно:\n"
-            "• /addbet Описание ставки — вручную добавить свою ставку\n"
-            "• /clearbets — очистить список ставок\n"
-            "• /help — список всех команд\n"
+    try:
+        lines: List[khl_client.BetLine] = await khl_client.get_today_lines()
+    except Exception as e:
+        logger.exception("Ошибка при вызове khl_client.get_today_lines: %s", e)
+        await update.message.reply_text(
+            "Не удалось получить актуальные линии — внутреняя ошибка.\n"
+            "Попробуй ещё раз чуть позже."
         )
+        return
 
-    await update.message.reply_text(bets_text)
+    if not lines:
+        await update.message.reply_text(
+            "На сегодня нет доступных линий (khl_client вернул пустой список).\n"
+            "Как только будут матчи, я смогу показать коэффициенты и рекомендации."
+        )
+        return
+
+    chunks: list[str] = ["Актуальные линии на сегодня:\n"]
+
+    # Ограничимся, например, 5 матчами, чтобы не спамить
+    for line in lines[:5]:
+        try:
+            start_str = line.start.strftime("%d.%m %H:%M UTC")
+
+            # Коэффициенты
+            odds_draw_str = "-" if line.odds_draw is None else str(line.odds_draw)
+
+            # Вероятности модели
+            prob_home_str = _format_prob(line.model_prob_home)
+            prob_draw_str = _format_prob(line.model_prob_draw)
+            prob_away_str = _format_prob(line.model_prob_away)
+
+            # Эдж (value)
+            edge_home_str = _format_edge(line.edge_home)
+            edge_draw_str = _format_edge(line.edge_draw)
+            edge_away_str = _format_edge(line.edge_away)
+
+            # Простая рекомендация: ищем наибольший положительный edge
+            best_side = None
+            best_edge_val = 0.0
+
+            for side, edge_val in [
+                ("дом", line.edge_home),
+                ("ничья", line.edge_draw),
+                ("гости", line.edge_away),
+            ]:
+                if edge_val is not None and edge_val > best_edge_val:
+                    best_edge_val = edge_val
+                    best_side = side
+
+            if best_side and best_edge_val > 0:
+                reco_line = f"Рекомендация модели: {best_side} (value {round(best_edge_val * 100, 1)}%)"
+            else:
+                reco_line = "Рекомендация модели: явного value нет."
+
+            block = (
+                f"{line.league}: {line.home} — {line.away}\n"
+                f"Время начала: {start_str}\n"
+                f"Рынок: {line.market} | Букмекер: {line.bookmaker}\n"
+                f"Коэффициенты: дом {line.odds_home}, ничья {odds_draw_str}, гости {line.odds_away}\n"
+                f"Вероятности модели: дом {prob_home_str}, ничья {prob_draw_str}, гости {prob_away_str}\n"
+                f"Эдж (value): дом {edge_home_str}, ничья {edge_draw_str}, гости {edge_away_str}\n"
+                f"{reco_line}"
+            )
+            chunks.append(block)
+        except Exception as e:
+            logger.exception("Ошибка форматирования BetLine: %s", e)
+            continue
+
+    text = "\n\n".join(chunks)
+
+    await update.message.reply_text(text)
 
 
 async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -269,6 +281,7 @@ async def stop_bot_polling() -> None:
 
     _bot_started = False
     logger.info("[BOT] Остановлен.")
+
 
 
 
