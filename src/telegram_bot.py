@@ -1,8 +1,8 @@
+# src/telegram_bot.py
 from __future__ import annotations
 
 import logging
 import os
-from datetime import timezone
 from typing import Optional, List
 
 from telegram import Update
@@ -15,12 +15,13 @@ from telegram.ext import (
     filters,
 )
 
-from . import khl_client
+from . import khl_client  # ВАЖНО: относительный импорт, а не "from src import khl_client"
 
 logger = logging.getLogger(__name__)
 
 # Глобальный объект приложения бота
 _bot_app: Optional[Application] = None
+_bot_started: bool = False  # наш флаг, чтобы не стартовать несколько раз
 
 
 # ====================== HANDLERS ======================
@@ -94,7 +95,7 @@ def _format_prob(prob: Optional[float]) -> str:
 async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Показывает пользователю актуальные линии на сегодня на основе khl_client.get_today_lines().
-    Использует твою датакласс-модель BetLine.
+    Использует датакласс BetLine из khl_client.
     """
     if update.message is None:
         return
@@ -104,7 +105,7 @@ async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.exception("Ошибка при вызове khl_client.get_today_lines: %s", e)
         await update.message.reply_text(
-            "Не удалось получить актуальные линии — внутреняя ошибка.\n"
+            "Не удалось получить актуальные линии — внутренняя ошибка.\n"
             "Попробуй ещё раз чуть позже."
         )
         return
@@ -169,7 +170,6 @@ async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
     text = "\n\n".join(chunks)
-
     await update.message.reply_text(text)
 
 
@@ -226,9 +226,6 @@ async def build_bot_app() -> Optional[Application]:
 
 # ====================== ЗАПУСК / ОСТАНОВКА (ASGI-style) ======================
 
-_bot_started: bool = False  # наш флаг, чтобы не стартовать несколько раз
-
-
 async def start_bot_polling() -> None:
     """
     Стартуем бота внутри того же event loop, что и FastAPI/uvicorn.
@@ -281,11 +278,3 @@ async def stop_bot_polling() -> None:
 
     _bot_started = False
     logger.info("[BOT] Остановлен.")
-
-
-
-
-
-
-
-
