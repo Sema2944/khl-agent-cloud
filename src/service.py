@@ -1,49 +1,62 @@
 import asyncio
 import logging
 from fastapi import FastAPI
-from src.telegram_bot import build_bot_app, run_polling, stop_polling
+from telegram import Update
 
-logger = logging.getLogger("svc")
-logging.basicConfig(level=logging.INFO)
+from src.telegram_bot import build_bot_app
 
-app = FastAPI(title="KHL Agent Cloud API")
+log = logging.getLogger("svc")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
-# Держим ссылку на приложение бота
+app = FastAPI(title="KHL Agent API")
+
 _bot_app = None
 _bot_task: asyncio.Task | None = None
+
 
 @app.on_event("startup")
 async def on_startup():
     global _bot_app, _bot_task
-    logger.info("[APP] Запуск приложения...")
+    log.info("[APP] Запуск приложения...")
 
+    # Инициализируем Telegram Application
     _bot_app = await build_bot_app()
-    if _bot_app is None:
-        logger.warning("[BOT] TELEGRAM_TOKEN отсутствует — бот не будет запущен.")
-        return
 
-    # Стартуем polling в фоне, не блокируя FastAPI
-    _bot_task = asyncio.create_task(run_polling(_bot_app))
-    logger.info("[BOT] Polling запущен.")
+    # Запускаем long polling в фоне
+    # В PTB v21 run_polling — корутина, её можно запускать в таске.
+    _bot_task = asyncio.create_task(
+        _bot_app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,               # не закрывать event loop FastAPI
+            stop_signals=None,              # управляем остановкой сами
+            drop_pending_updates=False,     # апдейты уже сброшены при delete_webhook
+        )
+    )
+    log.info("[BOT] Long polling запущен.")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
     global _bot_app, _bot_task
-    logger.info("[APP] Остановка приложения...")
+    log.info("[APP] Остановка приложения...")
 
-    if _bot_app is not None:
+    if _bot_task:
+        # Корректно остановим Application
         try:
-            await stop_polling(_bot_app)
+            await _bot_app.stop()
         except Exception:
-            logger.exception("[BOT] Ошибка при остановке бота")
-
-    if _bot_task and not _bot_task.done():
+            pass
         _bot_task.cancel()
         try:
             await _bot_task
         except asyncio.CancelledError:
             pass
+        _bot_task = None
+
+    log.info("[APP] Остановка завершена.")
+
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "KHL Agent API is running"}
+    return {"status": "ok", "bot": "running" if _bot_task and not _bot_task.done() else "stopped"}
+
