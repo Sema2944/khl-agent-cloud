@@ -1,163 +1,170 @@
 import logging
 import os
-from typing import Optional
+import threading
 
 from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# Глобальный инстанс приложения бота
-_bot_app: Optional[Application] = None
+# Глобальные объекты бота
+_bot_app: Application | None = None
+_bot_thread: threading.Thread | None = None
 
 
-# ==========================
-#      ХЕНДЛЕРЫ КОМАНД
-# ==========================
+# ====================== HANDLERS ======================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ на /start"""
-    log.info("[BOT] Обработана команда /start от %s", update.effective_user.id)
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
 
+    # ВАЖНО: НИКАКОЙ разметки <текст>, <b> и т.п. — только обычный текст
     text = (
-        "Привет! Я бот KHL Agent.\n\n"
+        "Привет! Я бот учёта ставок.\n\n"
         "Доступные команды:\n"
-        "/start — это сообщение\n"
-        "/help — помощь\n"
-        "/health — проверка статуса бота\n"
+        "/addbet Описание ставки — добавить ставку\n"
+        "/clearbets — очистить список ставок\n"
+        "/help — показать справку\n"
     )
-    # ЖЁСТКО запрещаем Telegram парсить HTML/Markdown
-    await update.message.reply_text(text, parse_mode=None)
+
+    await update.message.reply_text(text)
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("[BOT] Обработана команда /help от %s", update.effective_user.id)
+async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
     text = (
-        "Помощь по боту:\n\n"
-        "Пока доступен минимальный набор команд:\n"
-        "/start — приветствие\n"
-        "/help — это сообщение\n"
-        "/health — проверка статуса\n"
+        "Справка по боту:\n\n"
+        "/start — запустить бота и показать приветствие\n"
+        "/addbet Описание ставки — добавить ставку\n"
+        "/clearbets — удалить все сохранённые ставки\n"
     )
-    await update.message.reply_text(text, parse_mode=None)
+
+    await update.message.reply_text(text)
 
 
-async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.info("[BOT] Обработана команда /health от %s", update.effective_user.id)
-    await update.message.reply_text("✅ Бот запущен и работает.", parse_mode=None)
+async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    # Минимальный функционал: просто подтверждаем приём ставки
+    # (сюда позже можно подвезти твою реальную логику с БД)
+    if not context.args:
+        await update.message.reply_text("Использование: /addbet Описание ставки")
+        return
+
+    description = " ".join(context.args)
+    await update.message.reply_text(f"Ставка добавлена: {description}")
 
 
-async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ на неизвестные команды"""
-    if update.message and update.message.text and update.message.text.startswith("/"):
-        log.info("[BOT] Неизвестная команда: %s", update.message.text)
-        await update.message.reply_text(
-            "Я пока не знаю такую команду 🙈\nПопробуй /help.",
-            parse_mode=None,
-        )
+async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    # Здесь можно будет вызвать очистку из БД, пока просто сообщение
+    await update.message.reply_text("Все ставки очищены (заглушка).")
 
 
-# ==========================
-#   ЛОГИРОВАНИЕ АПДЕЙТОВ
-# ==========================
+async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
 
-async def log_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Хендлер для логирования любых апдейтов (для отладки)."""
-    log.info("[BOT] Получен апдейт: %s", update)
+    # Простой echo-ответ на любое текстовое сообщение
+    await update.message.reply_text(
+        "Я пока понимаю только команды.\n"
+        "Напиши /help, чтобы посмотреть список доступных команд."
+    )
 
 
-# ==========================
-#   СБОРКА ПРИЛОЖЕНИЯ БОТА
-# ==========================
+# ====================== ИНИЦИАЛИЗАЦИЯ БОТА ======================
 
-async def build_bot_app() -> Optional[Application]:
+def _build_application(token: str) -> Application:
     """
-    Создаёт и настраивает Application для бота.
-    Вызывается из FastAPI при старте сервиса.
+    Создаём объект Application и регистрируем хендлеры.
+    Без parse_mode, чтобы не ловить ошибки парсинга сущностей.
+    """
+    app = ApplicationBuilder().token(token).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _cmd_help))
+    app.add_handler(CommandHandler("addbet", _cmd_addbet))
+    app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
+
+    # Любой текст без команды
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
+
+    return app
+
+
+async def build_bot_app() -> Application | None:
+    """
+    Строит Application, если задан TELEGRAM_TOKEN.
+    Никакого run_polling здесь не вызываем.
     """
     global _bot_app
 
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
-        log.warning("⚠️ TELEGRAM_TOKEN не задан — бот не будет запущен.")
+        logger.warning("⚠️ TELEGRAM_TOKEN не задан — бот не будет запущен.")
         return None
 
-    log.info("[BOT] Инициализация Application...")
+    if _bot_app is None:
+        _bot_app = _build_application(token)
+        logger.info("[BOT] Application создан.")
 
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        # parse_mode НЕ задаём, и в reply_text явно пишем parse_mode=None
-        .build()
+    return _bot_app
+
+
+# ====================== ЗАПУСК В ОТДЕЛЬНОМ ПОТОКЕ ======================
+
+def start_bot_polling_in_thread() -> None:
+    """
+    Запускает run_polling в отдельном потоке, чтобы не конфликтовать
+    с event loop uvicorn'а. Поэтому НЕТ ошибки
+    'RuntimeError: this event loop is already running'.
+    """
+    global _bot_app, _bot_thread
+
+    if _bot_app is None:
+        logger.warning("[BOT] Нечего запускать: _bot_app is None.")
+        return
+
+    if _bot_thread is not None and _bot_thread.is_alive():
+        logger.info("[BOT] Поток уже запущен, повторный запуск не нужен.")
+        return
+
+    def _runner() -> None:
+        logger.info("[BOT] Polling-поток стартовал.")
+        # run_polling блокирующий, но крутится в отдельном потоке
+        _bot_app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            stop_signals=None,   # Управлять сигналами будет сам Render/процесс
+        )
+        logger.info("[BOT] Polling-поток завершился.")
+
+    _bot_thread = threading.Thread(
+        target=_runner,
+        name="telegram-bot-polling",
+        daemon=True,
     )
-
-    # Команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("health", cmd_health))
-
-    # Неизвестные команды
-    app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown), group=0)
-
-    # Логирование всех апдейтов
-    app.add_handler(MessageHandler(filters.ALL, log_any_update), group=1)
-
-    _bot_app = app
-    log.info("[BOT] Application создан.")
-    return app
+    _bot_thread.start()
 
 
-# ==========================
-#    СТАРТ / СТОП БОТА
-# ==========================
-
-async def start_bot() -> None:
+def stop_bot_polling_in_thread() -> None:
     """
-    Инициализация и запуск polling.
-    Этот метод вызывается из FastAPI on_startup.
+    На Render процесс и так будет убит, а поток — daemon.
+    Делаем no-op, чтобы не городить сложную синхронизацию event loop'ов.
     """
-    global _bot_app
-
-    if _bot_app is None:
-        await build_bot_app()
-
-    if _bot_app is None:
-        # Нет токена — бота не запускаем
-        log.warning("[BOT] Не удалось запустить бота — нет TELEGRAM_TOKEN.")
-        return
-
-    log.info("[BOT] Запуск polling...")
-
-    # ВАЖНО: это всё асинхронные методы — они НЕ блокируют event loop навсегда
-    await _bot_app.initialize()
-    await _bot_app.start()
-    await _bot_app.updater.start_polling()
-
-    log.info("[BOT] Polling запущен.")
-
-
-async def stop_bot() -> None:
-    """
-    Корректная остановка polling.
-    Этот метод вызывается из FastAPI on_shutdown.
-    """
-    global _bot_app
-
-    if _bot_app is None:
-        return
-
-    log.info("[BOT] Остановка polling...")
-    await _bot_app.updater.stop()
-    await _bot_app.stop()
-    await _bot_app.shutdown()
-    log.info("[BOT] Бот остановлен.")
+    logger.info("[BOT] stop_bot_polling_in_thread вызван (no-op, поток завершится с процессом).")
 
 
 
