@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 from typing import Optional
@@ -15,7 +14,7 @@ from telegram.ext import (
 
 log = logging.getLogger(__name__)
 
-# Глобальные ссылки, чтобы FastAPI мог корректно останавливать бота
+# Глобальный инстанс приложения бота
 _bot_app: Optional[Application] = None
 
 
@@ -34,8 +33,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — помощь\n"
         "/health — проверка статуса бота\n"
     )
-    # ВАЖНО: без HTML/Markdown, чтобы не ловить BadRequest
-    await update.message.reply_text(text)
+    # ЖЁСТКО запрещаем Telegram парсить HTML/Markdown
+    await update.message.reply_text(text, parse_mode=None)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -47,19 +46,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — это сообщение\n"
         "/health — проверка статуса\n"
     )
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode=None)
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("[BOT] Обработана команда /health от %s", update.effective_user.id)
-    await update.message.reply_text("✅ Бот запущен и работает.")
+    await update.message.reply_text("✅ Бот запущен и работает.", parse_mode=None)
 
 
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ответ на незнакомые команды"""
+    """Ответ на неизвестные команды"""
     if update.message and update.message.text and update.message.text.startswith("/"):
         log.info("[BOT] Неизвестная команда: %s", update.message.text)
-        await update.message.reply_text("Я пока не знаю такую команду 🙈\nПопробуй /help.")
+        await update.message.reply_text(
+            "Я пока не знаю такую команду 🙈\nПопробуй /help.",
+            parse_mode=None,
+        )
 
 
 # ==========================
@@ -92,7 +94,7 @@ async def build_bot_app() -> Optional[Application]:
     app = (
         ApplicationBuilder()
         .token(token)
-        # НИКАКОГО parse_mode, чтобы не словить BadRequest на разметке
+        # parse_mode НЕ задаём, и в reply_text явно пишем parse_mode=None
         .build()
     )
 
@@ -101,10 +103,10 @@ async def build_bot_app() -> Optional[Application]:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("health", cmd_health))
 
-    # Неизвестные команды (сообщения, начинающиеся с /)
+    # Неизвестные команды
     app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown), group=0)
 
-    # Логирование любых апдейтов для диагностики
+    # Логирование всех апдейтов
     app.add_handler(MessageHandler(filters.ALL, log_any_update), group=1)
 
     _bot_app = app
@@ -113,36 +115,48 @@ async def build_bot_app() -> Optional[Application]:
 
 
 # ==========================
-#    ЗАПУСК / СТОП ПОЛЛИНГА
+#    СТАРТ / СТОП БОТА
 # ==========================
 
-async def run_polling(app: Application) -> None:
+async def start_bot() -> None:
     """
-    Запуск long polling в фоне.
-    Вызывается из FastAPI on_startup через asyncio.create_task(run_polling(...)).
+    Инициализация и запуск polling.
+    Этот метод вызывается из FastAPI on_startup.
     """
+    global _bot_app
+
+    if _bot_app is None:
+        await build_bot_app()
+
+    if _bot_app is None:
+        # Нет токена — бота не запускаем
+        log.warning("[BOT] Не удалось запустить бота — нет TELEGRAM_TOKEN.")
+        return
+
     log.info("[BOT] Запуск polling...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+
+    # ВАЖНО: это всё асинхронные методы — они НЕ блокируют event loop навсегда
+    await _bot_app.initialize()
+    await _bot_app.start()
+    await _bot_app.updater.start_polling()
+
     log.info("[BOT] Polling запущен.")
 
-    # Ждём, пока приложение не будет остановлено
-    # (updater.start_polling() сам держит цикл до stop())
-    await app.updater.wait_for_stop()
 
-    log.info("[BOT] Polling завершён.")
-
-
-async def stop_polling(app: Application) -> None:
+async def stop_bot() -> None:
     """
     Корректная остановка polling.
-    Вызывается из FastAPI on_shutdown.
+    Этот метод вызывается из FastAPI on_shutdown.
     """
+    global _bot_app
+
+    if _bot_app is None:
+        return
+
     log.info("[BOT] Остановка polling...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
+    await _bot_app.updater.stop()
+    await _bot_app.stop()
+    await _bot_app.shutdown()
     log.info("[BOT] Бот остановлен.")
 
 
