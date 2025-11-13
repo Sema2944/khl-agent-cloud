@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from src import khl_client
+from . import khl_client
 
 logger = logging.getLogger(__name__)
 
