@@ -15,13 +15,12 @@ from telegram.ext import (
     filters,
 )
 
-from . import khl_client  # ВАЖНО: относительный импорт, а не "from src import khl_client"
+from src.khl_client import BetLine, get_today_lines  # <-- ВАЖНО: так
 
 logger = logging.getLogger(__name__)
 
-# Глобальный объект приложения бота
 _bot_app: Optional[Application] = None
-_bot_started: bool = False  # наш флаг, чтобы не стартовать несколько раз
+_bot_started: bool = False
 
 
 # ====================== HANDLERS ======================
@@ -30,7 +29,6 @@ async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.message is None:
         return
 
-    # ВАЖНО: только обычный текст, без HTML-тегов (<b>, <i> и т.п.)
     text = (
         "Привет! Я бот учёта ставок.\n\n"
         "Доступные команды:\n"
@@ -74,14 +72,12 @@ async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None:
         return
 
-    # Здесь позже можно будет вызвать очистку из БД
     await update.message.reply_text("Все ставки очищены (заглушка).")
 
 
 def _format_edge(edge: Optional[float]) -> str:
     if edge is None:
         return "-"
-    # edge=0.04 -> "+4%"
     sign = "+" if edge > 0 else ""
     return f"{sign}{round(edge * 100, 1)}%"
 
@@ -93,17 +89,13 @@ def _format_prob(prob: Optional[float]) -> str:
 
 
 async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Показывает пользователю актуальные линии на сегодня на основе khl_client.get_today_lines().
-    Использует датакласс BetLine из khl_client.
-    """
     if update.message is None:
         return
 
     try:
-        lines: List[khl_client.BetLine] = await khl_client.get_today_lines()
+        lines: List[BetLine] = await get_today_lines()
     except Exception as e:
-        logger.exception("Ошибка при вызове khl_client.get_today_lines: %s", e)
+        logger.exception("Ошибка при вызове get_today_lines: %s", e)
         await update.message.reply_text(
             "Не удалось получить актуальные линии — внутренняя ошибка.\n"
             "Попробуй ещё раз чуть позже."
@@ -112,35 +104,28 @@ async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not lines:
         await update.message.reply_text(
-            "На сегодня нет доступных линий (khl_client вернул пустой список).\n"
+            "На сегодня нет доступных линий.\n"
             "Как только будут матчи, я смогу показать коэффициенты и рекомендации."
         )
         return
 
     chunks: list[str] = ["Актуальные линии на сегодня:\n"]
 
-    # Ограничимся, например, 5 матчами, чтобы не спамить
     for line in lines[:5]:
         try:
             start_str = line.start.strftime("%d.%m %H:%M UTC")
-
-            # Коэффициенты
             odds_draw_str = "-" if line.odds_draw is None else str(line.odds_draw)
 
-            # Вероятности модели
             prob_home_str = _format_prob(line.model_prob_home)
             prob_draw_str = _format_prob(line.model_prob_draw)
             prob_away_str = _format_prob(line.model_prob_away)
 
-            # Эдж (value)
             edge_home_str = _format_edge(line.edge_home)
             edge_draw_str = _format_edge(line.edge_draw)
             edge_away_str = _format_edge(line.edge_away)
 
-            # Простая рекомендация: ищем наибольший положительный edge
             best_side = None
             best_edge_val = 0.0
-
             for side, edge_val in [
                 ("дом", line.edge_home),
                 ("ничья", line.edge_draw),
@@ -183,33 +168,21 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ====================== ВСПОМОГАТЕЛЬНОЕ ======================
-
 def _create_application(token: str) -> Application:
-    """
-    Создаём Application и регистрируем хендлеры.
-    НИКАКОГО parse_mode здесь нет.
-    """
     app = ApplicationBuilder().token(token).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("addbet", _cmd_addbet))
     app.add_handler(CommandHandler("clearbets", _cmd_clearbets))
     app.add_handler(CommandHandler("bets", _cmd_bets))
 
-    # Любой текст без команды
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
 
     return app
 
 
 async def build_bot_app() -> Optional[Application]:
-    """
-    Создаёт и кэширует Application, если задан TELEGRAM_TOKEN.
-    Ничего не запускает, только строит.
-    """
     global _bot_app
 
     token = os.getenv("TELEGRAM_TOKEN")
@@ -224,13 +197,7 @@ async def build_bot_app() -> Optional[Application]:
     return _bot_app
 
 
-# ====================== ЗАПУСК / ОСТАНОВКА (ASGI-style) ======================
-
 async def start_bot_polling() -> None:
-    """
-    Стартуем бота внутри того же event loop, что и FastAPI/uvicorn.
-    Без run_polling, без потоков — только initialize/start/updater.start_polling.
-    """
     global _bot_app, _bot_started
 
     if _bot_app is None:
@@ -241,17 +208,14 @@ async def start_bot_polling() -> None:
         logger.info("[BOT] Уже запущен, пропускаем повторный start.")
         return
 
-    # Инициализация Application
     await _bot_app.initialize()
     await _bot_app.start()
 
-    # На всякий случай чистим webhook и сбрасываем старые апдейты
     try:
         await _bot_app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.exception("[BOT] Не удалось удалить webhook: %s", e)
 
-    # Запускаем polling через updater (PTB v21)
     if getattr(_bot_app, "updater", None) is not None:
         await _bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("[BOT] Polling запущен.")
@@ -261,9 +225,6 @@ async def start_bot_polling() -> None:
 
 
 async def stop_bot_polling() -> None:
-    """
-    Корректно останавливает бота при остановке приложения.
-    """
     global _bot_app, _bot_started
 
     if _bot_app is None or not _bot_started:
