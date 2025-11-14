@@ -1,10 +1,10 @@
-# src/telegram_bot.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import sqlite3
+from pathlib import Path
 from typing import Optional, List
 
 from telegram import Update
@@ -17,123 +17,102 @@ from telegram.ext import (
     filters,
 )
 
+from src.khl_client import BetLine, get_today_lines
+
 logger = logging.getLogger(__name__)
 
-# =====================================================================
-# 1. МОДЕЛЬ ЛИНИЙ И ЗАГЛУШКА get_today_lines (РАНЬШЕ БЫЛО В khl_client.py)
-# =====================================================================
-
-@dataclass
-class BetLine:
-    league: str          # например: "KHL"
-    home: str            # хозяева
-    away: str            # гости
-    start: datetime      # время начала матча
-    market: str          # рынок, например: "1X2"
-    bookmaker: str       # название конторы/источника
-    odds_home: float
-    odds_away: float
-    odds_draw: Optional[float] = None
-    model_prob_home: Optional[float] = None
-    model_prob_away: Optional[float] = None
-    model_prob_draw: Optional[float] = None
-    edge_home: Optional[float] = None   # value (например, 0.05 = +5%)
-    edge_away: Optional[float] = None
-    edge_draw: Optional[float] = None
-
-
-async def get_today_lines() -> List[BetLine]:
-    """
-    Вернуть список линий на сегодня.
-    Сейчас — заглушка, чтобы бот уже умел что-то показать.
-    Потом сюда подключишь реальный парсер/модель.
-    """
-    now = datetime.now(timezone.utc)
-    example = BetLine(
-        league="KHL",
-        home="СКА",
-        away="ЦСКА",
-        start=now,
-        market="1X2",
-        bookmaker="DemoBook",
-        odds_home=1.85,
-        odds_away=2.10,
-        odds_draw=3.90,
-        model_prob_home=0.54,
-        model_prob_away=0.38,
-        model_prob_draw=0.08,
-        edge_home=0.04,   # типа +4% value на хозяев
-        edge_away=None,
-        edge_draw=None,
-    )
-    return [example]
-
-# =====================================================================
-# 2. TELEGRAM-БОТ
-# =====================================================================
+# ====== SQLite: путь к файлу ======
+DB_PATH = Path(os.getenv("BETBOT_DB_PATH", "betbot.sqlite3"))
 
 # Глобальный объект приложения бота
 _bot_app: Optional[Application] = None
+_bot_started: bool = False  # флаг, чтобы не стартовать несколько раз
 
 
-# ====================== HANDLERS ======================
+# ====================== SQLite-хелперы ======================
 
-async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _ensure_db() -> None:
+    """Создаём таблицы, если их ещё нет."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id    INTEGER PRIMARY KEY,
+                first_name TEXT,
+                username   TEXT,
+                created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bets (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                text       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _register_user_from_update(update: Update) -> None:
+    """Сохраняем пользователя, если ещё не сохранён."""
     if update.message is None:
         return
-
-    # ВАЖНО: только обычный текст, без HTML-тегов (<b>, <i> и т.п.)
-    text = (
-        "Привет! Я бот учёта ставок.\n\n"
-        "Доступные команды:\n"
-        "/addbet Описание ставки — добавить ставку\n"
-        "/clearbets — очистить список ставок\n"
-        "/bets — показать актуальные линии и рекомендации\n"
-        "/help — показать справку\n"
-    )
-
-    await update.message.reply_text(text)
-
-
-async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
+    user = update.message.from_user
+    if user is None:
         return
 
-    text = (
-        "Справка по боту:\n\n"
-        "/start — запустить бота и показать приветствие\n"
-        "/addbet Описание ставки — добавить ставку\n"
-        "/clearbets — удалить все сохранённые ставки\n"
-        "/bets — показать актуальные линии и рекомендации\n"
-    )
+    chat_id = update.message.chat_id
+    first_name = user.first_name or ""
+    username = user.username or ""
+    created_at = update.message.date.isoformat() if update.message.date else ""
 
-    await update.message.reply_text(text)
-
-
-async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование: /addbet Описание ставки")
-        return
-
-    description = " ".join(context.args)
-    await update.message.reply_text(f"Ставка добавлена: {description}")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO users (chat_id, first_name, username, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, first_name, username, created_at),
+        )
+        conn.commit()
 
 
-async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
-        return
+def _save_bet(chat_id: int, text: str, created_at_iso: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO bets (chat_id, text, created_at) VALUES (?, ?, ?)",
+            (chat_id, text, created_at_iso),
+        )
+        conn.commit()
 
-    # Здесь позже можно будет вызвать очистку из БД
-    await update.message.reply_text("Все ставки очищены (заглушка).")
 
+def _clear_bets(chat_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM bets WHERE chat_id = ?",
+            (chat_id,),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def _get_all_chat_ids() -> List[int]:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT chat_id FROM users").fetchall()
+    return [r[0] for r in rows]
+
+
+# ====================== Формататоры ======================
 
 def _format_edge(edge: Optional[float]) -> str:
     if edge is None:
         return "-"
-    # edge=0.04 -> "+4%"
     sign = "+" if edge > 0 else ""
     return f"{sign}{round(edge * 100, 1)}%"
 
@@ -144,51 +123,23 @@ def _format_prob(prob: Optional[float]) -> str:
     return f"{round(prob * 100, 1)}%"
 
 
-async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Показывает пользователю актуальные линии на сегодня на основе get_today_lines().
-    """
-    if update.message is None:
-        return
+def _format_lines_for_message(lines: List[BetLine], title: str) -> str:
+    chunks: list[str] = [title]
 
-    try:
-        lines: List[BetLine] = await get_today_lines()
-    except Exception as e:
-        logger.exception("Ошибка при вызове get_today_lines: %s", e)
-        await update.message.reply_text(
-            "Не удалось получить актуальные линии — внутренняя ошибка.\n"
-            "Попробуй ещё раз чуть позже."
-        )
-        return
-
-    if not lines:
-        await update.message.reply_text(
-            "На сегодня нет доступных линий.\n"
-            "Как только будут матчи, я смогу показать коэффициенты и рекомендации."
-        )
-        return
-
-    chunks: list[str] = ["Актуальные линии на сегодня:\n"]
-
-    # Ограничимся, например, 5 матчами, чтобы не спамить
     for line in lines[:5]:
         try:
-            start_str = line.start.strftime("%d.%m %H:%M UTC")
+            start_str = line.start.strftime("%d.%m %H:%M")
 
-            # Коэффициенты
             odds_draw_str = "-" if line.odds_draw is None else str(line.odds_draw)
 
-            # Вероятности модели
             prob_home_str = _format_prob(line.model_prob_home)
             prob_draw_str = _format_prob(line.model_prob_draw)
             prob_away_str = _format_prob(line.model_prob_away)
 
-            # Эдж (value)
             edge_home_str = _format_edge(line.edge_home)
             edge_draw_str = _format_edge(line.edge_draw)
             edge_away_str = _format_edge(line.edge_away)
 
-            # Простая рекомендация: ищем наибольший положительный edge
             best_side = None
             best_edge_val = 0.0
 
@@ -223,7 +174,102 @@ async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Ошибка форматирования BetLine: %s", e)
             continue
 
-    text = "\n\n".join(chunks)
+    return "\n\n".join(chunks)
+
+
+# ====================== HANDLERS ======================
+
+async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    _register_user_from_update(update)
+
+    text = (
+        "Привет! Я бот учёта ставок.\n\n"
+        "Доступные команды:\n"
+        "/addbet Описание ставки — добавить ставку\n"
+        "/clearbets — очистить список своих ставок\n"
+        "/bets — показать актуальные линии и рекомендации\n"
+        "/help — показать справку\n\n"
+        "⚠️ Помни, что ставки — это риск. Не ставь больше, чем готов проиграть."
+    )
+
+    await update.message.reply_text(text)
+
+
+async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    text = (
+        "Справка по боту:\n\n"
+        "/start — запустить бота и показать приветствие\n"
+        "/addbet Описание ставки — добавить ставку в базу\n"
+        "/clearbets — удалить все свои сохранённые ставки\n"
+        "/bets — показать актуальные линии и рекомендации\n"
+    )
+
+    await update.message.reply_text(text)
+
+
+async def _cmd_addbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    _register_user_from_update(update)
+
+    if not context.args:
+        await update.message.reply_text("Использование: /addbet Описание ставки")
+        return
+
+    description = " ".join(context.args)
+    created_at_iso = (
+        update.message.date.isoformat() if update.message.date else ""
+    )
+
+    _save_bet(update.message.chat_id, description, created_at_iso)
+
+    await update.message.reply_text(f"Ставка сохранена: {description}")
+
+
+async def _cmd_clearbets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    _register_user_from_update(update)
+
+    deleted = _clear_bets(update.message.chat_id)
+    if deleted:
+        await update.message.reply_text(f"Удалено ставок: {deleted}.")
+    else:
+        await update.message.reply_text("У тебя не было сохранённых ставок.")
+
+
+async def _cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    _register_user_from_update(update)
+
+    try:
+        lines = await get_today_lines()
+    except Exception as e:
+        logger.exception("Ошибка при get_today_lines: %s", e)
+        await update.message.reply_text(
+            "Не удалось получить актуальные линии — внутренняя ошибка.\n"
+            "Попробуй ещё раз чуть позже."
+        )
+        return
+
+    if not lines:
+        await update.message.reply_text(
+            "На сегодня нет доступных линий.\n"
+            "Как только будут матчи, я смогу показать коэффициенты и рекомендации."
+        )
+        return
+
+    text = _format_lines_for_message(lines, "Актуальные линии на сегодня:\n")
     await update.message.reply_text(text)
 
 
@@ -231,10 +277,75 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
 
+    _register_user_from_update(update)
+
     await update.message.reply_text(
         "Я пока понимаю только команды.\n"
         "Напиши /help, чтобы посмотреть список доступных команд."
     )
+
+
+# ====================== АВТОУВЕДОМЛЕНИЯ ======================
+
+async def _notify_all_users_once() -> None:
+    """
+    Разослать всем пользователям актуальные линии (если есть).
+    Используется в фоне.
+    """
+    global _bot_app
+
+    if _bot_app is None:
+        return
+
+    try:
+        lines = await get_today_lines()
+    except Exception as e:
+        logger.exception("Ошибка при get_today_lines в автоуведомлении: %s", e)
+        return
+
+    if not lines:
+        logger.info("Автоуведомление: линий нет, рассылку пропускаем.")
+        return
+
+    text = _format_lines_for_message(
+        lines,
+        "Автообновление линий:\n",
+    )
+
+    chat_ids = _get_all_chat_ids()
+    if not chat_ids:
+        logger.info("Автоуведомление: подписчиков нет, рассылку пропускаем.")
+        return
+
+    logger.info("Автоуведомление: рассылаем %d пользователям", len(chat_ids))
+
+    for chat_id in chat_ids:
+        try:
+            await _bot_app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.exception(
+                "Не удалось отправить автоуведомление в chat_id=%s: %s",
+                chat_id,
+                e,
+            )
+
+
+async def _auto_notify_loop() -> None:
+    """
+    Фоновая задача: периодически шлёт автоуведомления.
+    Сейчас — раз в 3 часа.
+    """
+    # Небольшая пауза после старта, чтобы всё успело проинициализироваться
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            await _notify_all_users_once()
+        except Exception as e:
+            logger.exception("Ошибка в автоуведомлении: %s", e)
+
+        # Ждём 3 часа до следующей рассылки
+        await asyncio.sleep(3 * 60 * 60)
 
 
 # ====================== ВСПОМОГАТЕЛЬНОЕ ======================
@@ -271,6 +382,9 @@ async def build_bot_app() -> Optional[Application]:
         logger.warning("⚠️ TELEGRAM_TOKEN не задан — бот не будет запущен.")
         return None
 
+    # Инициализируем SQLite
+    _ensure_db()
+
     if _bot_app is None:
         _bot_app = _create_application(token)
         logger.info("[BOT] Application создан.")
@@ -278,15 +392,13 @@ async def build_bot_app() -> Optional[Application]:
     return _bot_app
 
 
-# ====================== ЗАПУСК / ОСТАНОВКА (ASGI-style) ======================
-
-_bot_started: bool = False  # наш флаг, чтобы не стартовать несколько раз
-
+# ====================== ЗАПУСК / ОСТАНОВКА ======================
 
 async def start_bot_polling() -> None:
     """
     Стартуем бота внутри того же event loop, что и FastAPI/uvicorn.
     Без run_polling, без потоков — только initialize/start/updater.start_polling.
+    Плюс запускаем фоновую задачу автоуведомлений.
     """
     global _bot_app, _bot_started
 
@@ -298,23 +410,25 @@ async def start_bot_polling() -> None:
         logger.info("[BOT] Уже запущен, пропускаем повторный start.")
         return
 
-    # Инициализация Application
     await _bot_app.initialize()
     await _bot_app.start()
 
-    # На всякий случай чистим webhook и сбрасываем старые апдейты
     try:
         await _bot_app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         logger.exception("[BOT] Не удалось удалить webhook: %s", e)
 
-    # Запускаем polling через updater (PTB v21)
     if getattr(_bot_app, "updater", None) is not None:
         await _bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("[BOT] Polling запущен.")
         _bot_started = True
     else:
         logger.warning("[BOT] У Application нет updater — polling не запущен.")
+        return
+
+    # Запускаем фоновую задачу автоуведомлений
+    loop = asyncio.get_running_loop()
+    loop.create_task(_auto_notify_loop())
 
 
 async def stop_bot_polling() -> None:
