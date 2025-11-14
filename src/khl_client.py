@@ -4,142 +4,146 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
+import logging
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
+
+# ======================= МОДЕЛЬ ЛИНИИ =======================
 
 @dataclass
 class BetLine:
-    id: str              # внутренний id линии/матча
-    league: str
-    home: str
-    away: str
-    start: datetime
-    market: str          # например "1X2"
-    bookmaker: str
+    league: str          # например: "KHL"
+    home: str            # хозяева
+    away: str            # гости
+    start: datetime      # время начала матча (UTC)
+    market: str          # рынок, например: "1X2"
+    bookmaker: str       # название конторы/источника
     odds_home: float
     odds_away: float
     odds_draw: Optional[float] = None
+
     model_prob_home: Optional[float] = None
     model_prob_away: Optional[float] = None
     model_prob_draw: Optional[float] = None
-    edge_home: Optional[float] = None
+
+    edge_home: Optional[float] = None   # value (например, 0.05 = +5%)
     edge_away: Optional[float] = None
     edge_draw: Optional[float] = None
 
 
-# ==== ВСПОМОГАТЕЛЬНОЕ: парсер Winline (каркас) ====
+# ======================= КОНСТАНТЫ WINLINE =======================
+
+WINLINE_HOCKEY_URL = "https://winline.ru/stavki/sport/xokkej"
+
+# Заголовки, чтобы нас не посчитали странным ботом/скриптом
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
 
-WINLINE_API_URL = "https://www.winline.ru/api/v2/line?sport=khl"  # ПРИМЕР! подгонять под реальный URL
+# ======================= ВНЕШНЯЯ ФУНКЦИЯ =======================
 
-
-async def _fetch_winline_json() -> dict:
+async def get_today_lines() -> List[BetLine]:
     """
-    Тянем JSON с сервера Winline.
-    Здесь URL пока примерный — его нужно потом подогнать под реальный эндпоинт.
+    Главная функция, которую вызывает бот.
+
+    1. Пытается скачать HTML с Winline (страница хоккея).
+    2. Пытается распарсить актуальные линии.
+    3. Если что-то идёт не так — отдаёт демо-линию,
+       чтобы бот не падал и продолжал работать.
     """
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(WINLINE_API_URL)
-        resp.raise_for_status()
-        return resp.json()
+    try:
+        html = await _fetch_winline_html()
+    except Exception as e:
+        logger.exception("Не удалось скачать страницу Winline: %s", e)
+        return _demo_lines()
 
+    try:
+        lines = _parse_winline_html(html)
+    except Exception as e:
+        logger.exception("Ошибка парсинга HTML Winline: %s", e)
+        return _demo_lines()
 
-def _parse_winline_json(data: dict) -> List[BetLine]:
-    """
-    Парсим "сырой" JSON Winline в список BetLine.
-    Структуру нужно будет подогнать под реальное API.
-    Сейчас — разумный каркас.
-    """
-    lines: List[BetLine] = []
-
-    # >>> НИЖЕ ПРИМЕР СТРУКТУРЫ. ПОДГОНИМ ПОТОМ ПОД РЕАЛЬНЫЙ JSON <<<
-    # Допустим, data["events"] — список матчей
-    events = data.get("events") or data.get("matches") or []
-
-    for ev in events:
-        try:
-            league = ev.get("league", "KHL")
-            home = ev.get("homeTeam", {}).get("name") or ev.get("home", "Home")
-            away = ev.get("awayTeam", {}).get("name") or ev.get("away", "Away")
-
-            # время начала — часто в формате ISO или timestamp
-            # пробуем ISO:
-            start_raw = ev.get("startTime") or ev.get("start")
-            if isinstance(start_raw, str):
-                # простой парсер ISO (2025-11-13T17:30:00Z и т.п.)
-                start = datetime.fromisoformat(
-                    start_raw.replace("Z", "+00:00")
-                )
-            elif isinstance(start_raw, (int, float)):
-                start = datetime.fromtimestamp(start_raw, tz=timezone.utc)
-            else:
-                start = datetime.now(tz=timezone.utc)
-
-            # коэффициенты. Предположим, есть поле markets -> list
-            odds_home = 0.0
-            odds_away = 0.0
-            odds_draw: Optional[float] = None
-            market_name = "1X2"
-
-            markets = ev.get("markets", [])
-            for m in markets:
-                name = m.get("name", "").lower()
-                # ищем 1X2
-                if "1x2" in name or "исход" in name:
-                    outcomes = m.get("outcomes", [])
-                    for out in outcomes:
-                        code = out.get("code") or out.get("name", "").upper()
-                        k = float(out.get("price") or out.get("k") or 0)
-                        if code in ("1", "HOME"):
-                            odds_home = k
-                        elif code in ("2", "AWAY"):
-                            odds_away = k
-                        elif code in ("X", "DRAW"):
-                            odds_draw = k
-                    break
-
-            # если не нашли рынок — пропускаем матч
-            if not odds_home or not odds_away:
-                continue
-
-            line = BetLine(
-                id=str(ev.get("id") or ev.get("eventId") or f"{home}-{away}-{start.timestamp()}"),
-                league=league,
-                home=home,
-                away=away,
-                start=start,
-                market=market_name,
-                bookmaker="Winline",
-                odds_home=odds_home,
-                odds_away=odds_away,
-                odds_draw=odds_draw,
-                # пока модельные вероятности и edge — None
-            )
-            lines.append(line)
-
-        except Exception:
-            # лучше не падать на одном битом событии
-            continue
+    if not lines:
+        # Если парсер ничего не нашёл — тоже не валимся, а даём демо
+        logger.warning("Парсер Winline вернул пустой список — использую демо-линию.")
+        return _demo_lines()
 
     return lines
 
 
-async def get_today_lines() -> List[BetLine]:
+# ======================= HTTP-КЛИЕНТ =======================
+
+async def _fetch_winline_html() -> str:
     """
-    Основная точка входа для бота: вернуть список линий на сегодня.
-    Сейчас — Winline + простая фильтрация по дате.
+    Скачиваем HTML страницы хоккея с Winline.
+
+    В будущем, если найдём JSON-API Winline для prematch,
+    можно будет вместо HTML дёргать чистый JSON.
     """
-    try:
-        raw = await _fetch_winline_json()
-    except Exception:
-        # если Winline недоступен — можно вернуть пустой список или демо
-        return []
+    async with httpx.AsyncClient(headers=DEFAULT_HEADERS, timeout=15.0) as client:
+        resp = await client.get(WINLINE_HOCKEY_URL)
+        resp.raise_for_status()
+        return resp.text
 
-    all_lines = _parse_winline_json(raw)
 
-    # Фильтруем по "сегодня" (UTC) грубо: дата совпадает
-    today = datetime.now(tz=timezone.utc).date()
-    today_lines = [l for l in all_lines if l.start.date() == today]
+# ======================= ПАРСИНГ HTML =======================
 
-    return today_lines
+def _parse_winline_html(html: str) -> List[BetLine]:
+    """
+    Черновой парсер HTML Winline.
+
+    ВАЖНО:
+    - Сейчас мы не видим весь JS/JSON Winline (они подгружают много через XHR),
+      у нас только статический HTML-пример.
+    - Поэтому тут пока «каркас» парсера и fallback.
+    - Как только будет известен реальный JSON/структура,
+      внутрь этой функции можно будет вставить нормальный разбор.
+    """
+
+    # TODO: когда появится реальный JSON/HTML-структура:
+    #  1. Найти в HTML <script> с JSON-состоянием (Nuxt/React/Angular).
+    #  2. Вытянуть оттуда список событий (KHL / хоккей).
+    #  3. Преобразовать в список BetLine.
+
+    # Пока — просто возвращаем ту же демо-линию, но помечаем,
+    # что источник якобы Winline, чтобы было видно, откуда это.
+    logger.info("Пока что парсер Winline работает в демо-режиме.")
+    return _demo_lines(bookmaker="Winline (demo parser)")
+
+
+# ======================= DEMO-ДАННЫЕ =======================
+
+def _demo_lines(bookmaker: str = "DemoBook") -> List[BetLine]:
+    """
+    Запасной вариант: одна демо-игра КХЛ, чтобы бот не молчал.
+    """
+    now = datetime.now(timezone.utc)
+
+    example = BetLine(
+        league="KHL",
+        home="СКА",
+        away="ЦСКА",
+        start=now,
+        market="1X2",
+        bookmaker=bookmaker,
+        odds_home=1.85,
+        odds_away=2.10,
+        odds_draw=3.90,
+        model_prob_home=0.54,
+        model_prob_away=0.38,
+        model_prob_draw=0.08,
+        edge_home=0.04,   # условные +4% value на хозяев
+        edge_away=None,
+        edge_draw=None,
+    )
+    return [example]
