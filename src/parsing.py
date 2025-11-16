@@ -52,6 +52,7 @@ async def get_khl_events_for_today() -> List[Event]:
     """
     Тянем все события, фильтруем leagueName == 'KHL',
     для каждого подгружаем маркеты и приводим к Event.
+    СЕЙЧАС ЭТА ФУНКЦИЯ НАМ НЕ НУЖНА, НО ПУСТЬ ЛЕЖИТ ПРАВИЛЬНОЙ.
     """
     data = await _fetch_events_raw()
     events_raw = data.get("data", [])
