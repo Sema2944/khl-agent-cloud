@@ -15,9 +15,6 @@ from sqlmodel import SQLModel, Field, Session, select
 class Bet(SQLModel, table=True):
     """
     Запись о ставке пользователя.
-
-    ВАЖНО: используем отдельное имя таблицы "bets", чтобы не конфликтовать
-    со старой схемой, если она уже была.
     """
     __tablename__ = "bets"
 
@@ -31,6 +28,7 @@ class Bet(SQLModel, table=True):
 
     # базовые поля
     stake: Optional[float] = None          # сумма ставки
+    odds: Optional[float] = None           # коэффициент (например 1.85)
     event: Optional[str] = None            # матч / событие (пока не парсим)
     outcome: Optional[str] = None          # исход (П1, тотал и т.п.)
 
@@ -65,6 +63,7 @@ def add_bet(
     user_id: int,
     raw_text: str,
     stake: Optional[float] = None,
+    odds: Optional[float] = None,
     event: Optional[str] = None,
     outcome: Optional[str] = None,
 ) -> Bet:
@@ -75,6 +74,7 @@ def add_bet(
         user_id=user_id,
         raw_text=raw_text,
         stake=stake,
+        odds=odds,
         event=event,
         outcome=outcome,
     )
@@ -101,11 +101,13 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
     """
     Отмечаем ставку рассчитанной: result = "win" или "lose".
 
-    Для простоты считаем:
-    - если есть stake:
+    Расчёт PnL:
+    - если есть stake и odds:
+        win  -> profit = stake * (odds - 1)
+        lose -> profit = -stake
+    - если есть только stake:
         win  -> profit = +stake
         lose -> profit = -stake
-    - если stake нет -> profit остаётся None (участвует только в winrate).
     """
     result = result.lower().strip()
     if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
@@ -125,10 +127,18 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
     bet.settled_at = datetime.utcnow()
 
     if bet.stake is not None:
+        stake = float(bet.stake)
+        odds = float(bet.odds) if bet.odds is not None else None
+
         if norm_result == "win":
-            bet.profit = float(bet.stake)
+            if odds is not None and odds > 1.01:
+                # классика: чистая прибыль = ставка * (кэф - 1)
+                bet.profit = stake * (odds - 1.0)
+            else:
+                # если кэф неизвестен, считаем прибыль = ставка
+                bet.profit = stake
         elif norm_result == "lose":
-            bet.profit = -float(bet.stake)
+            bet.profit = -stake
 
     session.add(bet)
     session.commit()
