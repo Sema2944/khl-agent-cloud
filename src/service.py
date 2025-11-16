@@ -184,9 +184,10 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     if text.startswith("ставка"):
         # Оригинальный текст лучше взять без .lower(), чтобы не терять регистр:
         raw_text = original_text.strip()
+        lower_text = raw_text.lower()
 
-        # Ищем все числа: первое — считаем суммой, второе (если есть) — кэф
-        # Пример: "ставка 1000 на СКА победа за 1.85"
+        # ---------- ПАРСИНГ СУММЫ ----------
+        # Ищем все числа в строке
         num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
         numbers = [m[0] for m in num_matches]
 
@@ -194,17 +195,50 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         odds = None
 
         if numbers:
-            # первое число — сумма ставки
+            # первое число — КАНДИДАТ в сумму ставки
             try:
                 stake = float(numbers[0].replace(",", "."))
             except ValueError:
                 stake = None
 
-        if len(numbers) >= 2:
-            # второе число — коэффициент
+        # ---------- ПАРСИНГ КЭФА ПО КЛЮЧЕВЫМ СЛОВАМ ----------
+
+        # 1) Прямо рядом со словами "коэф", "кф", "кэф", "коэфф", "коэффициент"
+        coef_pattern = re.compile(
+            r"(коэф(фициент)?|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
+            re.IGNORECASE,
+        )
+        m_coef = coef_pattern.search(raw_text)
+        if m_coef:
+            try:
+                candidate_odds = float(m_coef.group(3).replace(",", "."))
+                if candidate_odds >= 1.01:
+                    odds = candidate_odds
+            except ValueError:
+                odds = None
+
+        # 2) Конструкции "за 1.85" или "по 1,75" — часто так пишут кэф
+        if odds is None:
+            za_pattern = re.compile(
+                r"\b(за|по)\s*(\d+([\.,]\d+)?)",
+                re.IGNORECASE,
+            )
+            m_za = za_pattern.search(raw_text)
+            if m_za:
+                try:
+                    candidate_odds = float(m_za.group(2).replace(",", "."))
+                    # фильтр: кэфы обычно в диапазоне 1.01–20
+                    if 1.01 <= candidate_odds <= 20:
+                        # и не совпадает с явной ставкой в тысячах
+                        if not (stake is not None and stake >= 50 and candidate_odds == stake):
+                            odds = candidate_odds
+                except ValueError:
+                    pass
+
+        # 3) Если ничего не нашли по словам — используем второе число как кэф
+        if odds is None and len(numbers) >= 2:
             try:
                 candidate_odds = float(numbers[1].replace(",", "."))
-                # небольшой фильтр: кэф обычно >= 1.01
                 if candidate_odds >= 1.01:
                     odds = candidate_odds
             except ValueError:
@@ -241,6 +275,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• По фразе 'ставка N выиграла/проиграла' отмечать результат и считать winrate/ROI\n\n"
         "Попробуй, например:\n"
         "• 'ставка 1000 на СКА победа за 1.85'\n"
+        "• 'ставка 500 Спартак тотал больше 4.5 коэф 2.1'\n"
+        "• 'ставка 700 на Зенит по 1,75'\n"
         "• 'мои ставки'\n"
         "• 'ставка 1 выиграла'\n"
         "• 'Покажи мою статистику'\n"
