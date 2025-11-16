@@ -48,11 +48,12 @@ class Bet(SQLModel, table=True):
 @dataclass
 class UserStats:
     total_bets: int        # всего ставок (в т.ч. нерасчитанных)
-    settled_bets: int      # рассчитанных ставок
-    winrate: float         # % выигрышей по рассчитанным
-    roi: float             # ROI по рассчитанным
-    pnl: float             # общий плюс/минус
-    total_stake: float     # суммарный объём ставок (по рассчитанным)
+    settled_bets: int      # рассчитанных (win/lose, без возвратов)
+    pushes: int            # количество возвратов
+    winrate: float         # % выигрышей по win/lose
+    roi: float             # ROI по win/lose
+    pnl: float             # общий плюс/минус (win/lose)
+    total_stake: float     # суммарный объём ставок (win/lose)
 
 
 # ---------- ОПЕРАЦИИ С БАЗОЙ ----------
@@ -99,21 +100,25 @@ def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
 
 def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
     """
-    Отмечаем ставку рассчитанной: result = "win" или "lose".
+    Отмечаем ставку рассчитанной: result = "win" / "lose" / "push".
 
     Расчёт PnL:
     - если есть stake и odds:
         win  -> profit = stake * (odds - 1)
         lose -> profit = -stake
+        push -> profit = 0
     - если есть только stake:
         win  -> profit = +stake
         lose -> profit = -stake
+        push -> profit = 0
     """
     result = result.lower().strip()
     if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
         norm_result = "win"
     elif result in ("lose", "loss", "проигрыш", "проиграл", "проиграла", "проиграли"):
         norm_result = "lose"
+    elif result in ("push", "refund", "возврат", "возврату", "возврата"):
+        norm_result = "push"
     else:
         # неизвестный результат
         return None
@@ -139,6 +144,8 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
                 bet.profit = stake
         elif norm_result == "lose":
             bet.profit = -stake
+        elif norm_result == "push":
+            bet.profit = 0.0
 
     session.add(bet)
     session.commit()
@@ -149,6 +156,9 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
 def get_user_stats(session: Session, user_id: int) -> UserStats:
     """
     Реальная статистика по пользователю.
+
+    Винрейт и ROI считаем только по win/lose (без push),
+    но при этом учитываем количество возвратов отдельно.
     """
     statement = select(Bet).where(Bet.user_id == user_id)
     bets = list(session.exec(statement))
@@ -158,36 +168,40 @@ def get_user_stats(session: Session, user_id: int) -> UserStats:
         return UserStats(
             total_bets=0,
             settled_bets=0,
+            pushes=0,
             winrate=0.0,
             roi=0.0,
             pnl=0.0,
             total_stake=0.0,
         )
 
-    settled = [b for b in bets if b.result is not None]
-    settled_count = len(settled)
+    wins = [b for b in bets if b.result == "win"]
+    loses = [b for b in bets if b.result == "lose"]
+    non_push = wins + loses
+    pushes = [b for b in bets if b.result == "push"]
+
+    settled_count = len(non_push)
 
     if settled_count == 0:
         return UserStats(
             total_bets=total,
             settled_bets=0,
+            pushes=len(pushes),
             winrate=0.0,
             roi=0.0,
             pnl=0.0,
             total_stake=0.0,
         )
 
-    wins = [b for b in settled if b.result == "win"]
     winrate = len(wins) / settled_count * 100.0
-
-    pnl = sum(b.profit or 0.0 for b in settled)
-
-    total_stake = sum(b.stake or 0.0 for b in settled)
+    pnl = sum(b.profit or 0.0 for b in non_push)
+    total_stake = sum(b.stake or 0.0 for b in non_push)
     roi = (pnl / total_stake * 100.0) if total_stake > 0 else 0.0
 
     return UserStats(
         total_bets=total,
         settled_bets=settled_count,
+        pushes=len(pushes),
         winrate=winrate,
         roi=roi,
         pnl=pnl,
