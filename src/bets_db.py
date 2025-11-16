@@ -1,85 +1,80 @@
 # src/bets_db.py
-from __future__ import annotations
-
-import sqlite3
-from dataclasses import dataclass
+from typing import Optional, List
 from datetime import datetime
-from pathlib import Path
-from typing import List
 
-DB_PATH = Path("bets.sqlite3")
+from sqlmodel import SQLModel, Field, Session, select
 
 
-@dataclass
-class UserBet:
-    id: int
+class Bet(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int
-    created_at: datetime
-    description: str
+
+    event_id: Optional[int] = None
+    sport: Optional[str] = None
+    league: Optional[str] = None
+    team1: Optional[str] = None
+    team2: Optional[str] = None
+    market: Optional[str] = None
+
+    odds: float
+    stake: float
+    status: str = "open"  # open | win | lose | push
+    profit: float = 0.0
+
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    settled_at: Optional[datetime] = None
 
 
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class UserStats(SQLModel):
+    total_bets: int
+    wins: int
+    losses: int
+    pushes: int
+    pnl: float
+    roi: float
+    winrate: float
 
 
-def init_db() -> None:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            description TEXT NOT NULL
-        );
-        """
+def get_user_bets(session: Session, user_id: int, limit: int = 1000) -> List[Bet]:
+    stmt = (
+        select(Bet)
+        .where(Bet.user_id == user_id)
+        .order_by(Bet.created_at.desc())
+        .limit(limit)
     )
-    conn.commit()
-    conn.close()
+    return list(session.exec(stmt))
 
 
-def add_bet(user_id: int, description: str) -> None:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO bets (user_id, created_at, description)
-        VALUES (?, ?, ?)
-        """,
-        (user_id, datetime.utcnow().isoformat(), description),
-    )
-    conn.commit()
-    conn.close()
+def get_user_stats(session: Session, user_id: int) -> UserStats:
+    bets = get_user_bets(session, user_id)
+    total = len(bets)
 
-
-def clear_bets(user_id: int) -> None:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM bets WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def list_bets(user_id: int) -> List[UserBet]:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, user_id, created_at, description "
-        "FROM bets WHERE user_id = ? ORDER BY id DESC",
-        (user_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    return [
-        UserBet(
-            id=row["id"],
-            user_id=row["user_id"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            description=row["description"],
+    if total == 0:
+        return UserStats(
+            total_bets=0,
+            wins=0,
+            losses=0,
+            pushes=0,
+            pnl=0.0,
+            roi=0.0,
+            winrate=0.0,
         )
-        for row in rows
-    ]
+
+    wins = sum(1 for b in bets if b.status == "win")
+    losses = sum(1 for b in bets if b.status == "lose")
+    pushes = sum(1 for b in bets if b.status == "push")
+    pnl = sum(b.profit for b in bets)
+    invested = sum(b.stake for b in bets)
+    roi = (pnl / invested * 100) if invested else 0.0
+    winrate = wins / total * 100
+
+    return UserStats(
+        total_bets=total,
+        wins=wins,
+        losses=losses,
+        pushes=pushes,
+        pnl=pnl,
+        roi=roi,
+        winrate=winrate,
+    )
+
