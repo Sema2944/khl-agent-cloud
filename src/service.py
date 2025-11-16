@@ -74,8 +74,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     Простейший if/else-агент.
     Дальше сюда можно будет наворачивать более умную логику и LLM.
     """
-    import re
-
     original_text = message or ""
     text = original_text.lower().strip()
 
@@ -170,6 +168,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             line = f"{b.created_at:%d.%m %H:%M} — {b.raw_text}"
             if b.stake:
                 line += f" | сумма: {b.stake:g}"
+            if b.odds:
+                line += f" | кэф: {b.odds:.2f}"
             if b.result:
                 human_res = "выигрыш" if b.result == "win" else "проигрыш"
                 line += f" | результат: {human_res}"
@@ -185,26 +185,44 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         # Оригинальный текст лучше взять без .lower(), чтобы не терять регистр:
         raw_text = original_text.strip()
 
-        # Простейший парсинг суммы: ищем первое число в строке
+        # Ищем все числа: первое — считаем суммой, второе (если есть) — кэф
+        # Пример: "ставка 1000 на СКА победа за 1.85"
+        num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
+        numbers = [m[0] for m in num_matches]
+
         stake = None
-        m = re.search(r"\b(\d+([\.,]\d+)?)\b", raw_text)
-        if m:
-            stake_str = m.group(1).replace(",", ".")
+        odds = None
+
+        if numbers:
+            # первое число — сумма ставки
             try:
-                stake = float(stake_str)
+                stake = float(numbers[0].replace(",", "."))
             except ValueError:
                 stake = None
+
+        if len(numbers) >= 2:
+            # второе число — коэффициент
+            try:
+                candidate_odds = float(numbers[1].replace(",", "."))
+                # небольшой фильтр: кэф обычно >= 1.01
+                if candidate_odds >= 1.01:
+                    odds = candidate_odds
+            except ValueError:
+                odds = None
 
         bet = add_bet(
             session=session,
             user_id=user_id,
             raw_text=raw_text,
             stake=stake,
+            odds=odds,
         )
 
         resp = f"Ставка сохранена (id: {bet.id}).\n\nТекст: {bet.raw_text}"
-        if stake:
+        if stake is not None:
             resp += f"\nСумма: {stake:g}"
+        if odds is not None:
+            resp += f"\nКоэффициент: {odds:.2f}"
         resp += (
             "\n\nКогда узнаешь результат, напиши, например:\n"
             f"'ставка {bet.id} выиграла' или 'ставка {bet.id} проиграла'.\n"
@@ -222,7 +240,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• По запросу 'мои ставки' показывать последние сохранённые\n"
         "• По фразе 'ставка N выиграла/проиграла' отмечать результат и считать winrate/ROI\n\n"
         "Попробуй, например:\n"
-        "• 'ставка 1000 на СКА победа'\n"
+        "• 'ставка 1000 на СКА победа за 1.85'\n"
         "• 'мои ставки'\n"
         "• 'ставка 1 выиграла'\n"
         "• 'Покажи мою статистику'\n"
