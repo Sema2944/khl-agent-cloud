@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from .db import init_db, get_session
-from .bets_db import get_user_stats
+from .bets_db import get_user_stats, add_bet, get_last_bets, settle_bet
 from .khl_client import get_today_khl_events
 
 logger = logging.getLogger(__name__)
