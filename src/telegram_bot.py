@@ -81,9 +81,11 @@ def main() -> None:
     """
     Точка входа бота.
 
-    ВАЖНО: мы запускаем бота в отдельном потоке из FastAPI,
-    поэтому здесь вручную создаём и навешиваем event loop
-    для этого потока перед app.run_polling().
+    ВАЖНО:
+    - бот запускается в отдельном потоке (из FastAPI),
+    - поэтому мы создаём свой asyncio event loop,
+    - и избегаем установки signal handlers (stop_signals=None),
+      иначе Python ругается `set_wakeup_fd only works in main thread`.
     """
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
@@ -101,5 +103,6 @@ def main() -> None:
     # Все текстовые сообщения (кроме команд) — в агент
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Блокирующий запуск polling в этом потоке с только что созданным event loop
-    app.run_polling()
+    # Блокирующий запуск polling в этом потоке,
+    # без установки signal handlers (stop_signals=None)
+    app.run_polling(stop_signals=None)
