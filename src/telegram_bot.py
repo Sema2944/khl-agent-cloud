@@ -2,6 +2,7 @@
 
 import os
 import logging
+import asyncio
 
 from telegram import Update
 from telegram.ext import (
@@ -14,10 +15,7 @@ from telegram.ext import (
 import httpx
 
 
-# URL твоего бекенда-агента (FastAPI)
 API_BASE = os.getenv("API_BASE", "https://khl-agent-api.onrender.com")
-
-# Токен бота из BotFather
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
@@ -30,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 async def call_agent(user_id: int, message: str) -> str:
     """
-    Шлёт запрос в твой /agent/query и возвращает текст ответа.
+    Шлём запрос в твой /agent/query и возвращаем текст ответа.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
@@ -81,12 +79,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def main() -> None:
     """
-    Точка входа: запускает Telegram-бота в режиме polling.
+    Точка входа бота.
+
+    ВАЖНО: мы запускаем бота в отдельном потоке из FastAPI,
+    поэтому здесь вручную создаём и навешиваем event loop
+    для этого потока перед app.run_polling().
     """
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
 
     logger.info("Запускаю Telegram-бота...")
+
+    # создаём event loop для текущего (фонового) потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -95,8 +101,5 @@ def main() -> None:
     # Все текстовые сообщения (кроме команд) — в агент
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Блокирующий запуск polling в этом потоке с только что созданным event loop
     app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
