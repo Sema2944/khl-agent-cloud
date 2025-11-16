@@ -1,5 +1,7 @@
 # src/service.py
 
+import logging
+
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -7,6 +9,8 @@ from sqlmodel import Session
 from .db import init_db, get_session
 from .bets_db import get_user_stats
 from .khl_client import get_today_khl_events
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent")
 
@@ -21,8 +25,11 @@ class AgentResponse(BaseModel):
 
 
 @app.on_event("startup")
-def on_startup():
+def on_startup() -> None:
+    # Инициализируем БД
     init_db()
+    # Базовая настройка логов (на всякий случай)
+    logging.basicConfig(level=logging.INFO)
 
 
 @app.get("/")
@@ -35,6 +42,10 @@ async def agent_query(
     payload: AgentQuery,
     session: Session = Depends(get_session),
 ) -> AgentResponse:
+    """
+    Главная точка входа для AI-агента.
+    Telegram-бот (или любой клиент) шлёт сюда user_id + текст сообщения.
+    """
     reply_text = await run_agent(
         user_id=payload.user_id,
         message=payload.message,
@@ -47,6 +58,10 @@ async def agent_query(
 
 
 async def run_agent(user_id: int, message: str, session: Session) -> str:
+    """
+    Простейший "агент" на if/else.
+    Дальше сюда можно будет вкручивать больше логики и LLM.
+    """
     text = (message or "").lower().strip()
 
     # 1) Показать статистику по ставкам
@@ -63,21 +78,34 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             f"Плюс/минус: {stats.pnl:.0f} ₽"
         )
 
-    # 2) Матчи КХЛ на сегодня
+    # 2) Матчи КХЛ на сегодня (через парсер/Winline)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
-        events = await get_today_khl_events()
+        try:
+            events = await get_today_khl_events()
+        except Exception:
+            # Логируем стек ошибки, но пользователю отдаём аккуратный текст
+            logger.exception("Ошибка при получении матчей КХЛ")
+            return (
+                "Не смог получить матчи КХЛ из источника "
+                "(ошибка парсера или API бука).\n"
+                "Попробуй ещё раз чуть позже или сформулируй другой запрос."
+            )
+
         if not events:
             return "На сегодня я не нашёл матчей КХЛ."
 
         lines = []
-        for e in events[:5]:
+        for e in events[:5]:  # ограничимся первыми 5 матчами
             line = f"{e.team1} — {e.team2} (id: {e.id})"
+
+            # Пытаемся найти рынок 1X2 и показать коэффициенты
             market_1x2 = next((m for m in e.markets if m.name == "1X2"), None)
             if market_1x2:
                 odds_part = ", ".join(
                     f"{o.name}: {o.price}" for o in market_1x2.outcomes
                 )
                 line += f" | 1X2: {odds_part}"
+
             lines.append(line)
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
@@ -87,7 +115,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return (
             "Я уже понимаю, что ты хочешь сделать ставку,\n"
             "но пока не сохраняю её в базу.\n"
-            "На следующем шаге добавим парсинг и запись в БД 💾"
+            "Дальше можно будет добавить парсинг и запись в БД 💾"
         )
 
     # 4) Ответ по умолчанию
@@ -95,6 +123,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "Я AI-агент для ставок.\n"
         "Сейчас умею:\n"
         "• По словам 'статистика / статку' показывать твою статистику\n"
-        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ\n\n"
+        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ (через линии бука)\n\n"
         "Попробуй: 'Покажи мою статистику' или 'Какие матчи КХЛ сегодня?'."
     )
