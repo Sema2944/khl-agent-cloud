@@ -2,13 +2,20 @@
 
 import logging
 import threading
+import os
+import re
 
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session
 
 from .db import init_db, get_session
-from .bets_db import get_user_stats, add_bet, get_last_bets, settle_bet
+from .bets_db import (
+    get_user_stats,
+    add_bet,
+    get_last_bets,
+    settle_bet,
+)
 from .khl_client import get_today_khl_events
 
 logger = logging.getLogger(__name__)
@@ -67,7 +74,32 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     Простейший if/else-агент.
     Дальше сюда можно будет наворачивать более умную логику и LLM.
     """
-    text = (message or "").lower().strip()
+    import re
+
+    original_text = message or ""
+    text = original_text.lower().strip()
+
+    # 0) Отметить результат ставки: "ставка 1 выиграла" / "ставка 2 проиграла"
+    m_res = re.search(
+        r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|win|lose|loss)",
+        text,
+    )
+    if m_res:
+        bet_id = int(m_res.group(1))
+        res_word = m_res.group(2)
+
+        result = res_word  # settle_bet сам нормализует
+        bet = settle_bet(session, user_id, bet_id, result)
+        if bet is None:
+            return f"Не нашёл ставку с id {bet_id} или не понял результат."
+
+        human_res = "выигрыш" if bet.result == "win" else "проигрыш"
+        msg = f"Отметил ставку {bet.id} как {human_res}."
+        if bet.profit is not None:
+            sign = "+" if bet.profit >= 0 else ""
+            msg += f"\nРезультат по сумме: {sign}{bet.profit:.0f}."
+        msg += "\n\nПосмотреть обновлённую статистику: 'Покажи мою статистику'."
+        return msg
 
     # 1) Показать статистику по ставкам
     if "статист" in text or "статку" in text or "stats" in text:
@@ -75,12 +107,22 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if stats.total_bets == 0:
             return "Пока нет ни одной сохранённой ставки. Начнём с первой 😉"
 
+        if stats.settled_bets == 0:
+            return (
+                f"Всего ставок: {stats.total_bets}\n"
+                "Пока ни одна ставка не рассчитана.\n"
+                "Когда отметишь результаты (например: 'ставка 1 выиграла'), "
+                "я посчитаю winrate и ROI."
+            )
+
         return (
             "Твоя статистика:\n"
-            f"Ставок: {stats.total_bets}\n"
+            f"Всего ставок: {stats.total_bets}\n"
+            f"Рассчитано: {stats.settled_bets}\n"
             f"Винрейт: {stats.winrate:.1f}%\n"
             f"ROI: {stats.roi:.2f}%\n"
-            f"Плюс/минус: {stats.pnl:.0f} ₽"
+            f"Плюс/минус: {stats.pnl:.0f}\n"
+            f"Общий объём ставок: {stats.total_stake:.0f}"
         )
 
     # 2) Матчи КХЛ на сегодня (через парсер/Winline или заглушку)
@@ -115,21 +157,76 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-    # 3) Заглушка под добавление ставки
-    if text.startswith("ставка ") or text.startswith("поставь "):
-        return (
-            "Я уже понимаю, что ты хочешь сделать ставку,\n"
-            "но пока не сохраняю её в базу.\n"
-            "Дальше можно будет добавить парсинг и запись в БД 💾"
+    # 3) Показать последние ставки: "мои ставки"
+    if "мои ставки" in text or ("ставки" in text and "мои" in text):
+        from .bets_db import Bet  # чтобы взять result/profit
+
+        bets = get_last_bets(session, user_id, limit=5)
+        if not bets:
+            return "У тебя пока нет сохранённых ставок."
+
+        lines = []
+        for b in bets:
+            line = f"{b.created_at:%d.%m %H:%M} — {b.raw_text}"
+            if b.stake:
+                line += f" | сумма: {b.stake:g}"
+            if b.result:
+                human_res = "выигрыш" if b.result == "win" else "проигрыш"
+                line += f" | результат: {human_res}"
+            if b.profit is not None:
+                sign = "+" if b.profit >= 0 else ""
+                line += f" | PnL: {sign}{b.profit:.0f}"
+            lines.append(line)
+
+        return "Твои последние ставки:\n" + "\n".join(lines)
+
+    # 4) Добавление ставки: сообщения, начинающиеся со слова "ставка"
+    if text.startswith("ставка"):
+        # Оригинальный текст лучше взять без .lower(), чтобы не терять регистр:
+        raw_text = original_text.strip()
+
+        # Простейший парсинг суммы: ищем первое число в строке
+        stake = None
+        m = re.search(r"\b(\d+([\.,]\d+)?)\b", raw_text)
+        if m:
+            stake_str = m.group(1).replace(",", ".")
+            try:
+                stake = float(stake_str)
+            except ValueError:
+                stake = None
+
+        bet = add_bet(
+            session=session,
+            user_id=user_id,
+            raw_text=raw_text,
+            stake=stake,
         )
 
-    # 4) Ответ по умолчанию
+        resp = f"Ставка сохранена (id: {bet.id}).\n\nТекст: {bet.raw_text}"
+        if stake:
+            resp += f"\nСумма: {stake:g}"
+        resp += (
+            "\n\nКогда узнаешь результат, напиши, например:\n"
+            f"'ставка {bet.id} выиграла' или 'ставка {bet.id} проиграла'.\n"
+            "Посмотреть: 'мои ставки' или 'Покажи мою статистику'."
+        )
+        return resp
+
+    # 5) Ответ по умолчанию
     return (
         "Я AI-агент для ставок.\n"
         "Сейчас умею:\n"
         "• По словам 'статистика / статку' показывать твою статистику\n"
-        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ (через линии бука)\n\n"
-        "Попробуй: 'Покажи мою статистику' или 'Какие матчи КХЛ сегодня?'."
+        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ\n"
+        "• По сообщению вида 'ставка ...' сохранять ставку в базу\n"
+        "• По запросу 'мои ставки' показывать последние сохранённые\n"
+        "• По фразе 'ставка N выиграла/проиграла' отмечать результат и считать winrate/ROI\n\n"
+        "Попробуй, например:\n"
+        "• 'ставка 1000 на СКА победа'\n"
+        "• 'мои ставки'\n"
+        "• 'ставка 1 выиграла'\n"
+        "• 'Покажи мою статистику'\n"
+        "• 'Какие матчи КХЛ сегодня?'\n"
     )
 
 
@@ -138,16 +235,20 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
 def _start_bot_background() -> None:
     """
-    Стартуем Telegram-бота в отдельном потоке,
-    чтобы он жил внутри того же процесса, что и FastAPI.
-    Это позволяет использовать бесплатный Web Service на Render.
+    Стартуем Telegram-бота в отдельном потоке.
+    Если TELEGRAM_BOT_TOKEN не задан — просто пишем варнинг и не запускаем бота.
     """
     try:
-        # импортируем здесь, чтобы избежать циклических импортов
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            logger.warning(
+                "TELEGRAM_BOT_TOKEN не задан; Telegram-бот не будет запущен."
+            )
+            return
+
         from . import telegram_bot
 
         logger.info("Запускаю Telegram-бота в фонового потоке...")
-        # отдельный поток, чтобы не блокировать uvicorn
         t = threading.Thread(
             target=telegram_bot.main,
             name="telegram-bot-thread",
