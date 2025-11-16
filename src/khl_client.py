@@ -147,3 +147,15 @@ def _demo_lines(bookmaker: str = "DemoBook") -> List[BetLine]:
         edge_draw=None,
     )
     return [example]
+# src/khl_client.py
+from typing import List
+from .parsing import Event, get_khl_events_for_today
+
+
+async def get_today_khl_events() -> List[Event]:
+    """
+    Обёртка над парсером.
+    Если потом сменишь источник (другой бук, кеш, БД),
+    код агента менять не придётся.
+    """
+    return await get_khl_events_for_today()
