@@ -1,80 +1,185 @@
 # src/bets_db.py
-from typing import Optional, List
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import datetime
+from typing import List, Optional
 
 from sqlmodel import SQLModel, Field, Session, select
 
 
+# ---------- МОДЕЛИ В БД ----------
+
+
 class Bet(SQLModel, table=True):
+    """
+    Запись о ставке пользователя.
+
+    ВАЖНО: используем отдельное имя таблицы "bets", чтобы не конфликтовать
+    со старой схемой, если она уже была.
+    """
+    __tablename__ = "bets"
+
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int
 
-    event_id: Optional[int] = None
-    sport: Optional[str] = None
-    league: Optional[str] = None
-    team1: Optional[str] = None
-    team2: Optional[str] = None
-    market: Optional[str] = None
-
-    odds: float
-    stake: float
-    status: str = "open"  # open | win | lose | push
-    profit: float = 0.0
-
+    user_id: int = Field(index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    settled_at: Optional[datetime] = None
+
+    # сырое описание ставки, как ввёл пользователь
+    raw_text: str
+
+    # базовые поля
+    stake: Optional[float] = None          # сумма ставки
+    event: Optional[str] = None            # матч / событие (пока не парсим)
+    outcome: Optional[str] = None          # исход (П1, тотал и т.п.)
+
+    # результат
+    result: Optional[str] = Field(
+        default=None, index=True
+    )  # "win" / "lose" / "push" / None
+
+    # финансы
+    profit: Optional[float] = None         # + / - в тех же единицах, что stake
+    settled_at: Optional[datetime] = None  # когда ставка была рассчитана
 
 
-class UserStats(SQLModel):
-    total_bets: int
-    wins: int
-    losses: int
-    pushes: int
-    pnl: float
-    roi: float
-    winrate: float
+# ---------- ВСПОМОГАТЕЛЬНЫЕ СТРУКТУРЫ ----------
 
 
-def get_user_bets(session: Session, user_id: int, limit: int = 1000) -> List[Bet]:
-    stmt = (
+@dataclass
+class UserStats:
+    total_bets: int        # всего ставок (в т.ч. нерасчитанных)
+    settled_bets: int      # рассчитанных ставок
+    winrate: float         # % выигрышей по рассчитанным
+    roi: float             # ROI по рассчитанным
+    pnl: float             # общий плюс/минус
+    total_stake: float     # суммарный объём ставок (по рассчитанным)
+
+
+# ---------- ОПЕРАЦИИ С БАЗОЙ ----------
+
+
+def add_bet(
+    session: Session,
+    user_id: int,
+    raw_text: str,
+    stake: Optional[float] = None,
+    event: Optional[str] = None,
+    outcome: Optional[str] = None,
+) -> Bet:
+    """
+    Сохраняем ставку в БД.
+    """
+    bet = Bet(
+        user_id=user_id,
+        raw_text=raw_text,
+        stake=stake,
+        event=event,
+        outcome=outcome,
+    )
+    session.add(bet)
+    session.commit()
+    session.refresh(bet)
+    return bet
+
+
+def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
+    """
+    Возвращаем последние N ставок пользователя.
+    """
+    statement = (
         select(Bet)
         .where(Bet.user_id == user_id)
         .order_by(Bet.created_at.desc())
         .limit(limit)
     )
-    return list(session.exec(stmt))
+    return list(session.exec(statement))
+
+
+def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
+    """
+    Отмечаем ставку рассчитанной: result = "win" или "lose".
+
+    Для простоты считаем:
+    - если есть stake:
+        win  -> profit = +stake
+        lose -> profit = -stake
+    - если stake нет -> profit остаётся None (участвует только в winrate).
+    """
+    result = result.lower().strip()
+    if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
+        norm_result = "win"
+    elif result in ("lose", "loss", "проигрыш", "проиграл", "проиграла", "проиграли"):
+        norm_result = "lose"
+    else:
+        # неизвестный результат
+        return None
+
+    statement = select(Bet).where(Bet.id == bet_id, Bet.user_id == user_id)
+    bet = session.exec(statement).one_or_none()
+    if bet is None:
+        return None
+
+    bet.result = norm_result
+    bet.settled_at = datetime.utcnow()
+
+    if bet.stake is not None:
+        if norm_result == "win":
+            bet.profit = float(bet.stake)
+        elif norm_result == "lose":
+            bet.profit = -float(bet.stake)
+
+    session.add(bet)
+    session.commit()
+    session.refresh(bet)
+    return bet
 
 
 def get_user_stats(session: Session, user_id: int) -> UserStats:
-    bets = get_user_bets(session, user_id)
-    total = len(bets)
+    """
+    Реальная статистика по пользователю.
+    """
+    statement = select(Bet).where(Bet.user_id == user_id)
+    bets = list(session.exec(statement))
 
+    total = len(bets)
     if total == 0:
         return UserStats(
             total_bets=0,
-            wins=0,
-            losses=0,
-            pushes=0,
-            pnl=0.0,
-            roi=0.0,
+            settled_bets=0,
             winrate=0.0,
+            roi=0.0,
+            pnl=0.0,
+            total_stake=0.0,
         )
 
-    wins = sum(1 for b in bets if b.status == "win")
-    losses = sum(1 for b in bets if b.status == "lose")
-    pushes = sum(1 for b in bets if b.status == "push")
-    pnl = sum(b.profit for b in bets)
-    invested = sum(b.stake for b in bets)
-    roi = (pnl / invested * 100) if invested else 0.0
-    winrate = wins / total * 100
+    settled = [b for b in bets if b.result is not None]
+    settled_count = len(settled)
+
+    if settled_count == 0:
+        return UserStats(
+            total_bets=total,
+            settled_bets=0,
+            winrate=0.0,
+            roi=0.0,
+            pnl=0.0,
+            total_stake=0.0,
+        )
+
+    wins = [b for b in settled if b.result == "win"]
+    winrate = len(wins) / settled_count * 100.0
+
+    pnl = sum(b.profit or 0.0 for b in settled)
+
+    total_stake = sum(b.stake or 0.0 for b in settled)
+    roi = (pnl / total_stake * 100.0) if total_stake > 0 else 0.0
 
     return UserStats(
         total_bets=total,
-        wins=wins,
-        losses=losses,
-        pushes=pushes,
-        pnl=pnl,
-        roi=roi,
+        settled_bets=settled_count,
         winrate=winrate,
+        roi=roi,
+        pnl=pnl,
+        total_stake=total_stake,
     )
-
