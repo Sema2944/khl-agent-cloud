@@ -1,6 +1,7 @@
 # src/service.py
 
 import logging
+import threading
 
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
@@ -26,10 +27,14 @@ class AgentResponse(BaseModel):
 
 @app.on_event("startup")
 def on_startup() -> None:
-    # Инициализируем БД
-    init_db()
-    # Базовая настройка логов (на всякий случай)
+    """
+    Хук старта FastAPI:
+    - инициализируем БД
+    - настраиваем базовые логи
+    """
     logging.basicConfig(level=logging.INFO)
+    init_db()
+    logger.info("FastAPI сервис запущен")
 
 
 @app.get("/")
@@ -44,7 +49,7 @@ async def agent_query(
 ) -> AgentResponse:
     """
     Главная точка входа для AI-агента.
-    Telegram-бот (или любой клиент) шлёт сюда user_id + текст сообщения.
+    Telegram-бот (и любые клиенты) шлют сюда user_id + текст.
     """
     reply_text = await run_agent(
         user_id=payload.user_id,
@@ -59,8 +64,8 @@ async def agent_query(
 
 async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
-    Простейший "агент" на if/else.
-    Дальше сюда можно будет вкручивать больше логики и LLM.
+    Простейший if/else-агент.
+    Дальше сюда можно будет наворачивать более умную логику и LLM.
     """
     text = (message or "").lower().strip()
 
@@ -78,7 +83,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             f"Плюс/минус: {stats.pnl:.0f} ₽"
         )
 
-    # 2) Матчи КХЛ на сегодня (через парсер/Winline)
+    # 2) Матчи КХЛ на сегодня (через парсер/Winline или заглушку)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             events = await get_today_khl_events()
@@ -126,3 +131,32 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• По запросу 'КХЛ сегодня' показывать матчи КХЛ (через линии бука)\n\n"
         "Попробуй: 'Покажи мою статистику' или 'Какие матчи КХЛ сегодня?'."
     )
+
+
+# ------------------ ЗАПУСК TELEGRAM-БОТА В ФОНЕ ------------------
+
+
+def _start_bot_background() -> None:
+    """
+    Стартуем Telegram-бота в отдельном потоке,
+    чтобы он жил внутри того же процесса, что и FastAPI.
+    Это позволяет использовать бесплатный Web Service на Render.
+    """
+    try:
+        # импортируем здесь, чтобы избежать циклических импортов
+        from . import telegram_bot
+
+        logger.info("Запускаю Telegram-бота в фонового потоке...")
+        # отдельный поток, чтобы не блокировать uvicorn
+        t = threading.Thread(
+            target=telegram_bot.main,
+            name="telegram-bot-thread",
+            daemon=True,
+        )
+        t.start()
+    except Exception:
+        logger.exception("Не удалось запустить Telegram-бота в фоне")
+
+
+# ВАЖНО: вызываем после определения всего приложения
+_start_bot_background()
