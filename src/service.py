@@ -77,9 +77,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     original_text = message or ""
     text = original_text.lower().strip()
 
-    # 0) Отметить результат ставки: "ставка 1 выиграла" / "ставка 2 проиграла"
+    # 0) Отметить результат ставки: "ставка 1 выиграла" / "ставка 2 проиграла" / "ставка 3 возврат"
     m_res = re.search(
-        r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|win|lose|loss)",
+        r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|возврат|refund|push|win|lose|loss)",
         text,
     )
     if m_res:
@@ -91,7 +91,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if bet is None:
             return f"Не нашёл ставку с id {bet_id} или не понял результат."
 
-        human_res = "выигрыш" if bet.result == "win" else "проигрыш"
+        if bet.result == "win":
+            human_res = "выигрыш"
+        elif bet.result == "lose":
+            human_res = "проигрыш"
+        elif bet.result == "push":
+            human_res = "возврат"
+        else:
+            human_res = bet.result or "неизвестно"
+
         msg = f"Отметил ставку {bet.id} как {human_res}."
         if bet.profit is not None:
             sign = "+" if bet.profit >= 0 else ""
@@ -105,23 +113,32 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if stats.total_bets == 0:
             return "Пока нет ни одной сохранённой ставки. Начнём с первой 😉"
 
-        if stats.settled_bets == 0:
+        if stats.settled_bets == 0 and stats.pushes == 0:
             return (
                 f"Всего ставок: {stats.total_bets}\n"
                 "Пока ни одна ставка не рассчитана.\n"
-                "Когда отметишь результаты (например: 'ставка 1 выиграла'), "
+                "Когда отметишь результаты (например: 'ставка 1 выиграла' или 'ставка 2 возврат'), "
                 "я посчитаю winrate и ROI."
             )
 
-        return (
-            "Твоя статистика:\n"
-            f"Всего ставок: {stats.total_bets}\n"
-            f"Рассчитано: {stats.settled_bets}\n"
-            f"Винрейт: {stats.winrate:.1f}%\n"
-            f"ROI: {stats.roi:.2f}%\n"
-            f"Плюс/минус: {stats.pnl:.0f}\n"
-            f"Общий объём ставок: {stats.total_stake:.0f}"
-        )
+        text_lines = [
+            "Твоя статистика:",
+            f"Всего ставок: {stats.total_bets}",
+            f"Рассчитано (win/lose): {stats.settled_bets}",
+        ]
+        if stats.pushes:
+            text_lines.append(f"Возвратов: {stats.pushes}")
+        if stats.settled_bets > 0:
+            text_lines.extend(
+                [
+                    f"Винрейт: {stats.winrate:.1f}%",
+                    f"ROI: {stats.roi:.2f}%",
+                    f"Плюс/минус: {stats.pnl:.0f}",
+                    f"Общий объём ставок: {stats.total_stake:.0f}",
+                ]
+            )
+
+        return "\n".join(text_lines)
 
     # 2) Матчи КХЛ на сегодня (через парсер/Winline или заглушку)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
@@ -171,7 +188,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             if b.odds:
                 line += f" | кэф: {b.odds:.2f}"
             if b.result:
-                human_res = "выигрыш" if b.result == "win" else "проигрыш"
+                if b.result == "win":
+                    human_res = "выигрыш"
+                elif b.result == "lose":
+                    human_res = "проигрыш"
+                elif b.result == "push":
+                    human_res = "возврат"
+                else:
+                    human_res = b.result
                 line += f" | результат: {human_res}"
             if b.profit is not None:
                 sign = "+" if b.profit >= 0 else ""
@@ -205,7 +229,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         # 1) Прямо рядом со словами "коэф", "кф", "кэф", "коэфф", "коэффициент"
         coef_pattern = re.compile(
-            r"(коэф(фициент)?|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
+            r"(коэф(фициент)?|коeff|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
             re.IGNORECASE,
         )
         m_coef = coef_pattern.search(raw_text)
@@ -259,7 +283,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             resp += f"\nКоэффициент: {odds:.2f}"
         resp += (
             "\n\nКогда узнаешь результат, напиши, например:\n"
-            f"'ставка {bet.id} выиграла' или 'ставка {bet.id} проиграла'.\n"
+            f"'ставка {bet.id} выиграла', 'ставка {bet.id} проиграла' "
+            f"или 'ставка {bet.id} возврат'.\n"
             "Посмотреть: 'мои ставки' или 'Покажи мою статистику'."
         )
         return resp
@@ -272,13 +297,13 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• По запросу 'КХЛ сегодня' показывать матчи КХЛ\n"
         "• По сообщению вида 'ставка ...' сохранять ставку в базу\n"
         "• По запросу 'мои ставки' показывать последние сохранённые\n"
-        "• По фразе 'ставка N выиграла/проиграла' отмечать результат и считать winrate/ROI\n\n"
+        "• По фразе 'ставка N выиграла/проиграла/возврат' отмечать результат и считать winrate/ROI\n\n"
         "Попробуй, например:\n"
         "• 'ставка 1000 на СКА победа за 1.85'\n"
         "• 'ставка 500 Спартак тотал больше 4.5 коэф 2.1'\n"
         "• 'ставка 700 на Зенит по 1,75'\n"
+        "• 'ставка 1 возврат'\n"
         "• 'мои ставки'\n"
-        "• 'ставка 1 выиграла'\n"
         "• 'Покажи мою статистику'\n"
         "• 'Какие матчи КХЛ сегодня?'\n"
     )
