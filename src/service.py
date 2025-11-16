@@ -1,59 +1,12 @@
-import logging
-
-from fastapi import FastAPI
-
-from src.db import init_db
-from src.telegram_bot import build_bot_app, start_bot_polling, stop_bot_polling
-
-logger = logging.getLogger("svc")
-
-app = FastAPI(title="KHL Agent API")
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info("[APP] Запуск приложения...")
-
-    # Инициализируем БД
-    try:
-        await init_db()
-        logger.info("[DB] init_db выполнен.")
-    except Exception as e:
-        logger.exception("[DB] Ошибка init_db: %s", e)
-
-    # Инициализируем и запускаем бота
-    bot_app = await build_bot_app()
-    if bot_app is None:
-        logger.warning("[BOT] TELEGRAM_TOKEN отсутствует — бот не будет запущен.")
-    else:
-        logger.info("[BOT] Запускаем polling...")
-        await start_bot_polling()
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    logger.info("[APP] Остановка приложения...")
-
-    try:
-        await stop_bot_polling()
-    except Exception as e:
-        logger.exception("[BOT] Ошибка при остановке бота: %s", e)
-
-    logger.info("[APP] Остановка завершена.")
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "KHL Agent API is running"}
-
 # src/service.py
+
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session
 
 from .db import init_db, get_session
-from .bets_db import get_user_stats  # про bets_db поговорим дальше
-from .khl_client import get_today_khl_events  # обёртка над парсером
+from .bets_db import get_user_stats
+from .khl_client import get_today_khl_events
 
 app = FastAPI(title="KHL AI Betting Agent")
 
@@ -69,7 +22,6 @@ class AgentResponse(BaseModel):
 
 @app.on_event("startup")
 def on_startup():
-    # создаём таблицы и т.п.
     init_db()
 
 
@@ -82,7 +34,7 @@ def root():
 async def agent_query(
     payload: AgentQuery,
     session: Session = Depends(get_session),
-):
+) -> AgentResponse:
     reply_text = await run_agent(
         user_id=payload.user_id,
         message=payload.message,
@@ -90,14 +42,11 @@ async def agent_query(
     )
     return AgentResponse(reply=reply_text)
 
+
 # ------------------ ЛОГИКА АГЕНТА ------------------
 
 
 async def run_agent(user_id: int, message: str, session: Session) -> str:
-    """
-    Сейчас это простой if/else-агент.
-    Дальше внутрь можно вкручивать больше логики и LLM.
-    """
     text = (message or "").lower().strip()
 
     # 1) Показать статистику по ставкам
@@ -121,9 +70,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             return "На сегодня я не нашёл матчей КХЛ."
 
         lines = []
-        for e in events[:5]:  # ограничим первые 5
+        for e in events[:5]:
             line = f"{e.team1} — {e.team2} (id: {e.id})"
-            # пробуем найти рынок 1X2
             market_1x2 = next((m for m in e.markets if m.name == "1X2"), None)
             if market_1x2:
                 odds_part = ", ".join(
@@ -139,7 +87,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return (
             "Я уже понимаю, что ты хочешь сделать ставку,\n"
             "но пока не сохраняю её в базу.\n"
-            "На следующем шаге добавим нормальный парсинг и запись в БД 💾"
+            "На следующем шаге добавим парсинг и запись в БД 💾"
         )
 
     # 4) Ответ по умолчанию
@@ -148,9 +96,5 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "Сейчас умею:\n"
         "• По словам 'статистика / статку' показывать твою статистику\n"
         "• По запросу 'КХЛ сегодня' показывать матчи КХЛ\n\n"
-        "Попробуй, например: 'Покажи мою статистику' или 'Какие матчи КХЛ сегодня?'."
+        "Попробуй: 'Покажи мою статистику' или 'Какие матчи КХЛ сегодня?'."
     )
-
-
-
-
