@@ -999,99 +999,181 @@ def build_user_profile(session: Session, user_id: int) -> str:
 def build_khl_match_analysis(event) -> str:
     """
     Разбор матча КХЛ по объекту event из khl_client.
+
+    Что делаем:
+    - разбираем линию 1X2 (фаворит / андердог, имплайд-вероятности, маржа)
+    - по возможности показываем рынок тотала (основная линия)
+    - даём аккуратные текстовые выводы, без прямых советов по ставке
     """
-    title = (
-        f"{getattr(event, 'team1', '?')} — {getattr(event, 'team2', '?')} "
-        f"(id: {getattr(event, 'id', '?')})"
-    )
+    team1 = getattr(event, "team1", "?")
+    team2 = getattr(event, "team2", "?")
+    event_id = getattr(event, "id", "?")
+    title = f"{team1} — {team2} (id: {event_id})"
 
     markets = getattr(event, "markets", []) or []
+
+    # --- 1) Поиск рынков 1X2 и тотала ---
     market_1x2 = None
+    market_total = None
+
     for m in markets:
-        name = getattr(m, "name", "") or ""
-        if name.upper() in ("1X2", "1X", "3WAY", "3-WAY"):
+        name = (getattr(m, "name", "") or "").upper()
+        if market_1x2 is None and name in ("1X2", "1X", "3WAY", "3-WAY"):
             market_1x2 = m
-            break
-
-    if not market_1x2:
-        return (
-            f"Разбор матча {title}.\n"
-            "Я не нашёл рынок 1X2 в данных по этому матчу, поэтому пока могу показать "
-            "только базовую информацию. Позже добавлю более глубокую аналитику."
-        )
-
-    outcomes = getattr(market_1x2, "outcomes", []) or []
-    if not outcomes:
-        return (
-            f"Разбор матча {title}.\n"
-            "У рынка 1X2 нет исходов с коэффициентами. Это странно, возможно, матч ещё не в линии."
-        )
-
-    odds_list: list[tuple[str, float]] = []
-    for o in outcomes:
-        name = str(getattr(o, "name", "?"))
-        price = getattr(o, "price", None)
-        try:
-            price_f = float(price)
-        except (TypeError, ValueError):
-            continue
-        if price_f < 1.01:
-            continue
-        odds_list.append((name, price_f))
-
-    if not odds_list:
-        return (
-            f"Разбор матча {title}.\n"
-            "Не удалось извлечь валидные коэффициенты по рынку 1X2."
-        )
-
-    implied = [(name, 100.0 / coef) for name, coef in odds_list]
-    sum_implied = sum(p for _, p in implied)
-    margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
-
-    fair: list[tuple[str, float]] = []
-    if sum_implied > 0:
-        for name, p in implied:
-            fair.append((name, p * 100.0 / sum_implied))
-
-    fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
-    fav_fair_pct = None
-    for name, p in fair:
-        if name == fav_name:
-            fav_fair_pct = p
-            break
+        if market_total is None and any(k in name for k in ("TOTAL", "ТОТАЛ", "TOTALS", "OVER/UNDER")):
+            market_total = m
 
     lines: list[str] = []
-    lines.append(f"📊 Разбор матча КХЛ:")
+    lines.append("📊 Разбор матча КХЛ:")
     lines.append(title)
     lines.append("")
-    lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-    for (name, coef), (_, p_imp) in zip(odds_list, implied):
-        lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
 
-    if margin:
-        lines.append("")
-        lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
-
-    if fair:
-        lines.append("")
-        lines.append("Оценка 'честных' вероятностей (без маржи):")
-        for name, p_fair in fair:
-            lines.append(f"• {name}: ≈ {p_fair:.1f}%")
-
-    if fav_name and fav_fair_pct is not None:
-        lines.append("")
+    # --- 2) Если нет линии вообще ---
+    if not markets:
         lines.append(
-            f"Фаворит по линии: {fav_name} (ориентировочно {fav_fair_pct:.1f}% без учёта маржи бука)."
+            "По этому матчу я не вижу доступных рынков в линии. "
+            "Возможно, матч ещё не открыт у букмекера или данные не подгрузились."
+        )
+        return "\n".join(lines)
+
+    # --- 3) Разбор рынка 1X2 ---
+    if market_1x2:
+        outcomes = getattr(market_1x2, "outcomes", []) or []
+        odds_list: list[tuple[str, float]] = []
+
+        for o in outcomes:
+            name = str(getattr(o, "name", "?"))
+            price = getattr(o, "price", None)
+            try:
+                price_f = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price_f < 1.01:
+                continue
+            odds_list.append((name, price_f))
+
+        if odds_list:
+            lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
+
+            implied = [(name, 100.0 / coef) for name, coef in odds_list]
+            sum_implied = sum(p for _, p in implied)
+            margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
+
+            for (name, coef), (_, p_imp) in zip(odds_list, implied):
+                lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
+
+            if margin:
+                lines.append("")
+                lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
+
+            # Оценка "честных" вероятностей (без маржи)
+            if sum_implied > 0:
+                lines.append("")
+                lines.append("Оценка 'честных' вероятностей (без маржи бука):")
+                for (name, _), (_, p_imp) in zip(odds_list, implied):
+                    fair = p_imp * 100.0 / sum_implied
+                    lines.append(f"• {name}: ≈ {fair:.1f}%")
+
+            # Определяем фаворита / андердога
+            fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
+            dog_name, dog_coef = max(odds_list, key=lambda x: x[1])
+
+            lines.append("")
+            lines.append("Структура матча по 1X2:")
+
+            ratio = dog_coef / fav_coef if fav_coef > 0 else None
+            if ratio is not None:
+                if ratio < 1.4:
+                    lines.append(
+                        "• Линия достаточно ровная — ожидается более-менее равный матч без явного суперфаворита."
+                    )
+                elif ratio < 2.2:
+                    lines.append(
+                        f"• {fav_name} идёт фаворитом, но андердог ({dog_name}) не выглядит безнадёжным по линии."
+                    )
+                else:
+                    lines.append(
+                        f"• {fav_name} — явный фаворит по линии, {dog_name} играет роль заметного андердога."
+                    )
+            else:
+                lines.append("• Фаворит и андердог по линии определяются, но коэффициенты странные.")
+
+            lines.append(
+                "• Помни, что линия отражает оценку букмекера + рынок, а не гарантию результата."
+            )
+
+        else:
+            lines.append(
+                "По рынку 1X2 я не нашёл валидных коэффициентов. "
+                "Возможно, матч в лайве или линия временно снята."
+            )
+    else:
+        lines.append(
+            "По этому матчу я не вижу классического рынка 1X2. "
+            "Скорее всего, доступны только альтернативные рынки или линия урезана."
         )
 
+    # --- 4) Разбор тотала, если есть ---
+    if market_total:
+        outcomes = getattr(market_total, "outcomes", []) or []
+        # Пытаемся найти основную линию тотала вида "ТБ 4.5", "Over 4.5", "Under 4.5"
+        over = None
+        under = None
+
+        for o in outcomes:
+            name_raw = str(getattr(o, "name", "") or "")
+            name_up = name_raw.upper()
+            price = getattr(o, "price", None)
+            try:
+                price_f = float(price)
+            except (TypeError, ValueError):
+                continue
+            if price_f < 1.01:
+                continue
+
+            # простое определение ТБ/ТМ
+            if any(k in name_up for k in ("OVER", "ТБ")):
+                over = (name_raw, price_f)
+            elif any(k in name_up for k in ("UNDER", "ТМ")):
+                under = (name_raw, price_f)
+
+        if over or under:
+            lines.append("")
+            lines.append("Рынок тотала (основная линия, если удалось определить):")
+
+            if over:
+                lines.append(f"• {over[0]}: кэф {over[1]:.2f}")
+            if under:
+                lines.append(f"• {under[0]}: кэф {under[1]:.2f}")
+
+            # Имплайд-вероятности по тоталу, если есть оба плеча
+            if over and under:
+                p_over = 100.0 / over[1]
+                p_under = 100.0 / under[1]
+                sum_p = p_over + p_under
+                margin_tot = sum_p - 100.0
+
+                lines.append("")
+                lines.append(
+                    f"Импл. вероятность: ТБ ≈ {p_over:.1f}%, ТМ ≈ {p_under:.1f}%. "
+                    "Сумма выше 100% из-за маржи бука."
+                )
+                lines.append(f"Оценочная маржа по тоталу ≈ {margin_tot:.1f} п.п.")
+        else:
+            lines.append("")
+            lines.append(
+                "Рынок тотала присутствует, но не удалось однозначно выделить основную линию ТБ/ТМ."
+            )
+
+    # --- 5) Финальная ремарка ---
     lines.append("")
     lines.append(
-        "Дальше сюда можно будет навесить xG, форму, PP/PK и вратарей. "
-        "Сейчас это быстрый odds-based разбор."
+        "Сейчас разбор опирается только на коэффициенты. "
+        "Дальше сюда можно будет добавить форму, xG, спецбригады и работу вратарей."
     )
 
     return "\n".join(lines)
+
 
 
 # ------------------ ЛОГИКА АГЕНТА ------------------
