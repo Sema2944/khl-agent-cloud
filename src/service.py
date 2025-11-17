@@ -21,6 +21,7 @@ from .bets_db import (
     change_user_bank,
     get_all_bets,
 )
+
 from .khl_client import get_today_khl_events
 
 logger = logging.getLogger(__name__)
@@ -239,7 +240,7 @@ def _extract_first_number(text: str) -> float | None:
     """
     Достаём первое число из строки (для банка, пополнения и т.п.).
     """
-    m = re.search(r"(\d+([\.,]\d+)?)", text)
+    m = re.search(r"(\d+([\.,]\д+)?)", text)
     if not m:
         return None
     try:
@@ -284,7 +285,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
             "Сделай пару ставок, и я смогу собрать для тебя отчёт 😉"
         )
 
-    # разделим по статусам
     settled = [b for b in bets if b.result in ("win", "lose")]
     pushes = [b for b in bets if b.result == "push"]
     wins = [b for b in bets if b.result == "win"]
@@ -301,7 +301,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     )
     roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else None
 
-    # лучшая и худшая ставка (по profit), если есть рассчитанные
     bets_with_profit = [b for b in bets if b.profit is not None]
     best_bet = (
         max(bets_with_profit, key=lambda b: b.profit)
@@ -335,7 +334,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     if total_stake:
         lines.append(f"Общий объём ставок: {total_stake:.0f}")
 
-    # блок про лучшую/худшую ставку
     if best_bet is not None and worst_bet is not None and best_bet != worst_bet:
         lines.append("")
         lines.append("🏆 Лучшая ставка недели:")
@@ -399,7 +397,7 @@ def build_best_bet_insight(session: Session, user_id: int) -> str:
     else:
         parts = []
         if best_bet.event:
-            parts.append(bест_bet.event)
+            parts.append(best_bet.event)
         if best_bet.outcome:
             parts.append(best_bet.outcome)
         if best_bet.stake is not None:
@@ -491,7 +489,7 @@ def _get_market_category(outcome: str | None) -> str:
     out = (outcome or "").upper()
     if any(k in out for k in ("ТБ", "ТМ", "ТОТАЛ")):
         return "тоталы"
-    if "Ф" in out:  # Ф1, Ф2, Ф(...), грубо, но работает
+    if "Ф" in out:
         return "форы"
     if any(k in out for k in ("П1", "П2", " Х", "1X", "Х2", "X2", "12")):
         return "1X2"
@@ -513,7 +511,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
             "Как только появится история, я покажу, какие рынки заходят лучше всего."
         )
 
-    # берём только рассчитанные (win/lose)
     settled = [b for b in bets if b.result in ("win", "lose")]
     if not settled:
         return (
@@ -545,7 +542,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
         if b.profit is not None:
             d["pnl"] += float(b.profit)
 
-    # считаем метрики
     for cat, d in stats_by_cat.items():
         if d["bets"] > 0:
             d["winrate"] = d["wins"] / d["bets"] * 100.0
@@ -556,7 +552,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
         else:
             d["roi"] = None
 
-    # выбираем лучший и худший рынки по ROI (минимальный размер выборки 3 ставки)
     cats_with_sample = [
         (cat, d) for cat, d in stats_by_cat.items() if d["bets"] >= 3
     ]
@@ -692,7 +687,7 @@ def _build_bank_hint_for_stake(bank: float, stake: float | None) -> list[str]:
     return lines
 
 
-# ------------------ ОЦЕНКА КОНКРЕТНОЙ СТАВКИ (SOFT VALUE / RISK-COACH) ------------------
+# ------------------ ОЦЕНКА КОНКРЕТНОЙ СТАВКИ ------------------
 
 
 def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str:
@@ -723,7 +718,6 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
         if odds is not None:
             lines.append(f"• Коэффициент: {odds:.2f}")
 
-    # Блок про банк
     bank = get_user_bank(session, user_id)
     if bank is not None:
         lines.extend(_build_bank_hint_for_stake(bank, stake))
@@ -734,7 +728,6 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
             "Можешь задать его командой 'мой банк 100000'."
         )
 
-    # Блок про опыт на рынке
     market_cat = _get_market_category(outcome)
     bets = get_all_bets(session, user_id)
     settled = [b for b in bets if b.result in ("win", "lose")]
@@ -798,6 +791,208 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
     return "\n".join(lines)
 
 
+# ------------------ ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ------------------
+
+
+def build_user_profile(session: Session, user_id: int) -> str:
+    """
+    Личный кабинет / профиль игрока:
+    - банк
+    - общая статистика
+    - результат за 7 дней
+    - сильный и слабый рынок
+    - персональный совет
+    """
+    stats = get_user_stats(session, user_id)
+    bank = get_user_bank(session, user_id)
+    bets = get_all_bets(session, user_id)
+
+    lines: list[str] = []
+    lines.append("👤 Твой профиль игрока:")
+
+    # Блок банка
+    lines.append("")
+    if bank is not None:
+        lines.append(_build_bank_status_text(bank))
+    else:
+        lines.append(
+            "💰 Банк ещё не задан.\n"
+            "Задай, например: 'мой банк 100000', и я начну отслеживать риск и просадку."
+        )
+
+    # Общая статистика
+    lines.append("")
+    lines.append("📊 Общая статистика:")
+    if stats.total_bets == 0:
+        lines.append("Пока нет ни одной сохранённой ставки.")
+    else:
+        lines.append(f"Всего ставок: {stats.total_bets}")
+        lines.append(f"Рассчитано (win/lose): {stats.settled_bets}")
+        if stats.pushes:
+            lines.append(f"Возвратов: {stats.pushes}")
+        if stats.settled_bets > 0:
+            lines.append(f"Winrate: {stats.winrate:.1f}%")
+            lines.append(f"ROI: {stats.roi:.2f}%")
+            sign_pnl = "+" if stats.pnl >= 0 else ""
+            lines.append(f"PnL за всё время: {sign_pnl}{stats.pnl:.0f}")
+            lines.append(f"Общий объём ставок: {stats.total_stake:.0f}")
+
+    # Результат за 7 дней
+    bets_7d, period_start, now = _get_last_7d_bets(session, user_id)
+    lines.append("")
+    lines.append("⏱ Результат за последние 7 дней:")
+    if not bets_7d:
+        lines.append(
+            "За последние 7 дней у тебя не было записанных ставок."
+        )
+    else:
+        settled_7d = [b for b in bets_7d if b.result in ("win", "lose")]
+        pnl_7d = sum(b.profit or 0.0 for b in settled_7d)
+        sign_7d = "+" if pnl_7d >= 0 else ""
+        lines.append(
+            f"Период: {period_start:%d.%m}–{now:%d.%m}, PnL: {sign_7d}{pnl_7d:.0f}"
+        )
+        if settled_7d:
+            wins_7d = [b for b in settled_7d if b.result == "win"]
+            winrate_7d = len(wins_7d) / len(settled_7d) * 100.0
+            lines.append(f"Winrate за период: {winrate_7d:.1f}%")
+
+    # Сильный / слабый рынок
+    lines.append("")
+    lines.append("🎯 Твои рынки:")
+
+    settled_all = [b for b in bets if b.result in ("win", "lose")]
+    if not settled_all:
+        lines.append(
+            "Пока рано делить на сильные и слабые рынки — нет рассчитанных ставок."
+        )
+    else:
+        stats_by_cat: dict[str, dict[str, float]] = {}
+        for b in settled_all:
+            cat = _get_market_category(b.outcome)
+            d = stats_by_cat.setdefault(
+                cat,
+                {
+                    "bets": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "stake": 0.0,
+                    "pnl": 0.0,
+                },
+            )
+            d["bets"] += 1
+            if b.result == "win":
+                d["wins"] += 1
+            elif b.result == "lose":
+                d["losses"] += 1
+            if b.stake is not None:
+                d["stake"] += float(b.stake)
+            if b.profit is not None:
+                d["pnl"] += float(b.profit)
+
+        for cat, d in stats_by_cat.items():
+            if d["bets"] > 0:
+                d["winrate"] = d["wins"] / d["bets"] * 100.0
+            else:
+                d["winrate"] = None
+            if d["stake"] > 0:
+                d["roi"] = d["pnl"] / d["stake"] * 100.0
+            else:
+                d["roi"] = None
+
+        cats_with_sample = [
+            (cat, d) for cat, d in stats_by_cat.items() if d["bets"] >= 3
+        ]
+        best_cat = None
+        worst_cat = None
+        if cats_with_sample:
+            best_cat = max(
+                cats_with_sample,
+                key=lambda x: x[1].get("roi", float("-inf")),
+            )
+            worst_cat = min(
+                cats_with_sample,
+                key=lambda x: x[1].get("roi", float("inf")),
+            )
+
+        if best_cat:
+            cat, d = best_cat
+            lines.append(
+                f"✅ Сильный рынок: {cat} "
+                f"(winrate {d['winrate']:.1f}%, ROI {d['roi']:.2f}%, "
+                f"ставок {int(d['bets'])})"
+            )
+        if worst_cat and worst_cat[0] != (best_cat[0] if best_cat else None):
+            cat, d = worst_cat
+            lines.append(
+                f"⚠️ Слабый рынок: {cat} "
+                f"(winrate {d['winrate']:.1f}%, ROI {d['roi']:.2f}%, "
+                f"ставок {int(d['bets'])})"
+            )
+        if not cats_with_sample:
+            lines.append(
+                "Выборка по рынкам пока небольшая. Чем больше сыграешь, тем точнее я покажу сильные и слабые зоны."
+            )
+
+    # Персональный совет
+    lines.append("")
+    lines.append("🧠 Совет по твоей игре:")
+
+    advice_parts: list[str] = []
+
+    # по 7д результату
+    if bets_7d and settled_all:
+        pnl_7d = sum(b.profit or 0.0 for b in [b for b in bets_7d if b.result in ("win", "lose")])
+        if pnl_7d < 0:
+            advice_parts.append(
+                "Последние 7 дней у тебя в лёгком минусе. Логично немного снизить средний % ставки от банка."
+            )
+        elif pnl_7d > 0:
+            advice_parts.append(
+                "Последние 7 дней у тебя в плюсе — важно не завышать ставки из-за серии успехов."
+            )
+
+    # по банку
+    if bank is None:
+        advice_parts.append(
+            "Сейчас ты играешь без фиксированного банка. Чтобы контролировать риск, задай банк и держись %
+            от него."
+        )
+
+    # по рынкам
+    if settled_all and best_cat:
+        cat, d = best_cat
+        advice_parts.append(
+            f"Продолжай мониторить ситуаций на рынке '{cat}' — по истории он для тебя самый сильный. "
+            "Туда можно ставить базовый % от банка."
+        )
+    if settled_all and worst_cat and worst_cat[0] != (best_cat[0] if best_cat else None):
+        cat, d = worst_cat
+        advice_parts.append(
+            f"На рынке '{cat}' пока осторожнее: по истории он тянет вниз. "
+            "Хорошая идея — уменьшить там % от банка или ставить только в самых очевидных спотах."
+        )
+
+    if not advice_parts:
+        advice_parts.append(
+            "Истории пока мало, чтобы дать точный совет. Главное — держать размер ставки в адекватном "
+            "проценте от банка и не догоняться."
+        )
+
+    for p in advice_parts:
+        lines.append(f"• {p}")
+
+    lines.append("")
+    lines.append(
+        "Для деталей можешь спросить:\n"
+        "• 'разбор моих рынков'\n"
+        "• 'отчёт за неделю'\n"
+        "• 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'"
+    )
+
+    return "\n".join(lines)
+
+
 # ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
 
 
@@ -832,7 +1027,6 @@ def build_khl_match_analysis(event) -> str:
             "У рынка 1X2 нет исходов с коэффициентами. Это странно, возможно, матч ещё не в линии."
         )
 
-    # собираем коэффициенты
     odds_list: list[tuple[str, float]] = []
     for o in outcomes:
         name = str(getattr(o, "name", "?"))
@@ -851,18 +1045,15 @@ def build_khl_match_analysis(event) -> str:
             "Не удалось извлечь валидные коэффициенты по рынку 1X2."
         )
 
-    # имплайд-проценты
     implied = [(name, 100.0 / coef) for name, coef in odds_list]
     sum_implied = sum(p for _, p in implied)
     margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
 
-    # 'честные' проценты без маржи
     fair: list[tuple[str, float]] = []
     if sum_implied > 0:
         for name, p in implied:
             fair.append((name, p * 100.0 / sum_implied))
 
-    # фаворит по минимальному коэффициенту
     fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
     fav_fair_pct = None
     for name, p in fair:
@@ -909,7 +1100,6 @@ def build_khl_match_analysis(event) -> str:
 async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     Простейший if/else-агент.
-    Дальше сюда можно будет наворачивать более умную логику и LLM.
     """
     original_text = message or ""
     text = original_text.lower().strip()
@@ -936,22 +1126,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'лучшая ставка недели'\n"
             "  • 'ошибка недели'\n"
             "  • 'разбор моих рынков' — где ты силён, а где льёшь\n\n"
+            "👤 *Профиль*\n"
+            "  • 'профиль' — банк, статистика, сильные/слабые рынки, совет\n\n"
             "🧠 *Оценка конкретной ставки*\n"
             "  • 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
-            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n\n"
-            "Команды, которые уже работают:\n"
-            "• 'ставка 1000 на СКА - ЦСКА тотал больше 5.5 за 1.9'\n"
-            "• 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
-            "• 'мои ставки'\n"
-            "• 'покажи мою статистику'\n"
-            "• 'ставка 1 выиграла' / 'ставка 2 возврат'\n"
-            "• 'кхл сегодня'\n"
-            "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
-            "• 'отчёт за неделю'\n"
-            "• 'лучшая ставка недели'\n"
-            "• 'ошибка недели'\n"
-            "• 'разбор моих рынков'\n"
-            "• 'мой банк 100000', 'состояние банка', 'пополнить банк 20000'\n"
+            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n"
         )
 
     # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ + АВТО-ОБНОВЛЕНИЕ БАНКА
@@ -963,7 +1142,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         bet_id = int(m_res.group(1))
         res_word = m_res.group(2)
 
-        # сначала рассчитываем ставку
         bet = settle_bet(session, user_id, bet_id, res_word)
         if bet is None:
             return f"Не нашёл ставку с id {bet_id} или не понял результат."
@@ -983,7 +1161,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             sign = "+" if bet.profit >= 0 else ""
             lines.append(f"Результат по сумме: {sign}{bet.profit:.0f}.")
 
-        # авто-обновление банка, но только если банк уже был задан
         old_bank = get_user_bank(session, user_id)
         if old_bank is not None and bet.profit is not None:
             user = change_user_bank(session, user_id, bet.profit)
@@ -997,13 +1174,21 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         lines.append("")
         lines.append(
-            "Посмотреть статистику: 'Покажи мою статистику' или 'отчёт за неделю'."
+            "Посмотреть статистику: 'Покажи мою статистику', 'профиль' или 'отчёт за неделю'."
         )
         return "\n".join(lines)
 
-    # 2) КОМАНДЫ БАНКА
+    # 2) ПРОФИЛЬ
+    if (
+        text == "профиль"
+        or "мой профиль" in text
+        or "личный кабинет" in text
+        or "мой аккаунт" in text
+    ):
+        return build_user_profile(session, user_id)
 
-    # 2.1 Показать состояние банка
+    # 3) КОМАНДЫ БАНКА
+
     if (
         "состояние банка" in text
         or text.strip() == "мой банк"
@@ -1017,7 +1202,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
         return _build_bank_status_text(bank)
 
-    # 2.2 Установить банк (мой банк 100000 / банк 50000 / установи банк 80000)
     m_set_bank = re.search(
         r"(мой\s+банк|установи\s+банк|банк)\s+(\d+([\.,]\d+)?)",
         text,
@@ -1038,7 +1222,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             + _build_bank_status_text(user.bank)
         )
 
-    # 2.3 Пополнить/увеличить банк
     if "банк" in text and any(k in text for k in ("попол", "добав", "увелич")):
         delta = _extract_first_number(text)
         if delta is None or delta <= 0:
@@ -1051,7 +1234,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         msg += "\n\n" + _build_bank_status_text(user.bank)
         return msg
 
-    # 2.4 Уменьшить банк
     if "банк" in text and any(k in text for k in ("уменьш", "сниз", "убав", "минус")):
         delta = _extract_first_number(text)
         if delta is None or delta <= 0:
@@ -1063,14 +1245,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             + _build_bank_status_text(user.bank)
         )
 
-    # 3) ЛУЧШАЯ СТАВКА НЕДЕЛИ
+    # 4) ЛУЧШАЯ СТАВКА НЕДЕЛИ
     if (
         "лучшая ставка недели" in text
         or ("лучш" in text and "ставк" in text and "недел" in text)
     ):
         return build_best_bet_insight(session, user_id)
 
-    # 4) ОШИБКА НЕДЕЛИ
+    # 5) ОШИБКА НЕДЕЛИ
     if (
         "ошибка недели" in text
         or ("худш" in text and "ставк" in text and "недел" in text)
@@ -1078,7 +1260,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_worst_bet_insight(session, user_id)
 
-    # 5) РАЗБОР МОИХ РЫНКОВ
+    # 6) РАЗБОР МОИХ РЫНКОВ
     if (
         "разбор моих рынков" in text
         or ("разбор" in text and "рынк" in text)
@@ -1087,7 +1269,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_user_market_insights(session, user_id)
 
-    # 6) ОБЩАЯ СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ
+    # 7) ОБЩАЯ СТАТИСТИКА
     if (
         "статист" in text
         or "статку" in text
@@ -1130,6 +1312,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             text_lines.append("")
         text_lines.append(
             "Отчёты и инсайты:\n"
+            "• 'профиль'\n"
             "• 'отчёт за неделю'\n"
             "• 'лучшая ставка недели'\n"
             "• 'ошибка недели'\n"
@@ -1139,7 +1322,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(text_lines)
 
-    # 7) ОТЧЁТ ЗА НЕДЕЛЮ
+    # 8) ОТЧЁТ ЗА НЕДЕЛЮ
     if (
         "отчёт за неделю" in text
         or "отчет за неделю" in text
@@ -1147,7 +1330,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_weekly_report(session, user_id)
 
-    # 8) АНАЛИЗ МАТЧА КХЛ ПО ID
+    # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
@@ -1176,7 +1359,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return build_khl_match_analysis(ev)
 
-    # 9) ОЦЕНКА СТАВКИ (SOFT VALUE / RISK-COACH)
+    # 10) ОЦЕНКА СТАВКИ
     if (
         "оценка ставки" in text
         or ("что скажешь" in text and "ставк" in text)
@@ -1185,7 +1368,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_stake_evaluation(session, user_id, original_text)
 
-    # 10) МАТЧИ КХЛ НА СЕГОДНЯ
+    # 11) МАТЧИ КХЛ НА СЕГОДНЯ
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             events = await get_today_khl_events()
@@ -1201,10 +1384,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             return "На сегодня я не нашёл матчей КХЛ."
 
         lines = []
-        for e in events[:5]:  # ограничимся первыми 5 матчами
+        for e in events[:5]:
             line = f"{e.team1} — {e.team2} (id: {e.id})"
 
-            # Пытаемся найти рынок 1X2 и показать коэффициенты
             market_1x2 = None
             for m in e.markets:
                 name = getattr(m, "name", "") or ""
@@ -1228,17 +1410,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-    # 11) МОИ СТАВКИ
+    # 12) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
-        from .bets_db import Bet  # чтобы взять result/profit при необходимости
-
         bets = get_last_bets(session, user_id, limit=5)
         if not bets:
             return "У тебя пока нет сохранённых ставок."
 
         lines = []
         for b in bets:
-            line_parts = [f"{b.created_at:%d.%m %H:%M} — {b.raw_text}"]
+            line_parts = [f"{b.created_at:%d.%м %H:%M} — {b.raw_text}"]
             if b.event:
                 line_parts.append(f"событие: {b.event}")
             if b.outcome:
@@ -1264,7 +1444,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # 12) ДОБАВЛЕНИЕ СТАВКИ + ПОДСКАЗКА ПО БАНКУ
+    # 13) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -1295,17 +1475,16 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "\nКогда узнаешь результат, напиши, например:\n"
             f"'ставка {bet.id} выиграла', 'ставка {bet.id} проиграла' "
             f"или 'ставка {bet.id} возврат'.\n"
-            "Посмотреть: 'мои ставки' или 'Покажи мою статистику'."
+            "Посмотреть: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
         )
 
-        # подсказка по банку (если он задан)
         bank = get_user_bank(session, user_id)
         if bank is not None:
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
 
         return "\n".join(resp_lines)
 
-    # 13) ЗАГЛУШКИ ПОД БУДУЩИЕ РАЗДЕЛЫ
+    # 14) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
         return (
             "Раздел аналитики матчей расширяется.\n"
@@ -1326,19 +1505,21 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "План: value-ставки, расширенная аналитика, персональные рекомендации."
         )
 
-    # 14) HELP ПО УМОЛЧАНИЮ
+    # 15) HELP ПО УМОЛЧАНИЮ
     return (
         "Я AI-агент для ставок по хоккею.\n"
         "Сейчас умею:\n"
+        "• Вести банк и подсказки по размеру ставки\n"
         "• Парсить сумму, кэф, исход и событие из текста ставки\n"
         "• Вести историю и показывать статистику\n"
-        "• Делать weekly-отчёт, подсвечивать лучшую и худшую ставку недели\n"
+        "• Делать weekly-отчёт и подсвечивать лучшую/худшую ставку недели\n"
         "• Разбирать твои рынки: 'разбор моих рынков'\n"
-        "• Работать с банком и подсказывать размер ставки: 'мой банк 100000', 'состояние банка'\n"
         "• Оценивать конкретную ставку как коуч: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
-        "• Показывать матчи КХЛ и разбор линии 1X2 по матчу\n\n"
+        "• Показывать матчи КХЛ и odds-разбор по матчу\n"
+        "• Собираать твой профиль: 'профиль'\n\n"
         "Попробуй, например:\n"
         "• 'мой банк 100000'\n"
+        "• 'профиль'\n"
         "• 'состояние банка'\n"
         "• 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
         "• 'ставка 1000 на СКА - ЦСКА тотал больше 5.5 за 1.9'\n"
@@ -1349,7 +1530,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'ошибка недели'\n"
         "• 'разбор моих рынков'\n"
         "• 'КХЛ сегодня'\n"
-        "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
+        "• 'анализ матча 123'\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
     )
 
@@ -1383,5 +1564,4 @@ def _start_bot_background() -> None:
         logger.exception("Не удалось запустить Telegram-бота в фоне")
 
 
-# ВАЖНО: вызываем после определения всего приложения
 _start_bot_background()
