@@ -12,6 +12,19 @@ from sqlmodel import SQLModel, Field, Session, select
 # ---------- МОДЕЛИ В БД ----------
 
 
+class User(SQLModel, table=True):
+    """
+    Пользователь бота.
+
+    id — это тот же user_id, который приходит из Telegram/клиента.
+    bank — текущий банкролл (может быть None, если ещё не задан).
+    """
+    __tablename__ = "users"
+
+    id: int = Field(primary_key=True, index=True)
+    bank: Optional[float] = Field(default=None)
+
+
 class Bet(SQLModel, table=True):
     """
     Запись о ставке пользователя.
@@ -29,7 +42,7 @@ class Bet(SQLModel, table=True):
     # базовые поля
     stake: Optional[float] = None          # сумма ставки
     odds: Optional[float] = None           # коэффициент (например 1.85)
-    event: Optional[str] = None            # матч / событие (пока не парсим)
+    event: Optional[str] = None            # матч / событие
     outcome: Optional[str] = None          # исход (П1, тотал и т.п.)
 
     # результат
@@ -56,7 +69,66 @@ class UserStats:
     total_stake: float     # суммарный объём ставок (win/lose)
 
 
-# ---------- ОПЕРАЦИИ С БАЗОЙ ----------
+# ---------- ОПЕРАЦИИ С ПОЛЬЗОВАТЕЛЕМ / БАНКОМ ----------
+
+
+def get_or_create_user(session: Session, user_id: int) -> User:
+    """
+    Получаем пользователя по id.
+    Если его нет — создаём нового с пустым банком.
+    """
+    statement = select(User).where(User.id == user_id)
+    user: User | None = session.exec(statement).one_or_none()
+
+    if user is None:
+        user = User(id=user_id, bank=None)
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+    return user
+
+
+def get_user_bank(session: Session, user_id: int) -> Optional[float]:
+    """
+    Возвращаем текущий банк пользователя (или None, если не задан).
+    """
+    user = get_or_create_user(session, user_id)
+    return user.bank
+
+
+def set_user_bank(session: Session, user_id: int, bank: float) -> User:
+    """
+    Жёстко устанавливаем банку новое значение.
+    Используем для команд типа 'мой банк 100000'.
+    """
+    user = get_or_create_user(session, user_id)
+    user.bank = float(bank)
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+def change_user_bank(session: Session, user_id: int, delta: float) -> User:
+    """
+    Изменяем банк на delta (может быть положительный или отрицательный).
+    Например: пополнить/уменьшить банк.
+    """
+    user = get_or_create_user(session, user_id)
+    current = float(user.bank or 0.0)
+    new_value = current + float(delta)
+    # при желании можно не давать падать ниже 0
+    if new_value < 0:
+        new_value = 0.0
+    user.bank = new_value
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+# ---------- ОПЕРАЦИИ СО СТАВКАМИ ----------
 
 
 def add_bet(
@@ -71,6 +143,9 @@ def add_bet(
     """
     Сохраняем ставку в БД.
     """
+    # гарантируем, что пользователь существует
+    get_or_create_user(session, user_id)
+
     bet = Bet(
         user_id=user_id,
         raw_text=raw_text,
@@ -98,7 +173,21 @@ def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
     return list(session.exec(statement))
 
 
-def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
+def get_all_bets(session: Session, user_id: int) -> List[Bet]:
+    """
+    Возвращаем все ставки пользователя.
+    (Может использоваться для глобальной аналитики рынков и т.п.)
+    """
+    statement = select(Bet).where(Bet.user_id == user_id)
+    return list(session.exec(statement))
+
+
+def settle_bet(
+    session: Session,
+    user_id: int,
+    bet_id: int,
+    result: str,
+) -> Optional[Bet]:
     """
     Отмечаем ставку рассчитанной: result = "win" / "lose" / "push".
 
