@@ -23,7 +23,7 @@ from .bets_db import (
 )
 
 from .khl_client import get_today_khl_events
-from .khl_form_client import get_team_form, TeamForm
+from .khl_form_client import get_team_form, TeamForm  # пока не используем, но пусть будет
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +241,7 @@ def _extract_first_number(text: str) -> float | None:
     """
     Достаём первое число из строки (для банка, пополнения и т.п.).
     """
-    m = re.search(r"(\d+([\.,]\д+)?)", text)
+    m = re.search(r"(\d+([\.,]\d+)?)", text)
     if not m:
         return None
     try:
@@ -863,6 +863,8 @@ def build_user_profile(session: Session, user_id: int) -> str:
     lines.append("🎯 Твои рынки:")
 
     settled_all = [b for b in bets if b.result in ("win", "lose")]
+    best_cat = None
+    worst_cat = None
     if not settled_all:
         lines.append(
             "Пока рано делить на сильные и слабые рынки — нет рассчитанных ставок."
@@ -904,8 +906,6 @@ def build_user_profile(session: Session, user_id: int) -> str:
         cats_with_sample = [
             (cat, d) for cat, d in stats_by_cat.items() if d["bets"] >= 3
         ]
-        best_cat = None
-        worst_cat = None
         if cats_with_sample:
             best_cat = max(
                 cats_with_sample,
@@ -923,7 +923,7 @@ def build_user_profile(session: Session, user_id: int) -> str:
                 f"(winrate {d['winrate']:.1f}%, ROI {d['roi']:.2f}%, "
                 f"ставок {int(d['bets'])})"
             )
-        if worst_cat and worst_cat[0] != (best_cat[0] if best_cat else None):
+        if worst_cat and (not best_cat or worst_cat[0] != best_cat[0]):
             cat, d = worst_cat
             lines.append(
                 f"⚠️ Слабый рынок: {cat} "
@@ -943,7 +943,10 @@ def build_user_profile(session: Session, user_id: int) -> str:
 
     # по 7д результату
     if bets_7d and settled_all:
-        pnl_7d = sum(b.profit or 0.0 for b in [b for b in bets_7d if b.result in ("win", "lose")])
+        pnl_7d = sum(
+            b.profit or 0.0
+            for b in [b for b in bets_7d if b.result in ("win", "lose")]
+        )
         if pnl_7d < 0:
             advice_parts.append(
                 "Последние 7 дней у тебя в лёгком минусе. Логично немного снизить средний % ставки от банка."
@@ -956,8 +959,8 @@ def build_user_profile(session: Session, user_id: int) -> str:
     # по банку
     if bank is None:
         advice_parts.append(
-       profile_lines.append("Сейчас ты играешь без фиксированного банка. Чтобы контролировать риск, установи банк и держись безопасного процента от него (обычно 1–5%).")
-
+            "Сейчас ты играешь без фиксированного банка. Чтобы контролировать риск, "
+            "установи банк и держись безопасного процента от него (обычно 1–5%)."
         )
 
     # по рынкам
@@ -967,7 +970,7 @@ def build_user_profile(session: Session, user_id: int) -> str:
             f"Продолжай мониторить ситуаций на рынке '{cat}' — по истории он для тебя самый сильный. "
             "Туда можно ставить базовый % от банка."
         )
-    if settled_all and worst_cat and worst_cat[0] != (best_cat[0] if best_cat else None):
+    if settled_all and worst_cat and (not best_cat or worst_cat[0] != best_cat[0]):
         cat, d = worst_cat
         advice_parts.append(
             f"На рынке '{cat}' пока осторожнее: по истории он тянет вниз. "
@@ -1007,7 +1010,7 @@ def build_khl_match_analysis(event) -> str:
     event_id = getattr(event, "id", "?")
     title = f"{team1} — {team2} (id: {event_id})"
 
-    lines = []
+    lines: list[str] = []
     lines.append("📊 Разбор матча КХЛ (упрощённый режим):")
     lines.append(title)
     lines.append("")
@@ -1017,170 +1020,6 @@ def build_khl_match_analysis(event) -> str:
     )
 
     return "\n".join(lines)
-
-
-    # --- 3) Разбор рынка 1X2 ---
-    if market_1x2:
-        outcomes = getattr(market_1x2, "outcomes", []) or []
-        odds_list: list[tuple[str, float]] = []
-
-        for o in outcomes:
-            name = str(getattr(o, "name", "?"))
-            price = getattr(o, "price", None)
-            try:
-                price_f = float(price)
-            except (TypeError, ValueError):
-                continue
-            if price_f < 1.01:
-                continue
-            odds_list.append((name, price_f))
-
-        if odds_list:
-            lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-
-            implied = [(name, 100.0 / coef) for name, coef in odds_list]
-            sum_implied = sum(p for _, p in implied)
-            margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
-
-            for (name, coef), (_, p_imp) in zip(odds_list, implied):
-                lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
-
-            if margin:
-                lines.append("")
-                lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
-
-            # Оценка "честных" вероятностей (без маржи)
-            if sum_implied > 0:
-                lines.append("")
-                lines.append("Оценка 'честных' вероятностей (без маржи бука):")
-                for (name, _), (_, p_imp) in zip(odds_list, implied):
-                    fair = p_imp * 100.0 / sum_implied
-                    lines.append(f"• {name}: ≈ {fair:.1f}%")
-
-            # Определяем фаворита / андердога
-            fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
-            dog_name, dog_coef = max(odds_list, key=lambda x: x[1])
-
-            lines.append("")
-            lines.append("Структура матча по 1X2:")
-
-            ratio = dog_coef / fav_coef if fav_coef > 0 else None
-            if ratio is not None:
-                if ratio < 1.4:
-                    lines.append(
-                        "• Линия достаточно ровная — ожидается более-менее равный матч без явного суперфаворита."
-                    )
-                elif ratio < 2.2:
-                    lines.append(
-                        f"• {fav_name} идёт фаворитом, но андердог ({dog_name}) не выглядит безнадёжным по линии."
-                    )
-                else:
-                    lines.append(
-                        f"• {fav_name} — явный фаворит по линии, {dog_name} играет роль заметного андердога."
-                    )
-            else:
-                lines.append("• Фаворит и андердог по линии определяются, но коэффициенты странные.")
-
-            lines.append(
-                "• Помни, что линия отражает оценку букмекера + рынок, а не гарантию результата."
-            )
-
-        else:
-            lines.append(
-                "По рынку 1X2 я не нашёл валидных коэффициентов. "
-                "Возможно, матч в лайве или линия временно снята."
-            )
-    else:
-        lines.append(
-            "По этому матчу я не вижу классического рынка 1X2. "
-            "Скорее всего, доступны только альтернативные рынки или линия урезана."
-        )
-
-    # --- 4) Разбор тотала, если есть ---
-    if market_total:
-        outcomes = getattr(market_total, "outcomes", []) or []
-        over = None
-        under = None
-
-        for o in outcomes:
-            name_raw = str(getattr(o, "name", "") or "")
-            name_up = name_raw.upper()
-            price = getattr(o, "price", None)
-            try:
-                price_f = float(price)
-            except (TypeError, ValueError):
-                continue
-            if price_f < 1.01:
-                continue
-
-            if any(k in name_up for k in ("OVER", "ТБ")):
-                over = (name_raw, price_f)
-            elif any(k in name_up for k in ("UNDER", "ТМ")):
-                under = (name_raw, price_f)
-
-        if over or under:
-            lines.append("")
-            lines.append("Рынок тотала (основная линия, если удалось определить):")
-
-            if over:
-                lines.append(f"• {over[0]}: кэф {over[1]:.2f}")
-            if under:
-                lines.append(f"• {under[0]}: кэф {under[1]:.2f}")
-
-            if over and under:
-                p_over = 100.0 / over[1]
-                p_under = 100.0 / under[1]
-                sum_p = p_over + p_under
-                margin_tot = sum_p - 100.0
-
-                lines.append("")
-                lines.append(
-                    f"Импл. вероятность: ТБ ≈ {p_over:.1f}%, ТМ ≈ {p_under:.1f}%. "
-                    "Сумма выше 100% из-за маржи бука."
-                )
-                lines.append(f"Оценочная маржа по тоталу ≈ {margin_tot:.1f} п.п.")
-        else:
-            lines.append("")
-            lines.append(
-                "Рынок тотала присутствует, но не удалось однозначно выделить основную линию ТБ/ТМ."
-            )
-
-    # --- 5) Форма команд (через khl_form_client) ---
-    # Сейчас это заглушка, но интерфейс тот же, что и будет с реальными данными.
-    lines.append("")
-    lines.append("📉 Форма команд (оценка по последним матчам):")
-
-    form1 = get_team_form(team1)
-    form2 = get_team_form(team2)
-
-    if form1:
-        lines.append(
-            f"• {form1.team_name}: {form1.wins}-{form1.losses} за последние {form1.games} матчей, "
-            f"забивают в среднем {form1.goals_for:.1f}, пропускают {form1.goals_against:.1f}, "
-            f"средний тотал ≈ {form1.avg_total:.1f}."
-        )
-    else:
-        lines.append(f"• {team1}: форму не удалось оценить (недостаточно данных).")
-
-    if form2:
-        lines.append(
-            f"• {form2.team_name}: {form2.wins}-{form2.losses} за последние {form2.games} матчей, "
-            f"забивают в среднем {form2.goals_for:.1f}, пропускают {form2.goals_against:.1f}, "
-            f"средний тотал ≈ {form2.avg_total:.1f}."
-        )
-    else:
-        lines.append(f"• {team2}: форму не удалось оценить (недостаточно данных).")
-
-      lines.append("")
-    lines.append(
-        "Форма считается по последним матчам (когда данные доступны в календаре), "
-        "а если календарь недоступен — по приближённой модели по команде. "
-        "Позже сюда можно будет подставить полноценный статистический фид без изменения логики бота."
-    )
-
-    return "\n".join(lines)
-
-
 
 
 # ------------------ ЛОГИКА АГЕНТА ------------------
@@ -1507,7 +1346,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         lines = []
         for b in bets:
-            line_parts = [f"{b.created_at:%d.%м %H:%M} — {b.raw_text}"]
+            line_parts = [f"{b.created_at:%d.%m %H:%M} — {b.raw_text}"]
             if b.event:
                 line_parts.append(f"событие: {b.event}")
             if b.outcome:
