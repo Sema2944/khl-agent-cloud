@@ -997,7 +997,7 @@ def build_user_profile(session: Session, user_id: int) -> str:
 # ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
 
 
-async def build_khl_match_analysis(event) -> str:
+def build_khl_match_analysis(event) -> str:
     """
     Разбор матча КХЛ по объекту event из khl_client.
 
@@ -1168,8 +1168,8 @@ async def build_khl_match_analysis(event) -> str:
     lines.append("")
     lines.append("📉 Форма команд (оценка по последним матчам):")
 
-    form1 = await get_team_form(team1)
-    form2 = await get_team_form(team2)
+    form1 = get_team_form(team1)
+    form2 = get_team_form(team2)
 
     if form1:
         lines.append(
