@@ -348,6 +348,112 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
+# ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
+
+
+def build_khl_match_analysis(event) -> str:
+    """
+    Разбор матча КХЛ по объекту event из khl_client:
+    - линия 1X2
+    - имплайд-вероятности
+    - маржа букмекера
+    - 'честные' вероятности без маржи
+    """
+    title = f"{getattr(event, 'team1', '?')} — {getattr(event, 'team2', '?')} (id: {getattr(event, 'id', '?')})"
+
+    markets = getattr(event, "markets", []) or []
+    market_1x2 = None
+    for m in markets:
+        name = getattr(m, "name", "") or ""
+        if name.upper() in ("1X2", "1X", "3WAY", "3-WAY"):
+            market_1x2 = m
+            break
+
+    if not market_1x2:
+        return (
+            f"Разбор матча {title}.\n"
+            "Я не нашёл рынок 1X2 в данных по этому матчу, поэтому пока могу показать "
+            "только базовую информацию. Позже добавлю более глубокую аналитику."
+        )
+
+    outcomes = getattr(market_1x2, "outcomes", []) or []
+    if not outcomes:
+        return (
+            f"Разбор матча {title}.\n"
+            "У рынка 1X2 нет исходов с коэффициентами. Это странно, возможно, матч ещё не в линии."
+        )
+
+    # собираем коэффициенты
+    odds_list: list[tuple[str, float]] = []
+    for o in outcomes:
+        name = str(getattr(o, "name", "?"))
+        price = getattr(o, "price", None)
+        try:
+            price_f = float(price)
+        except (TypeError, ValueError):
+            continue
+        if price_f < 1.01:
+            continue
+        odds_list.append((name, price_f))
+
+    if not odds_list:
+        return (
+            f"Разбор матча {title}.\n"
+            "Не удалось извлечь валидные коэффициенты по рынку 1X2."
+        )
+
+    # имплайд-проценты
+    implied = [(name, 100.0 / coef) for name, coef in odds_list]
+    sum_implied = sum(p for _, p in implied)
+    margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
+
+    # 'честные' проценты без маржи
+    fair = []
+    if sum_implied > 0:
+        for name, p in implied:
+            fair.append((name, p * 100.0 / sum_implied))
+
+    # определим фаворита по минимальному коэффициенту
+    fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
+    fav_fair_pct = None
+    for name, p in fair:
+        if name == fav_name:
+            fav_fair_pct = p
+            break
+
+    lines: list[str] = []
+    lines.append(f"📊 Разбор матча КХЛ:")
+    lines.append(title)
+    lines.append("")
+    lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
+    for (name, coef), (_, p_imp) in zip(odds_list, implied):
+        lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
+
+    if margin:
+        lines.append("")
+        lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
+
+    if fair:
+        lines.append("")
+        lines.append("Оценка 'честных' вероятностей (без маржи):")
+        for name, p_fair in fair:
+            lines.append(f"• {name}: ≈ {p_fair:.1f}%")
+
+    if fav_name and fav_fair_pct is not None:
+        lines.append("")
+        lines.append(
+            f"Фаворит по линии: {fav_name} (ориентировочно {fav_fair_pct:.1f}% без учёта маржи бука)."
+        )
+
+    lines.append("")
+    lines.append(
+        "Дальше сюда можно будет навесить xG, форму, PP/PK и вратарей. "
+        "Сейчас это быстрый odds-based разбор."
+    )
+
+    return "\n".join(lines)
+
+
 # ------------------ ЛОГИКА АГЕНТА ------------------
 
 
@@ -368,9 +474,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • сохранять ставки по тексту\n"
             "  • показывать последние\n"
             "  • считать winrate, ROI, PnL\n\n"
-            "📊 *Аналитика матчей* (в разработке)\n"
-            "  • разбор матчей КХЛ и других лиг\n"
-            "  • подсказки по рынкам (тоталы, форы, 1X2)\n\n"
+            "📊 *Аналитика матчей* (уже частично есть)\n"
+            "  • покажу матчи КХЛ на сегодня\n"
+            "  • сделаю odds-разбор матча по id: 'анализ матча 123'\n\n"
             "🔴 *Live-инсайты* (позже)\n"
             "  • анализ событий по ходу игры\n\n"
             "📈 *Отчёты недели* (уже частично работают)\n"
@@ -384,6 +490,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "• 'покажи мою статистику'\n"
             "• 'ставка 1 выиграла' / 'ставка 2 возврат'\n"
             "• 'кхл сегодня'\n"
+            "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
             "• 'отчёт за неделю'\n"
         )
 
@@ -466,7 +573,38 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_weekly_report(session, user_id)
 
-    # ----------------- 4) МАТЧИ КХЛ НА СЕГОДНЯ -----------------
+    # ----------------- 4) АНАЛИЗ МАТЧА КХЛ ПО ID -----------------
+    # Примеры:
+    # "анализ матча 123", "разбор матча 123", "анализ 123"
+    m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
+    if not m_an:
+        m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
+    if m_an:
+        event_id_str = m_an.group(2)
+        try:
+            events = await get_today_khl_events()
+        except Exception:
+            logger.exception("Ошибка при получении матчей КХЛ (для анализа матча)")
+            return (
+                "Не смог получить матчи КХЛ для анализа (ошибка парсера или API).\n"
+                "Попробуй ещё раз чуть позже или сначала запроси 'КХЛ сегодня'."
+            )
+
+        ev = None
+        for e in events:
+            if str(getattr(e, "id", "")) == event_id_str:
+                ev = e
+                break
+
+        if ev is None:
+            return (
+                f"Я не нашёл матч с id {event_id_str} среди сегодняшних игр КХЛ.\n"
+                "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
+            )
+
+        return build_khl_match_analysis(ev)
+
+    # ----------------- 5) МАТЧИ КХЛ НА СЕГОДНЯ -----------------
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             events = await get_today_khl_events()
@@ -486,7 +624,13 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             line = f"{e.team1} — {e.team2} (id: {e.id})"
 
             # Пытаемся найти рынок 1X2 и показать коэффициенты
-            market_1x2 = next((m for m in e.markets if m.name == "1X2"), None)
+            market_1x2 = None
+            for m in e.markets:
+                name = getattr(m, "name", "") or ""
+                if name.upper() in ("1X2", "1X", "3WAY", "3-WAY"):
+                    market_1x2 = m
+                    break
+
             if market_1x2:
                 odds_part = ", ".join(
                     f"{o.name}: {o.price}" for o in market_1x2.outcomes
@@ -495,9 +639,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
             lines.append(line)
 
+        lines.append("")
+        lines.append(
+            "Чтобы получить разбор конкретного матча, напиши, например: 'анализ матча 123' "
+            "(используй id из списка выше)."
+        )
+
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-    # ----------------- 5) МОИ СТАВКИ -----------------
+    # ----------------- 6) МОИ СТАВКИ -----------------
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
         from .bets_db import Bet  # чтобы взять result/profit при необходимости
 
@@ -533,7 +683,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # ----------------- 6) ДОБАВЛЕНИЕ СТАВКИ -----------------
+    # ----------------- 7) ДОБАВЛЕНИЕ СТАВКИ -----------------
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -569,12 +719,13 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(resp_lines)
 
-    # ----------------- 7) ЗАГЛУШКИ ПОД БУДУЩИЕ РАЗДЕЛЫ -----------------
+    # ----------------- 8) ЗАГЛУШКИ ПОД БУДУЩИЕ РАЗДЕЛЫ -----------------
     if "аналити" in text and "матч" in text:
         return (
-            "Раздел аналитики матчей в разработке.\n"
-            "Чуть позже тут будет разбор по xG, PP/PK, вратарям и value.\n"
-            "Сейчас могу показать: 'КХЛ сегодня' или сохранить ставку."
+            "Раздел аналитики матчей расширяется.\n"
+            "Уже сейчас можно:\n"
+            "• запросить 'КХЛ сегодня' и увидеть матчи и линию 1X2\n"
+            "• написать 'анализ матча <id>' для разбора линии по конкретному матчу."
         )
 
     if "live" in text or "лайв" in text or "жив" in text:
@@ -589,14 +740,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "План: value-ставки, расширенная аналитика, персональные рекомендации."
         )
 
-    # ----------------- 8) HELP ПО УМОЛЧАНИЮ -----------------
+    # ----------------- 9) HELP ПО УМОЛЧАНИЮ -----------------
     return (
         "Я AI-агент для ставок по хоккею.\n"
         "Сейчас умею:\n"
         "• Парсить сумму, кэф, исход (П1/П2/Х, тоталы, форы) и событие из текста ставки\n"
         "• По словам 'статистика / статку / моя статистика' показывать твою статистику\n"
         "• По запросу 'отчёт за неделю' собирать weekly-отчёт по ставкам\n"
-        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ\n"
+        "• По запросу 'КХЛ сегодня' показывать матчи КХЛ и линию 1X2\n"
+        "• По запросу 'анализ матча <id>' разбирать линию 1X2 по конкретному матчу\n"
         "• По сообщению вида 'ставка ...' сохранять ставку в базу\n"
         "• По запросу 'мои ставки' показывать последние сохранённые\n"
         "• По фразе 'ставка N выиграла/проиграла/возврат' отмечать результат и считать winrate/ROI\n\n"
@@ -604,8 +756,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'ставка 1000 на СКА - ЦСКА тотал больше 5.5 за 1.9'\n"
         "• 'мои ставки'\n"
         "• 'отчёт за неделю'\n"
-        "• 'Покажи мою статистику'\n"
-        "• 'Какие матчи КХЛ сегодня?'\n"
+        "• 'КХЛ сегодня'\n"
+        "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
     )
 
