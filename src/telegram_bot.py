@@ -4,7 +4,7 @@ import os
 import logging
 import asyncio
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,6 +26,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def build_main_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Главная клавиатура с основными кнопками.
+    Тексты кнопок совпадают с командами, которые понимает run_agent.
+    """
+    keyboard = [
+        ["профиль", "мои ставки"],
+        ["КХЛ сегодня", "отчёт за неделю"],
+        ["разбор моих рынков", "состояние банка"],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+
 async def call_agent(user_id: int, message: str) -> str:
     """
     Шлём запрос в твой /agent/query и возвращаем текст ответа.
@@ -42,14 +55,24 @@ async def call_agent(user_id: int, message: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start — приветственное сообщение.
+    /start — приветственное сообщение + показ клавиатуры.
     """
-    await update.message.reply_text(
+    if not update.message:
+        return
+
+    text = (
         "Привет! Я AI-агент для ставок на спорт.\n\n"
         "Я умею:\n"
-        "• Показать твою статистику по ставкам (напиши: 'Покажи мою статистику')\n"
-        "• Показать матчи КХЛ на сегодня (напиши: 'Какие матчи КХЛ сегодня?')\n\n"
-        "Напиши мне что-нибудь 😉"
+        "• Вести историю ставок и статистику (winrate, ROI, PnL)\n"
+        "• Работать с банк-менеджментом\n"
+        "• Делать отчёты за неделю и разбор твоих рынков\n"
+        "• Показывать матчи КХЛ на сегодня и делать базовый разбор матча\n\n"
+        "Нажимай на кнопки внизу или напиши мне что-нибудь 😉"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=build_main_keyboard(),
     )
 
 
@@ -64,6 +87,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     text = update.message.text or ""
+    norm = text.strip().lower()
 
     try:
         reply = await call_agent(user_id, text)
@@ -73,8 +97,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Не удалось связаться с сервером агента 😔\n"
             "Попробуй ещё раз чуть позже."
         )
+        # даже при ошибке можно показать клавиатуру
+        await update.message.reply_text(reply, reply_markup=build_main_keyboard())
+        return
 
-    await update.message.reply_text(reply)
+    # Если пользователь просит меню/помощь — показываем клавиатуру
+    if norm in {"/start", "start", "меню", "help", "/help"}:
+        await update.message.reply_text(reply, reply_markup=build_main_keyboard())
+    else:
+        # Обычный ответ без изменения клавиатуры
+        await update.message.reply_text(reply)
 
 
 def main() -> None:
