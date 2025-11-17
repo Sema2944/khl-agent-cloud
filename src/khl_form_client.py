@@ -19,7 +19,9 @@ class TeamForm:
     avg_total: float       # средний тотал (GF + GA)
 
 
-async def get_team_form(team_name: str) -> Optional[TeamForm]:
+def get_team_form(team_name: str) -> Optional[TeamForm]:
+    ...
+
     """
     ВРЕМЕННАЯ ЗАГЛУШКА ДЛЯ ФОРМЫ КОМАНДЫ.
 
