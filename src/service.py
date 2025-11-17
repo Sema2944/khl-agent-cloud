@@ -23,6 +23,7 @@ from .bets_db import (
 )
 
 from .khl_client import get_today_khl_events
+from .khl_form_client import get_team_form, TeamForm
 
 logger = logging.getLogger(__name__)
 
