@@ -999,202 +999,21 @@ def build_user_profile(session: Session, user_id: int) -> str:
 
 def build_khl_match_analysis(event) -> str:
     """
-    Разбор матча КХЛ по объекту event из khl_client.
-
-    Что делаем:
-    - разбираем линию 1X2 (фаворит / андердог, имплайд-вероятности, маржа)
-    - по возможности показываем рынок тотала (основная линия)
-    - добавляем блок "Форма команд" (через khl_form_client)
+    Временный простой вариант разбора матча КХЛ,
+    чтобы сервис успешно запускался.
     """
-    from .khl_form_client import get_team_form  # локальный импорт, чтобы избежать циклов
-
     team1 = getattr(event, "team1", "?")
     team2 = getattr(event, "team2", "?")
     event_id = getattr(event, "id", "?")
     title = f"{team1} — {team2} (id: {event_id})"
 
-    markets = getattr(event, "markets", []) or []
-
-    # --- 1) Поиск рынков 1X2 и тотала ---
-    market_1x2 = None
-    market_total = None
-
-    for m in markets:
-        name = (getattr(m, "name", "") or "").upper()
-        if market_1x2 is None and name in ("1X2", "1X", "3WAY", "3-WAY"):
-            market_1x2 = m
-        if market_total is None and any(k in name for k in ("TOTAL", "ТОТАЛ", "TOTALS", "OVER/UNDER")):
-            market_total = m
-
-    lines: list[str] = []
-    lines.append("📊 Разбор матча КХЛ:")
+    lines = []
+    lines.append("📊 Разбор матча КХЛ (упрощённый режим):")
     lines.append(title)
     lines.append("")
-
-    # --- 2) Если нет линии вообще ---
-    if not markets:
-        lines.append(
-            "По этому матчу я не вижу доступных рынков в линии. "
-            "Возможно, матч ещё не открыт у букмекера или данные не подгрузились."
-        )
-        return "\n".join(lines)
-
-    # --- 3) Разбор рынка 1X2 ---
-    if market_1x2:
-        outcomes = getattr(market_1x2, "outcomes", []) or []
-        odds_list: list[tuple[str, float]] = []
-
-        for o in outcomes:
-            name = str(getattr(o, "name", "?"))
-            price = getattr(o, "price", None)
-            try:
-                price_f = float(price)
-            except (TypeError, ValueError):
-                continue
-            if price_f < 1.01:
-                continue
-            odds_list.append((name, price_f))
-
-        if odds_list:
-            lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-
-            implied = [(name, 100.0 / coef) for name, coef in odds_list]
-            sum_implied = sum(p for _, p in implied)
-            margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
-
-            for (name, coef), (_, p_imp) in zip(odds_list, implied):
-                lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
-
-            if margin:
-                lines.append("")
-                lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
-
-            # Оценка "честных" вероятностей (без маржи)
-            if sum_implied > 0:
-                lines.append("")
-                lines.append("Оценка 'честных' вероятностей (без маржи бука):")
-                for (name, _), (_, p_imp) in zip(odds_list, implied):
-                    fair = p_imp * 100.0 / sum_implied
-                    lines.append(f"• {name}: ≈ {fair:.1f}%")
-
-            # Определяем фаворита / андердога
-            fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
-            dog_name, dog_coef = max(odds_list, key=lambda x: x[1])
-
-            lines.append("")
-            lines.append("Структура матча по 1X2:")
-
-            ratio = dog_coef / fav_coef if fav_coef > 0 else None
-            if ratio is not None:
-                if ratio < 1.4:
-                    lines.append(
-                        "• Линия достаточно ровная — ожидается более-менее равный матч без явного суперфаворита."
-                    )
-                elif ratio < 2.2:
-                    lines.append(
-                        f"• {fav_name} идёт фаворитом, но андердог ({dog_name}) не выглядит безнадёжным по линии."
-                    )
-                else:
-                    lines.append(
-                        f"• {fav_name} — явный фаворит по линии, {dog_name} играет роль заметного андердога."
-                    )
-            else:
-                lines.append("• Фаворит и андердог по линии определяются, но коэффициенты странные.")
-
-            lines.append(
-                "• Помни, что линия отражает оценку букмекера + рынок, а не гарантию результата."
-            )
-
-        else:
-            lines.append(
-                "По рынку 1X2 я не нашёл валидных коэффициентов. "
-                "Возможно, матч в лайве или линия временно снята."
-            )
-    else:
-        lines.append(
-            "По этому матчу я не вижу классического рынка 1X2. "
-            "Скорее всего, доступны только альтернативные рынки или линия урезана."
-        )
-
-    # --- 4) Разбор тотала, если есть ---
-    if market_total:
-        outcomes = getattr(market_total, "outcomes", []) or []
-        over = None
-        under = None
-
-        for o in outcomes:
-            name_raw = str(getattr(o, "name", "") or "")
-            name_up = name_raw.upper()
-            price = getattr(o, "price", None)
-            try:
-                price_f = float(price)
-            except (TypeError, ValueError):
-                continue
-            if price_f < 1.01:
-                continue
-
-            if any(k in name_up for k in ("OVER", "ТБ")):
-                over = (name_raw, price_f)
-            elif any(k in name_up for k in ("UNDER", "ТМ")):
-                under = (name_raw, price_f)
-
-        if over or under:
-            lines.append("")
-            lines.append("Рынок тотала (основная линия, если удалось определить):")
-
-            if over:
-                lines.append(f"• {over[0]}: кэф {over[1]:.2f}")
-            if under:
-                lines.append(f"• {under[0]}: кэф {under[1]:.2f}")
-
-            if over and under:
-                p_over = 100.0 / over[1]
-                p_under = 100.0 / under[1]
-                sum_p = p_over + p_under
-                margin_tot = sum_p - 100.0
-
-                lines.append("")
-                lines.append(
-                    f"Импл. вероятность: ТБ ≈ {p_over:.1f}%, ТМ ≈ {p_under:.1f}%. "
-                    "Сумма выше 100% из-за маржи бука."
-                )
-                lines.append(f"Оценочная маржа по тоталу ≈ {margin_tot:.1f} п.п.")
-        else:
-            lines.append("")
-            lines.append(
-                "Рынок тотала присутствует, но не удалось однозначно выделить основную линию ТБ/ТМ."
-            )
-
-    # --- 5) Форма команд (через khl_form_client) ---
-    lines.append("")
-    lines.append("📉 Форма команд (оценка по последним матчам):")
-
-    form1 = get_team_form(team1)
-    form2 = get_team_form(team2)
-
-    if form1:
-        lines.append(
-            f"• {form1.team_name}: {form1.wins}-{form1.losses} за последние {form1.games} матчей, "
-            f"забивают в среднем {form1.goals_for:.1f}, пропускают {form1.goals_against:.1f}, "
-            f"средний тотал ≈ {form1.avg_total:.1f}."
-        )
-    else:
-        lines.append(f"• {team1}: форму не удалось оценить (недостаточно данных).")
-
-    if form2:
-        lines.append(
-            f"• {form2.team_name}: {form2.wins}-{form2.losses} за последние {form2.games} матчей, "
-            f"забивают в среднем {form2.goals_for:.1f}, пропускают {form2.goals_against:.1f}, "
-            f"средний тотал ≈ {form2.avg_total:.1f}."
-        )
-    else:
-        lines.append(f"• {team2}: форму не удалось оценить (недостаточно данных).")
-
-    lines.append("")
     lines.append(
-        "Форма считается по последним матчам (когда данные доступны в календаре), "
-        "а если календарь недоступен — по приближённой модели по команде. "
-        "Позже сюда можно будет подставить полноценный статистический фид без изменения логики бота."
+        "Подробный разбор линии и формы команд временно отключён из-за технических правок. "
+        "Сервис запущен в безопасном режиме, чтобы бот продолжал работать."
     )
 
     return "\n".join(lines)
