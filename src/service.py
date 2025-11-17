@@ -73,18 +73,12 @@ async def agent_query(
 def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     """
     Выделяем сумму и коэффициент из произвольной строки.
-    Логика:
-    - первое число -> кандидат в сумму
-    - кэф ищем по:
-        * 'коэф/кф/кэф/коэфф/коэффициент 2.1'
-        * 'за 1.85' / 'по 1,75'
-        * если не нашли — второе число как кэф
     """
     num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
     numbers = [m[0] for m in num_matches]
 
-    stake = None
-    odds = None
+    stake: float | None = None
+    odds: float | None = None
 
     if numbers:
         try:
@@ -139,13 +133,11 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     Пытаемся вытащить:
     - outcome: П1/П2/Х/1X/X2/12, тотал, фора и т.п.
     - event: текст о матче/командах (после 'на ...')
-
-    Всё храним как человекочитаемую строку, без жёсткой структуры.
     """
     text = raw_text.lower()
 
     outcome_parts: list[str] = []
-    event = None
+    event: str | None = None
 
     # ----- 1X2: П1 / П2 / Х / 1X / X2 / 12 -----
     if re.search(r"\bп1\b", text):
@@ -165,7 +157,7 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     if re.search(r"\bх2\b", text):
         outcome_parts.append("X2")
 
-    # ----- Тоталы: 'тотал больше 5.5', 'ТБ 4.5', 'ТМ 5' -----
+    # ----- Тоталы -----
     m_total = re.search(
         r"тотал\s+(больше|меньше)\s*(\d+([\.,]\d+)?)",
         text,
@@ -187,8 +179,7 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
         prefix = "ТБ" if letter == "б" else "ТМ"
         outcome_parts.append(f"{prefix} {line.replace('.', ',')}")
 
-    # ----- Форы: 'фора 1 (-1.5)', 'фора -1.5', 'Ф1(-1.5)' -----
-    # фора с командой: Ф1(-1.5), Ф2(+1.5)
+    # ----- Форы -----
     m_fora_short = re.search(
         r"\bф(1|2)\s*\(?\s*([+-]?\d+([\.,]\d+)?)\s*\)?",
         text,
@@ -198,7 +189,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
         val = m_fora_short.group(2)
         outcome_parts.append(f"Ф{side}({val.replace('.', ',')})")
 
-    # 'фора -1.5' или 'фора 1 -1.5'
     m_fora_long = re.search(
         r"фора\s*(1|2)?\s*([+-]?\d+([\.,]\d+)?)",
         text,
@@ -211,16 +201,13 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
         else:
             outcome_parts.append(f"Ф({val.replace('.', ',')})")
 
-    # outcome как одна строка
     outcome = " ; ".join(dict.fromkeys(outcome_parts)) if outcome_parts else None
 
     # ----- EVENT: текст после "на ..." -----
     lower = text
-
     idx = lower.find(" на ")
     if idx != -1:
         after = raw_text[idx + 4 :]  # всё после " на "
-        # режем по первым ключевым словам для рынков/кэфов
         cut_keywords = [
             " тотал",
             " фора",
@@ -244,25 +231,35 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     return outcome, event
 
 
-# ------------------ ОТЧЁТ ЗА НЕДЕЛЮ ------------------
+# ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПО СТАВКАМ ------------------
 
 
-def build_weekly_report(session: Session, user_id: int) -> str:
+def _get_last_7d_bets(session: Session, user_id: int):
     """
-    Строим отчёт за последние 7 дней по ставкам пользователя.
-    Используем модель Bet из bets_db и поле created_at.
+    Достаём все ставки пользователя за последние 7 дней.
+    Возвращаем: (ставки, начало периода, конец периода).
     """
     from .bets_db import Bet  # локальный импорт, чтобы не плодить циклы
 
     now = datetime.utcnow()
     period_start = now - timedelta(days=7)
-
     bets = session.exec(
         select(Bet).where(
             Bet.user_id == user_id,
             Bet.created_at >= period_start,
         )
     ).all()
+    return bets, period_start, now
+
+
+# ------------------ ОТЧЁТ ЗА НЕДЕЛЮ ------------------
+
+
+def build_weekly_report(session: Session, user_id: int) -> str:
+    """
+    Строим отчёт за последние 7 дней по ставкам пользователя.
+    """
+    bets, period_start, now = _get_last_7d_bets(session, user_id)
 
     if not bets:
         return (
@@ -348,6 +345,125 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
+# ------------------ ЛУЧШАЯ СТАВКА НЕДЕЛИ ------------------
+
+
+def build_best_bet_insight(session: Session, user_id: int) -> str:
+    """
+    Коучинговый инсайт: лучшая ставка за 7 дней.
+    """
+    bets, period_start, now = _get_last_7d_bets(session, user_id)
+    bets_with_profit = [b for b in bets if b.profit is not None]
+
+    if not bets:
+        return (
+            "За последние 7 дней у тебя ещё не было ставок. "
+            "Как только появятся победные, я покажу лучшую ставку недели."
+        )
+
+    if not bets_with_profit:
+        return (
+            "За последние 7 дней ставки либо ещё не рассчитаны, либо пока все без результата.\n"
+            "Когда появятся рассчитанные ставки, я смогу выделить лучшую."
+        )
+
+    best_bet = max(bets_with_profit, key=lambda b: b.profit or 0)
+    period_str = f"{period_start:%d.%m}–{now:%d.%m}"
+
+    sign_best = "+" if (best_bet.profit or 0) >= 0 else ""
+    pnl_best = f"{sign_best}{(best_bet.profit or 0):.0f}"
+
+    lines: list[str] = []
+    lines.append(f"🏆 Лучшая ставка недели ({period_str}):")
+    if best_bet.created_at:
+        lines.append(f"Дата: {best_bet.created_at:%d.%m %H:%M}")
+    if best_bet.raw_text:
+        lines.append(f"Ставка: {best_bet.raw_text}")
+    else:
+        parts = []
+        if best_bet.event:
+            parts.append(best_bet.event)
+        if best_bet.outcome:
+            parts.append(best_bet.outcome)
+        if best_bet.stake is not None:
+            parts.append(f"сумма: {best_bet.stake:g}")
+        if best_bet.odds is not None:
+            parts.append(f"кэф: {best_bet.odds:.2f}")
+        if parts:
+            lines.append("Ставка: " + " | ".join(parts))
+
+    lines.append(f"Результат по прибыли: {pnl_best}")
+
+    lines.append("")
+    lines.append(
+        "Идея: посмотри, что именно ты увидел в этом матче/рынке. "
+        "Такие решения стоит искать и повторять в будущем."
+    )
+
+    return "\n".join(lines)
+
+
+# ------------------ ОШИБКА НЕДЕЛИ ------------------
+
+
+def build_worst_bet_insight(session: Session, user_id: int) -> str:
+    """
+    Инсайт: самая слабая ставка за 7 дней (ошибка недели).
+    """
+    bets, period_start, now = _get_last_7d_bets(session, user_id)
+    bets_with_profit = [b for b in bets if b.profit is not None]
+
+    if not bets:
+        return (
+            "За последние 7 дней у тебя ещё не было ставок. "
+            "Когда появятся сделки, я смогу подсветить ошибку недели."
+        )
+
+    if not bets_with_profit:
+        return (
+            "За последние 7 дней ставки либо ещё не рассчитаны, либо пока без результата.\n"
+            "Когда появятся рассчитанные ставки, я смогу выделить самую слабую."
+        )
+
+    worst_bet = min(bets_with_profit, key=lambda b: b.profit or 0)
+    period_str = f"{period_start:%d.%m}–{now:%d.%m}"
+
+    sign_worst = "+" if (worst_bet.profit or 0) >= 0 else ""
+    pnl_worst = f"{sign_worst}{(worst_bet.profit or 0):.0f}"
+
+    lines: list[str] = []
+    lines.append(f"⚠️ Ошибка недели ({period_str}):")
+    if worst_bet.created_at:
+        lines.append(f"Дата: {worst_bet.created_at:%d.%m %H:%M}")
+    if worst_bet.raw_text:
+        lines.append(f"Ставка: {worst_bet.raw_text}")
+    else:
+        parts = []
+        if worst_bet.event:
+            parts.append(worst_bet.event)
+        if worst_bet.outcome:
+            parts.append(worst_bet.outcome)
+        if worst_bet.stake is not None:
+            parts.append(f"сумма: {worst_bet.stake:g}")
+        if worst_bet.odds is not None:
+            parts.append(f"кэф: {worst_bet.odds:.2f}")
+        if parts:
+            lines.append("Ставка: " + " | ".join(parts))
+
+    lines.append(f"Результат по прибыли: {pnl_worst}")
+
+    lines.append("")
+    lines.append(
+        "Важно не просто зафиксировать минус, а понять причину:\n"
+        "• переоценил команду?\n"
+        "• зашёл в неудобный рынок?\n"
+        "• заиграл слишком большой размер ставки?\n"
+        "Такие моменты — лучший материал для роста."
+    )
+
+    return "\n".join(lines)
+
+
 # ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
 
 
@@ -408,12 +524,12 @@ def build_khl_match_analysis(event) -> str:
     margin = sum_implied - 100.0 if sum_implied > 0 else 0.0
 
     # 'честные' проценты без маржи
-    fair = []
+    fair: list[tuple[str, float]] = []
     if sum_implied > 0:
         for name, p in implied:
             fair.append((name, p * 100.0 / sum_implied))
 
-    # определим фаворита по минимальному коэффициенту
+    # фаворит по минимальному коэффициенту
     fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
     fav_fair_pct = None
     for name, p in fair:
@@ -465,7 +581,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     original_text = message or ""
     text = original_text.lower().strip()
 
-    # ----------------- 0) ГЛАВНОЕ МЕНЮ / СТАРТ -----------------
+    # 0) ГЛАВНОЕ МЕНЮ / СТАРТ
     if text in {"/start", "start", "меню", "главное меню", "help", "/help"}:
         return (
             "Я хоккейный AI-помощник для ставок 🏒\n\n"
@@ -474,16 +590,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • сохранять ставки по тексту\n"
             "  • показывать последние\n"
             "  • считать winrate, ROI, PnL\n\n"
-            "📊 *Аналитика матчей* (уже частично есть)\n"
-            "  • покажу матчи КХЛ на сегодня\n"
-            "  • сделаю odds-разбор матча по id: 'анализ матча 123'\n\n"
+            "📊 *Аналитика матчей* (частично готово)\n"
+            "  • 'КХЛ сегодня' — матчи и линия 1X2\n"
+            "  • 'анализ матча 123' — odds-разбор по id\n\n"
+            "📈 *Отчёты и инсайты по тебе*\n"
+            "  • 'отчёт за неделю' — сводка по последним 7 дням\n"
+            "  • 'лучшая ставка недели'\n"
+            "  • 'ошибка недели'\n\n"
             "🔴 *Live-инсайты* (позже)\n"
-            "  • анализ событий по ходу игры\n\n"
-            "📈 *Отчёты недели* (уже частично работают)\n"
-            "  • могу собрать отчёт за последние 7 дней по твоим ставкам\n\n"
-            "⭐ *Премиум* (позже)\n"
-            "  • value-ставки, углублённая аналитика\n\n"
-            "⚙️ *Настройки* (позже)\n\n"
+            "⭐ *Премиум* (позже)\n\n"
             "Команды, которые уже работают:\n"
             "• 'ставка 1000 на СКА - ЦСКА тотал больше 5.5 за 1.9'\n"
             "• 'мои ставки'\n"
@@ -492,9 +607,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "• 'кхл сегодня'\n"
             "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
             "• 'отчёт за неделю'\n"
+            "• 'лучшая ставка недели'\n"
+            "• 'ошибка недели'\n"
         )
 
-    # ----------------- 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ -----------------
+    # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ
     m_res = re.search(
         r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|возврат|refund|push|win|lose|loss)",
         text,
@@ -524,7 +641,22 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         msg += "\n\nПосмотреть обновлённую статистику: 'Покажи мою статистику'."
         return msg
 
-    # ----------------- 2) СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ (ВСЁ ВРЕМЯ) -----------------
+    # 2) ЛУЧШАЯ СТАВКА НЕДЕЛИ
+    if (
+        "лучшая ставка недели" in text
+        or ("лучш" in text and "ставк" in text and "недел" in text)
+    ):
+        return build_best_bet_insight(session, user_id)
+
+    # 3) ОШИБКА НЕДЕЛИ
+    if (
+        "ошибка недели" in text
+        or ("худш" in text and "ставк" in text and "недел" in text)
+        or ("ошибк" in text and "недел" in text)
+    ):
+        return build_worst_bet_insight(session, user_id)
+
+    # 4) ОБЩАЯ СТАТИСТИКА ПОЛЬЗОВАТЕЛЯ
     if (
         "статист" in text
         or "статку" in text
@@ -561,11 +693,16 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
 
         text_lines.append("")
-        text_lines.append("Отчёт за последние 7 дней: напиши 'отчёт за неделю'.")
+        text_lines.append(
+            "Отчёты и инсайты за последние 7 дней:\n"
+            "• 'отчёт за неделю'\n"
+            "• 'лучшая ставка недели'\n"
+            "• 'ошибка недели'"
+        )
 
         return "\n".join(text_lines)
 
-    # ----------------- 3) ОТЧЁТ ЗА НЕДЕЛЮ -----------------
+    # 5) ОТЧЁТ ЗА НЕДЕЛЮ
     if (
         "отчёт за неделю" in text
         or "отчет за неделю" in text
@@ -573,9 +710,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_weekly_report(session, user_id)
 
-    # ----------------- 4) АНАЛИЗ МАТЧА КХЛ ПО ID -----------------
-    # Примеры:
-    # "анализ матча 123", "разбор матча 123", "анализ 123"
+    # 6) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
@@ -604,7 +739,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return build_khl_match_analysis(ev)
 
-    # ----------------- 5) МАТЧИ КХЛ НА СЕГОДНЯ -----------------
+    # 7) МАТЧИ КХЛ НА СЕГОДНЯ
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             events = await get_today_khl_events()
@@ -647,7 +782,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-    # ----------------- 6) МОИ СТАВКИ -----------------
+    # 8) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
         from .bets_db import Bet  # чтобы взять result/profit при необходимости
 
@@ -683,7 +818,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # ----------------- 7) ДОБАВЛЕНИЕ СТАВКИ -----------------
+    # 9) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -719,7 +854,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(resp_lines)
 
-    # ----------------- 8) ЗАГЛУШКИ ПОД БУДУЩИЕ РАЗДЕЛЫ -----------------
+    # 10) ЗАГЛУШКИ ПОД БУДУЩИЕ РАЗДЕЛЫ
     if "аналити" in text and "матч" in text:
         return (
             "Раздел аналитики матчей расширяется.\n"
@@ -740,13 +875,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "План: value-ставки, расширенная аналитика, персональные рекомендации."
         )
 
-    # ----------------- 9) HELP ПО УМОЛЧАНИЮ -----------------
+    # 11) HELP ПО УМОЛЧАНИЮ
     return (
         "Я AI-агент для ставок по хоккею.\n"
         "Сейчас умею:\n"
         "• Парсить сумму, кэф, исход (П1/П2/Х, тоталы, форы) и событие из текста ставки\n"
         "• По словам 'статистика / статку / моя статистика' показывать твою статистику\n"
         "• По запросу 'отчёт за неделю' собирать weekly-отчёт по ставкам\n"
+        "• По запросу 'лучшая ставка недели' и 'ошибка недели' показывать ключевые сделки за 7 дней\n"
         "• По запросу 'КХЛ сегодня' показывать матчи КХЛ и линию 1X2\n"
         "• По запросу 'анализ матча <id>' разбирать линию 1X2 по конкретному матчу\n"
         "• По сообщению вида 'ставка ...' сохранять ставку в базу\n"
@@ -756,6 +892,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'ставка 1000 на СКА - ЦСКА тотал больше 5.5 за 1.9'\n"
         "• 'мои ставки'\n"
         "• 'отчёт за неделю'\n"
+        "• 'лучшая ставка недели'\n"
+        "• 'ошибка недели'\n"
         "• 'КХЛ сегодня'\n"
         "• 'анализ матча 123' (id из списка 'КХЛ сегодня')\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
