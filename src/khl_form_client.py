@@ -71,19 +71,18 @@ def _is_same_team(target: str, candidate: str) -> bool:
 CHAMPIONAT_KHL_CAL_URL = (
     "https://www.championat.com/hockey/_superleague/tournament/6608/calendar/"
 )
-# 6608 — id текущего сезона КХЛ 2025/26 на Championat.
-# Если лига поменяет id сезона, это место придётся обновить руками.
+# 6608 — id сезона КХЛ на Championat.
+# Если лига сменит id сезона, это место придётся обновить руками.
 
 
-async def _fetch_calendar_html() -> str | None:
+def _fetch_calendar_html() -> str | None:
     """
-    Тянем HTML календаря КХЛ с Championat.
+    Тянем HTML календаря КХЛ с Championat (СИНХРОННО).
 
     Если не получилось (таймаут / 5xx / блокировка) — вернём None,
     а наверху аккуратно отработаем заглушку.
     """
     headers = {
-        # Чуть более "человеческий" User-Agent, чтобы не пугать сайт.
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -92,8 +91,8 @@ async def _fetch_calendar_html() -> str | None:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-            resp = await client.get(CHAMPIONAT_KHL_CAL_URL)
+        with httpx.Client(timeout=10.0, headers=headers) as client:
+            resp = client.get(CHAMPIONAT_KHL_CAL_URL)
             if resp.status_code != 200:
                 logger.warning(
                     "Championat calendar returned status %s", resp.status_code
@@ -156,7 +155,7 @@ def _parse_matches_for_team(
         elif is_team2 and not is_team1:
             gf, ga = g2, g1
         else:
-            # Если вдруг совпало с обеими (какой-то странный случай) — пропускаем.
+            # Если вдруг совпало с обеими (какой-то странный кейс) — пропускаем.
             continue
 
         target_matches.append((dt, gf, ga))
@@ -170,21 +169,21 @@ def _parse_matches_for_team(
     return target_matches
 
 
-async def get_team_form(team_name: str, max_games: int = 10) -> Optional[TeamForm]:
+def get_team_form(team_name: str, max_games: int = 10) -> Optional[TeamForm]:
     """
-    Основная точка входа:
+    Основная точка входа (СИНХРОННАЯ):
 
     - тянем календарь КХЛ с Championat;
     - вытаскиваем матчи нужной команды;
     - считаем форму по последним N играм (по умолчанию 10).
 
     Если не получилось спарсить или матчей ещё нет — вернём None,
-    а наверху (в run_agent) уже есть обработка этого кейса.
+    а наверху (в build_khl_match_analysis) уже есть обработка этого кейса.
     """
     if not team_name:
         return None
 
-    html = await _fetch_calendar_html()
+    html = _fetch_calendar_html()
     if not html:
         logger.warning("No HTML for KHL calendar; returning None form for %s", team_name)
         return None
