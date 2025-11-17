@@ -1616,24 +1616,33 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-    # 12) МОИ СТАВКИ
+       # 12) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
         bets = get_last_bets(session, user_id, limit=5)
         if not bets:
             return "У тебя пока нет сохранённых ставок."
 
-        lines = []
-               for b in bets:
-            line_parts = [f"{b.created_at:%d.%m %H:%M} — {b.raw_text}"]
-                   
+        lines: list[str] = []
+        for b in bets:
+            line_parts: list[str] = []
+
+            # Дата/время, если есть
+            if b.created_at:
+                line_parts.append(f"{b.created_at:%d.%m %H:%M}")
+
+            # Исходный текст
+            if b.raw_text:
+                line_parts.append(b.raw_text)
+
             if b.event:
                 line_parts.append(f"событие: {b.event}")
             if b.outcome:
                 line_parts.append(f"исход: {b.outcome}")
-            if b.stake:
+            if b.stake is not None:
                 line_parts.append(f"сумма: {b.stake:g}")
-            if b.odds:
+            if b.odds is not None:
                 line_parts.append(f"кэф: {b.odds:.2f}")
+
             if b.result:
                 if b.result == "win":
                     human_res = "выигрыш"
@@ -1644,9 +1653,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 else:
                     human_res = b.result
                 line_parts.append(f"результат: {human_res}")
+
             if b.profit is not None:
                 sign = "+" if b.profit >= 0 else ""
                 line_parts.append(f"PnL: {sign}{b.profit:.0f}")
+
             lines.append(" | ".join(line_parts))
 
         return "Твои последние ставки:\n" + "\n".join(lines)
