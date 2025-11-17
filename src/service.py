@@ -997,14 +997,14 @@ def build_user_profile(session: Session, user_id: int) -> str:
 # ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
 
 
-def build_khl_match_analysis(event) -> str:
+async def build_khl_match_analysis(event) -> str:
     """
     Разбор матча КХЛ по объекту event из khl_client.
 
     Что делаем:
     - разбираем линию 1X2 (фаворит / андердог, имплайд-вероятности, маржа)
     - по возможности показываем рынок тотала (основная линия)
-    - даём аккуратные текстовые выводы, без прямых советов по ставке
+    - добавляем блок "Форма команд" (сейчас через заглушку, позже можно подменить на реальные данные)
     """
     team1 = getattr(event, "team1", "?")
     team2 = getattr(event, "team2", "?")
@@ -1117,7 +1117,6 @@ def build_khl_match_analysis(event) -> str:
     # --- 4) Разбор тотала, если есть ---
     if market_total:
         outcomes = getattr(market_total, "outcomes", []) or []
-        # Пытаемся найти основную линию тотала вида "ТБ 4.5", "Over 4.5", "Under 4.5"
         over = None
         under = None
 
@@ -1132,7 +1131,6 @@ def build_khl_match_analysis(event) -> str:
             if price_f < 1.01:
                 continue
 
-            # простое определение ТБ/ТМ
             if any(k in name_up for k in ("OVER", "ТБ")):
                 over = (name_raw, price_f)
             elif any(k in name_up for k in ("UNDER", "ТМ")):
@@ -1147,7 +1145,6 @@ def build_khl_match_analysis(event) -> str:
             if under:
                 lines.append(f"• {under[0]}: кэф {under[1]:.2f}")
 
-            # Имплайд-вероятности по тоталу, если есть оба плеча
             if over and under:
                 p_over = 100.0 / over[1]
                 p_under = 100.0 / under[1]
@@ -1166,11 +1163,37 @@ def build_khl_match_analysis(event) -> str:
                 "Рынок тотала присутствует, но не удалось однозначно выделить основную линию ТБ/ТМ."
             )
 
-    # --- 5) Финальная ремарка ---
+    # --- 5) Форма команд (через khl_form_client) ---
+    # Сейчас это заглушка, но интерфейс тот же, что и будет с реальными данными.
+    lines.append("")
+    lines.append("📉 Форма команд (оценка по последним матчам):")
+
+    form1 = await get_team_form(team1)
+    form2 = await get_team_form(team2)
+
+    if form1:
+        lines.append(
+            f"• {form1.team_name}: {form1.wins}-{form1.losses} за последние {form1.games} матчей, "
+            f"забивают в среднем {form1.goals_for:.1f}, пропускают {form1.goals_against:.1f}, "
+            f"средний тотал ≈ {form1.avg_total:.1f}."
+        )
+    else:
+        lines.append(f"• {team1}: форму не удалось оценить (недостаточно данных).")
+
+    if form2:
+        lines.append(
+            f"• {form2.team_name}: {form2.wins}-{form2.losses} за последние {form2.games} матчей, "
+            f"забивают в среднем {form2.goals_for:.1f}, пропускают {form2.goals_against:.1f}, "
+            f"средний тотал ≈ {form2.avg_total:.1f}."
+        )
+    else:
+        lines.append(f"• {team2}: форму не удалось оценить (недостаточно данных).")
+
     lines.append("")
     lines.append(
-        "Сейчас разбор опирается только на коэффициенты. "
-        "Дальше сюда можно будет добавить форму, xG, спецбригады и работу вратарей."
+        "Сейчас форма считается по упрощённой модели. "
+        "Позже сюда можно будет подставить реальные данные KHL или платный статистический фид, "
+        "ничего не меняя в логике бота."
     )
 
     return "\n".join(lines)
