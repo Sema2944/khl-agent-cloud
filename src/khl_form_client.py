@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import hashlib
-import random
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List
@@ -39,7 +37,7 @@ def _norm_team_name(name: str) -> str:
     Нормализуем имя команды:
     - в верхний регистр
     - убираем лишние пробелы
-    - приводим Ё → Е
+    - приводим Ё → Е.
     """
     if not name:
         return ""
@@ -50,9 +48,9 @@ def _norm_team_name(name: str) -> str:
 
 def _is_same_team(target: str, candidate: str) -> bool:
     """
-    Грубое сравнение названий команд:
+    Сравниваем названия команд:
     - нормализуем
-    - проверяем совпадение или включение (на случай 'ДИНАМО М' vs 'ДИНАМО МОСКВА')
+    - допускаем включение (ДИНАМО М vs ДИНАМО МОСКВА).
     """
     t = _norm_team_name(target)
     c = _norm_team_name(candidate)
@@ -62,27 +60,25 @@ def _is_same_team(target: str, candidate: str) -> bool:
     if t == c:
         return True
 
-    # На всякий случай — короткое/длинное имя
     return t in c or c in t
 
 
 # ----------------------------------------------------------------------
-# Парсинг календаря КХЛ на Championat
+# Основная логика: парсим календарь КХЛ на Championat
 # ----------------------------------------------------------------------
 
 CHAMPIONAT_KHL_CAL_URL = (
     "https://www.championat.com/hockey/_superleague/tournament/6608/calendar/"
 )
 # 6608 — id сезона КХЛ на Championat.
-# Если лига сменит id сезона, это место придётся обновить руками.
+# Когда начнётся новый сезон, id может поменяться — тогда нужно будет обновить это число.
 
 
 def _fetch_calendar_html() -> str | None:
     """
     Тянем HTML календаря КХЛ с Championat (СИНХРОННО).
 
-    Если не получилось (таймаут / 5xx / блокировка) — вернём None,
-    а выше будет fallback.
+    Если не получилось (таймаут / 5xx / блокировка) — вернём None.
     """
     headers = {
         "User-Agent": (
@@ -114,14 +110,17 @@ def _parse_matches_for_team(
     """
     Из общей HTML-страницы календаря вытаскиваем матчи нужной команды.
 
-    Возвращаем список кортежей:
-    (дата, забитые, пропущенные) — только по завершённым матчам.
+    Возвращаем список:
+        (дата, забитые, пропущенные)
+    — только по завершённым матчам.
     """
-    # Убираем теги, оставляем голый текст — так проще регуляркой.
+    # Убираем теги → оставляем текст, чтобы проще было регуляркой работать.
     text = re.sub(r"<[^>]+>", " ", html)
     text = text.replace("&nbsp;", " ")
     text = re.sub(r"\s+", " ", text)
 
+    # Регулярка по структуре:
+    #   дата, время, команда1, команда2, счёт 4 : 3
     pattern = re.compile(
         r"(?P<date>\d{2}\.\d{2}\.\d{4})\s+\d{2}:\d{2}\s+"
         r"(?P<team1>[A-Za-zА-Яа-яЁё\"«»\-\s]+?)\s+–\s+"
@@ -155,7 +154,7 @@ def _parse_matches_for_team(
         elif is_team2 and not is_team1:
             gf, ga = g2, g1
         else:
-            # Если вдруг совпало с обеими (странный кейс) — пропускаем.
+            # Если по какой-то причине совпало с обеими строками — пропускаем.
             continue
 
         target_matches.append((dt, gf, ga))
@@ -169,75 +168,32 @@ def _parse_matches_for_team(
     return target_matches
 
 
-# ----------------------------------------------------------------------
-# Fallback-модель формы (детерминированная, "похожа на правду")
-# ----------------------------------------------------------------------
-
-
-def _fallback_pseudo_form(team_name: str, games: int = 10) -> TeamForm:
-    """
-    Заглушка на случай, если не получилось получить реальные матчи.
-
-    Делаем детерминированную "правдоподобную" форму:
-    - один и тот же team_name → всегда одни и те же цифры.
-    """
-    name_norm = (team_name or "").strip().lower()
-    if not name_norm:
-        name_norm = "unknown"
-
-    seed = int(hashlib.md5(name_norm.encode("utf-8")).hexdigest(), 16) % (2**32)
-    rnd = random.Random(seed)
-
-    wins = rnd.randint(3, 7)
-    losses = max(games - wins, 0)
-
-    goals_for = round(rnd.uniform(2.4, 3.8), 1)
-    goals_against = round(rnd.uniform(2.0, 3.5), 1)
-    avg_total = round(goals_for + goals_against, 1)
-
-    return TeamForm(
-        team_name=team_name,
-        games=games,
-        wins=wins,
-        losses=losses,
-        goals_for=goals_for,
-        goals_against=goals_against,
-        avg_total=avg_total,
-    )
-
-
-# ----------------------------------------------------------------------
-# Публичная функция: форма команды
-# ----------------------------------------------------------------------
-
-
 def get_team_form(team_name: str, max_games: int = 10) -> Optional[TeamForm]:
     """
     Основная точка входа (СИНХРОННАЯ):
 
-    1) Пытаемся получить реальные матчи команды из календаря Championat.
-    2) Если получилось — считаем форму по реальным данным.
-    3) Если нет HTML или нет матчей — возвращаем детерминированный fallback.
+    1) Тянем календарь КХЛ с Championat.
+    2) Вытаскиваем матчи нужной команды.
+    3) Считаем форму по последним N играм.
 
-    Таким образом, наверху мы почти всегда показываем игроку осмысленную форму.
+    Если:
+    - нет HTML (сайт недоступен),
+    - или не найдено ни одного матча,
+    вернём None — наверху это уже обрабатывается
+    как "форму не удалось оценить".
     """
     if not team_name:
         return None
 
     html = _fetch_calendar_html()
     if not html:
-        logger.warning(
-            "No HTML for KHL calendar; using fallback form for %s", team_name
-        )
-        return _fallback_pseudo_form(team_name, games=max_games)
+        logger.warning("No HTML for KHL calendar; cannot build form for %s", team_name)
+        return None
 
     matches = _parse_matches_for_team(html, team_name, max_games=max_games)
-
     if not matches:
-        logger.info(
-            "No matches found in calendar for team '%s'; using fallback form", team_name
-        )
-        return _fallback_pseudo_form(team_name, games=max_games)
+        logger.info("No matches found in calendar for team '%s'", team_name)
+        return None
 
     games = len(matches)
     total_gf = sum(gf for _, gf, _ in matches)
