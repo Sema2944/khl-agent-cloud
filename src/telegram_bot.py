@@ -1,18 +1,23 @@
-# src/telegram_bot.py
-
 import os
 import logging
 import asyncio
 
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 import httpx
+
 
 
 API_BASE = os.getenv("API_BASE", "https://khl-agent-api.onrender.com")
