@@ -79,20 +79,43 @@ async def agent_query(
 def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     """
     Выделяем сумму и коэффициент из произвольной строки.
+
+    Важно: если есть конструкция 'матч 123456 2000', то:
+    - 123456 считаем id матча
+    - 2000 считаем суммой (а не кэфом)
     """
+    text_lower = raw_text.lower()
+
+    # Все числа в строке
     num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
     numbers = [m[0] for m in num_matches]
+
+    # Если есть 'матч 123456' — это id, и его исключаем из кандидатов для суммы/кэфа
+    match_id = None
+    m_match = re.search(r"матч\s+(\d+)", text_lower)
+    if m_match:
+        match_id = m_match.group(1)
+
+    numbers_for_parsing: list[str] = []
+    for n in numbers:
+        # отбрасываем id матча
+        if match_id is not None and n.replace(",", ".") == match_id:
+            continue
+        numbers_for_parsing.append(n)
 
     stake: float | None = None
     odds: float | None = None
 
-    if numbers:
+    # 1) Пытаемся взять первое "очищенное" число как сумму
+    if numbers_for_parsing:
         try:
-            stake = float(numbers[0].replace(",", "."))
+            stake = float(numbers_for_parsing[0].replace(",", "."))
         except ValueError:
             stake = None
 
-    # 1) рядом с словами "коэф/кф/кэф/коэфф/коэффициент"
+    # 2) Паттерны для кэфа
+
+    # 2.1) рядом со словами "коэф/кф/кэф/коэфф/коэффициент"
     coef_pattern = re.compile(
         r"(коэф(фициент)?|коeff|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
         re.IGNORECASE,
@@ -106,7 +129,7 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
         except ValueError:
             odds = None
 
-    # 2) конструкции "за 1.85" / "по 1,75"
+    # 2.2) конструкции "за 1.85" / "по 1,75"
     if odds is None:
         za_pattern = re.compile(
             r"\b(за|по)\s*(\d+([\.,]\d+)?)",
@@ -117,15 +140,16 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
             try:
                 candidate_odds = float(m_za.group(2).replace(",", "."))
                 if 1.01 <= candidate_odds <= 20:
+                    # защита от случая, когда сумма и кэф совпадают
                     if not (stake is not None and stake >= 50 and candidate_odds == stake):
                         odds = candidate_odds
             except ValueError:
                 pass
 
-    # 3) если всё ещё нет кэфа — берём второе число как кэф
-    if odds is None and len(numbers) >= 2:
+    # 2.3) если всё ещё нет кэфа — берём второе число как кэф (из очищенного списка)
+    if odds is None and len(numbers_for_parsing) >= 2:
         try:
-            candidate_odds = float(numbers[1].replace(",", "."))
+            candidate_odds = float(numbers_for_parsing[1].replace(",", "."))
             if candidate_odds >= 1.01:
                 odds = candidate_odds
         except ValueError:
@@ -134,7 +158,7 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     return stake, odds
 
 
-def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
+def def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     """
     Пытаемся вытащить:
     - outcome: П1/П2/Х/1X/X2/12, тотал, фора и т.п.
@@ -231,13 +255,22 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
             if pos != -1:
                 end_pos = min(end_pos, pos)
         event_candidate = after[:end_pos].strip(" -–—,:;")
+
         if event_candidate:
-            event = event_candidate
+            # Спец-кейс: 'матч 123456 2000' → 'матч 123456'
+            ec_lower = event_candidate.lower()
+            m_match_tail = re.match(r"(матч\s+\d+)\s+\d+(\s+.*)?$", ec_lower)
+            if m_match_tail:
+                # длина первой части 'матч 123456'
+                keep_len = len(m_match_tail.group(1))
+                event = event_candidate[:keep_len]
+            else:
+                event = event_candidate
 
     return outcome, event
 
 
-def _extract_first_number(text: str) -> float | None:
+def def _extract_first_number(text: str) -> float | None:
     """
     Достаём первое число из строки (для банка, пополнения и т.п.).
     """
