@@ -411,27 +411,29 @@ def _get_last_7d_bets(session: Session, user_id: int):
 # ------------------ ОТЧЁТ ЗА НЕДЕЛЮ ------------------
 
 
+# ------------------ ОТЧЁТ ЗА МЕСЯЦ ------------------
+
+
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
     Отчёт за последние 30 дней по ставкам пользователя.
-    Логика похожа на build_weekly_report, но период длиннее.
+    Берём все ставки пользователя и фильтруем по дате created_at.
     """
-    from .bets_db import Bet  # локальный импорт, как в _get_last_7d_bets
+    bets_all = get_all_bets(session, user_id)
 
     now = datetime.utcnow()
     period_start = now - timedelta(days=30)
 
-    bets = session.exec(
-        select(Bet).where(
-            Bet.user_id == user_id,
-            Bet.created_at >= period_start,
-        )
-    ).all()
+    # фильтруем только те, у кого есть created_at и он в пределах 30 дней
+    bets = [
+        b for b in bets_all
+        if b.created_at is not None and b.created_at >= period_start
+    ]
 
     if not bets:
         return (
             "За последние 30 дней у тебя не было записанных ставок. "
-            "Как только будет история за месяц, я соберу по ней отчёт 😉"
+            "Как только набросаешь историю за месяц, я соберу подробный отчёт."
         )
 
     settled = [b for b in bets if b.result in ("win", "lose")]
@@ -465,7 +467,7 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     period_str = f"{period_start:%d.%m}–{now:%d.%m}"
 
     lines: list[str] = []
-    lines.append(f"📊 Отчёт за последние 30 дней ({period_str}):")
+    lines.append(f"📈 Отчёт за последние 30 дней ({period_str}):")
     lines.append(f"Всего ставок: {total_bets}")
 
     if settled_count > 0:
@@ -489,7 +491,10 @@ def build_monthly_report(session: Session, user_id: int) -> str:
         desc_best = best_bet.raw_text or ""
         sign_best = "+" if (best_bet.profit or 0) >= 0 else ""
         pnl_best = f"{sign_best}{(best_bet.profit or 0):.0f}"
-        lines.append(f"• {desc_best}")
+        if best_bet.created_at:
+            lines.append(f"• Дата: {best_bet.created_at:%d.%m %H:%M}")
+        if desc_best:
+            lines.append(f"• {desc_best}")
         lines.append(f"• Результат: {pnl_best}")
 
         lines.append("")
@@ -497,18 +502,20 @@ def build_monthly_report(session: Session, user_id: int) -> str:
         desc_worst = worst_bet.raw_text or ""
         sign_worst = "+" if (worst_bet.profit or 0) >= 0 else ""
         pnl_worst = f"{sign_worst}{(worst_bet.profit or 0):.0f}"
-        lines.append(f"• {desc_worst}")
+        if worst_bet.created_at:
+            lines.append(f"• Дата: {worst_bet.created_at:%d.%m %H:%M}")
+        if desc_worst:
+            lines.append(f"• {desc_worst}")
         lines.append(f"• Результат: {pnl_worst}")
 
     lines.append("")
     lines.append(
-        "Смысл месячного отчёта — увидеть картину шире, чем по одной неделе.\n"
-        "Смотри, какой стиль игры приводит тебя к плюсу/минусу на дистанции в 30 дней."
+        "Месячный горизонт лучше показывает, где ты реально зарабатываешь, а где льёшь. "
+        "Смотри на типы рынков, лиги и размеры ставок, которые тянут результат вниз."
     )
 
     return "\n".join(lines)
 
-# ------------------ ОТЧЁТ ЗА МЕСЯЦ ------------------
 
 
 def build_monthly_report(session: Session, user_id: int) -> str:
