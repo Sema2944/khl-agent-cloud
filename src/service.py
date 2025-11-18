@@ -802,6 +802,120 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
     )
 
     return "\n".join(lines)
+def build_value_analysis(raw_text: str) -> str:
+    """
+    Value-разбор кэфа:
+    - парсим кэф (через существующий _parse_stake_and_odds)
+    - парсим твою оценку вероятности (например '60%' или 'вероятность 60')
+    - считаем:
+        * имплайд-вероятность
+        * 'справедливый' кэф по твоей оценке
+        * edge (разница в п.п.)
+        * ожидаемое матожидание (EV)
+    """
+    # 1) достаём кэф – используем уже готовый парсер
+    _, odds = _parse_stake_and_odds(raw_text)
+
+    # 2) достаём пользовательскую вероятность
+    text = raw_text.lower()
+
+    user_prob: float | None = None
+
+    # вариант: '60%' / '60 %'
+    m_pct = re.search(r"(\d+([\.,]\d+)?)\s*%", text)
+    if m_pct:
+        try:
+            user_prob = float(m_pct.group(1).replace(",", "."))
+        except ValueError:
+            user_prob = None
+
+    # вариант: 'вероятн 60', 'оценка 55', 'шанс 62'
+    if user_prob is None:
+        m_prob = re.search(
+            r"(вероятн|оценк|шанс)[^\d]{0,10}(\d+([\.,]\d+)?)",
+            text,
+        )
+        if m_prob:
+            try:
+                user_prob = float(m_prob.group(2).replace(",", "."))
+            except ValueError:
+                user_prob = None
+
+    # ограничим адекватный диапазон
+    if user_prob is not None:
+        if not (0 < user_prob < 100):
+            user_prob = None
+
+    lines: list[str] = []
+    lines.append("🎯 Value-разбор ставки:")
+
+    if odds is None:
+        lines.append("")
+        lines.append(
+            "Я не смог вытащить коэффициент из текста.\n"
+            "Напиши что-то вроде: 'value ставка по 1.85 при вероятности 60%'."
+        )
+        return "\n".join(lines)
+
+    # имплайд-вероятность по кэфу
+    implied_prob = 100.0 / odds
+
+    lines.append("")
+    lines.append(f"Коэффициент: {odds:.2f}")
+    lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
+
+    if user_prob is None:
+        lines.append("")
+        lines.append(
+            "Ты не указал свою оценку вероятности.\n"
+            "Чтобы я посчитал value, добавь, например: 'при вероятности 60%' или 'шанс 55%'."
+        )
+        lines.append("")
+        lines.append(
+            "Пример запроса:\n"
+            "• 'value 1.85 при вероятности 60%'\n"
+            "• 'value ставка по 2.10, шанс 48%'"
+        )
+        return "\n".join(lines)
+
+    # 'справедливый' кэф по твоей оценке
+    fair_odds_by_user = 100.0 / user_prob
+
+    # edge в п.п. и EV
+    edge_pp = user_prob - implied_prob  # +edge = value
+    ev = odds * (user_prob / 100.0) - 1.0  # матожидание на 1 ед. ставки
+
+    lines.append("")
+    lines.append(f"Твоя оценка вероятности: ≈ {user_prob:.1f}%")
+    lines.append(f"'Справедливый' кэф по твоей оценке: ≈ {fair_odds_by_user:.2f}")
+    lines.append(f"Edge (разница): ≈ {edge_pp:.1f} п.п.")
+
+    lines.append("")
+    sign_ev = "+" if ev >= 0 else ""
+    lines.append(f"Ожидаемое матожидание (EV) на 1 единицу ставки: {sign_ev}{ev:.3f}")
+    if ev > 0:
+        lines.append(
+            "Это позитивное матожидание: при такой оценке вероятности ставка выглядит плюс-EV на дистанции."
+        )
+    elif ev < 0:
+        lines.append(
+            "Это отрицательное матожидание: при такой оценке вероятности ставка в минус-EV, "
+            "рынок даёт хуже, чем твой 'справедливый' кэф."
+        )
+    else:
+        lines.append(
+            "Теоретически нулевое матожидание — линия примерно совпадает с твоей оценкой."
+        )
+
+    lines.append("")
+    lines.append(
+        "Важно: я не говорю 'ставь/не ставь'. Value-разбор — это чек-лист:\n"
+        "• рынок → даёт имплайд-вероятность;\n"
+        "• ты → даёшь свою оценку;\n"
+        "• разница показывает, насколько линия лучше/хуже твоей модели."
+    )
+
+    return "\n".join(lines)
 
 
 # ------------------ ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ------------------
@@ -1523,6 +1637,16 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or text.startswith("оценить ставку")
     ):
         return build_stake_evaluation(session, user_id, original_text)
+        
+    # 10.1) VALUE-РАЗБОР КЭФА
+    if (
+        "value" in text
+        or "вэлью" in text
+        or "валю" in text
+        or ("проверка" in text and "кэф" in text)
+        or ("проверка" in text and "коэф" in text)
+    ):
+        return build_value_analysis(original_text)
 
     # 11) МАТЧИ КХЛ НА СЕГОДНЯ
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
