@@ -414,7 +414,7 @@ def _get_last_7d_bets(session: Session, user_id: int):
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
     Отчёт за последние 30 дней по ставкам пользователя.
-    Логика похожа на weekly-отчёт, но период длиннее.
+    Логика похожа на build_weekly_report, но период длиннее.
     """
     from .bets_db import Bet  # локальный импорт, как в _get_last_7d_bets
 
@@ -431,7 +431,7 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     if not bets:
         return (
             "За последние 30 дней у тебя не было записанных ставок. "
-            "Как только появится объём игры, я смогу собрать отчёт за месяц 😉"
+            "Как только будет история за месяц, я соберу по ней отчёт 😉"
         )
 
     settled = [b for b in bets if b.result in ("win", "lose")]
@@ -465,7 +465,7 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     period_str = f"{period_start:%d.%m}–{now:%d.%m}"
 
     lines: list[str] = []
-    lines.append(f"📈 Отчёт за последние 30 дней ({period_str}):")
+    lines.append(f"📊 Отчёт за последние 30 дней ({period_str}):")
     lines.append(f"Всего ставок: {total_bets}")
 
     if settled_count > 0:
@@ -502,11 +502,12 @@ def build_monthly_report(session: Session, user_id: int) -> str:
 
     lines.append("")
     lines.append(
-        "Месячная дистанция сглаживает шум: смотри, какие рынки и типы ставок "
-        "дают тебе результат на длинном отрезке, а какие тянут вниз."
+        "Смысл месячного отчёта — увидеть картину шире, чем по одной неделе.\n"
+        "Смотри, какой стиль игры приводит тебя к плюсу/минусу на дистанции в 30 дней."
     )
 
     return "\n".join(lines)
+
 
 
 
