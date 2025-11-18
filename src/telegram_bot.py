@@ -1,3 +1,5 @@
+# src/telegram_bot.py
+
 import os
 import logging
 import asyncio
@@ -58,94 +60,41 @@ async def call_agent(user_id: int, message: str) -> str:
         return data.get("reply", "Пустой ответ от агента 😕")
 
 
-# ==============================
-# Инлайн-клавиатура под разбором матча
-# ==============================
+def extract_stake_id_from_reply(reply: str) -> int | None:
+    """
+    Парсим id ставки из текста ответа вида:
+    'Ставка сохранена (id: 3).'
+    """
+    m = re.search(r"id:\s*(\d+)\)", reply)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
-async def send_match_analysis(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    analysis_text: str,
-    match_id: str,
-) -> None:
+
+def build_stake_result_keyboard(stake_id: int) -> InlineKeyboardMarkup:
     """
-    Отправляем разбор матча + инлайн-кнопки:
-    - value-разбор
-    - полный разбор
-    - добавить ставку
+    Инлайн-клавиатура для быстрого проставления результата ставки.
     """
-    keyboard = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🔍 Value-проверка", callback_data=f"value_{match_id}"),
-            InlineKeyboardButton("📊 Полный разбор", callback_data=f"deep_{match_id}"),
-        ],
-        [
-            InlineKeyboardButton("➕ Добавить ставку", callback_data=f"addbet_{match_id}"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.message:
-        await update.message.reply_text(analysis_text, reply_markup=reply_markup)
-    elif update.callback_query and update.callback_query.message:
-        # на всякий случай, если когда-нибудь будем вызывать из callback
-        await update.callback_query.message.reply_text(
-            analysis_text, reply_markup=reply_markup
-        )
-
-
-# ==============================
-# Обработка нажатий по инлайн-кнопкам
-# ==============================
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработка callback_data:
-    - value_<id> → запрос в агента на value-разбор матча
-    - deep_<id>  → запрос в агента на глубокий анализ
-    - addbet_<id> → подсказка пользователю написать ставку
-    """
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-
-    data = query.data or ""
-    user = update.effective_user
-    user_id = user.id if user else 0
-
-    # VALUE-разбор матча
-    if data.startswith("value_"):
-        match_id = data.split("_", 1)[1]
-        try:
-            text = await call_agent(user_id, f"value разбор матча {match_id}")
-        except Exception as e:
-            logger.exception("Ошибка при value-разборе матча %s: %s", match_id, e)
-            text = "Не удалось получить value-разбор матча 😔\nПопробуй позже."
-        await query.edit_message_text(text)
-
-    # Глубокий анализ матча
-    elif data.startswith("deep_"):
-        match_id = data.split("_", 1)[1]
-        try:
-            text = await call_agent(user_id, f"глубокий анализ матча {match_id}")
-        except Exception as e:
-            logger.exception("Ошибка при глубоком разборе матча %s: %s", match_id, e)
-            text = "Не удалось получить глубокий разбор матча 😔\nПопробуй позже."
-        await query.edit_message_text(text)
-
-    # Подсказка по добавлению ставки
-    elif data.startswith("addbet_"):
-        match_id = data.split("_", 1)[1]
-        text = (
-            f"💬 Напиши ставку на матч {match_id} в свободной форме.\n\n"
-            "Примеры:\n"
-            f"• ставка 2000 на матч {match_id} победа СКА по 1.85\n"
-            f"• ставка 1500 на матч {match_id} тотал больше 5.5 за 1.90\n\n"
-            "Я распознаю сумму, кэф, исход и событие и сохраню её в историю."
-        )
-        await query.edit_message_text(text)
+            [
+                InlineKeyboardButton(
+                    "✅ Выиграла", callback_data=f"bet_result:{stake_id}:win"
+                ),
+                InlineKeyboardButton(
+                    "❌ Проиграла", callback_data=f"bet_result:{stake_id}:lose"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "↔️ Возврат", callback_data=f"bet_result:{stake_id}:push"
+                ),
+            ],
+        ]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -176,8 +125,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Обрабатываем любое текстовое сообщение:
     → отправляем его на бекенд-агент
     → возвращаем ответ пользователю.
-    Для команд вида 'анализ матча 123' / 'анализ 123' —
-    оборачиваем ответ в инлайн-клавиатуру с дополнительными действиями.
+
+    Если это ответ про 'Ставка сохранена (id: N)',
+    добавляем инлайн-кнопки: Выиграла / Проиграла / Возврат.
     """
     if not update.message:
         return
@@ -185,14 +135,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text = update.message.text or ""
     norm = text.strip().lower()
-
-    # Пытаемся понять, это запрос на анализ конкретного матча или нет
-    match_id: str | None = None
-    m = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", norm)
-    if not m:
-        m = re.search(r"(анализ|разбор)\s+(\d+)", norm)
-    if m:
-        match_id = m.group(2)
 
     try:
         reply = await call_agent(user_id, text)
@@ -202,7 +144,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Не удалось связаться с сервером агента 😔\n"
             "Попробуй ещё раз чуть позже."
         )
-        # даже при ошибке можно показать клавиатуру
         await update.message.reply_text(reply, reply_markup=build_main_keyboard())
         return
 
@@ -211,12 +152,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(reply, reply_markup=build_main_keyboard())
         return
 
-    # Если это анализ матча с id — шлём ответ + инлайн-кнопки
-    if match_id:
-        await send_match_analysis(update, context, reply, match_id)
+    # Пытаемся понять, что это ответ про сохранённую ставку
+    stake_id = None
+    if reply.startswith("Ставка сохранена"):
+        stake_id = extract_stake_id_from_reply(reply)
+
+    # Если нашли id ставки — добавляем инлайн-кнопки для результата
+    if stake_id is not None:
+        keyboard = build_stake_result_keyboard(stake_id)
+        await update.message.reply_text(reply, reply_markup=keyboard)
     else:
-        # Обычный ответ без изменения клавиатуры
+        # Обычный ответ без доп. клавиатуры
         await update.message.reply_text(reply)
+
+
+async def handle_bet_result_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Обработка нажатий по инлайн-кнопкам:
+    bet_result:<stake_id>:<win|lose|push>
+
+    Мы НЕ лезем напрямую в базу, а просто
+    шлём в /agent/query фразу вроде:
+    'ставка 3 выиграла', чтобы сработала
+    уже существующая логика settle_bet.
+    """
+    query = update.callback_query
+    if not query:
+        return
+
+    await query.answer()
+
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.message.reply_text("Не понял действие по ставке.")
+        return
+
+    _, stake_id_str, result_code = parts
+
+    try:
+        stake_id = int(stake_id_str)
+    except ValueError:
+        await query.message.reply_text("Некорректный id ставки.")
+        return
+
+    # Маппим код на русское слово, которое уже понимает run_agent
+    if result_code == "win":
+        res_word = "выиграла"
+    elif result_code == "lose":
+        res_word = "проиграла"
+    elif result_code == "push":
+        res_word = "возврат"
+    else:
+        await query.message.reply_text("Неизвестный результат ставки.")
+        return
+
+    user_id = query.from_user.id
+
+    try:
+        # Прокидываем в /agent/query как обычный текст
+        agent_message = f"ставка {stake_id} {res_word}"
+        reply = await call_agent(user_id, agent_message)
+    except Exception as e:
+        logger.exception("Ошибка при применении результата ставки: %s", e)
+        await query.message.reply_text(
+            "Не удалось обновить результат ставки. Попробуй позже."
+        )
+        return
+
+    # Убираем инлайн-кнопки у исходного сообщения
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        # Если вдруг не получилось отредактировать (старое сообщение и т.п.) — просто игнорим
+        pass
+
+    # Шлём ответ от агента (там уже и банк, и PnL, и подсказки)
+    await query.message.reply_text(reply)
 
 
 def main() -> None:
@@ -242,8 +256,10 @@ def main() -> None:
 
     # Команда /start
     app.add_handler(CommandHandler("start", start))
-    # Callback-кнопки под сообщениями
-    app.add_handler(CallbackQueryHandler(callback_router))
+    # Callback-и (инлайн-кнопки по ставкам)
+    app.add_handler(
+        CallbackQueryHandler(handle_bet_result_callback, pattern=r"^bet_result:")
+    )
     # Все текстовые сообщения (кроме команд) — в агент
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
