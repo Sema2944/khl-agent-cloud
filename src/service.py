@@ -270,10 +270,11 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
 
 
 
-def def _extract_first_number(text: str) -> float | None:
+def _extract_first_number(text: str) -> float | None:
     """
     Достаём первое число из строки (для банка, пополнения и т.п.).
     """
+    # Важно: здесь латинская \d, а не русская "д"
     m = re.search(r"(\d+([\.,]\d+)?)", text)
     if not m:
         return None
