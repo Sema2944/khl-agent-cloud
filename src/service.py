@@ -80,42 +80,59 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     """
     Выделяем сумму и коэффициент из произвольной строки.
 
-    Важно: если есть конструкция 'матч 123456 2000', то:
-    - 123456 считаем id матча
-    - 2000 считаем суммой (а не кэфом)
+    Особый кейс:
+    - 'ставка на матч 123456 2000'
+      → матч 123456 (ID), ставка 2000.
     """
+    # Все числа с позициями
+    num_matches = list(re.finditer(r"(\d+([\.,]\d+)?)", raw_text))
+    if not num_matches:
+        return None, None
+
     text_lower = raw_text.lower()
 
-    # Все числа в строке
-    num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
-    numbers = [m[0] for m in num_matches]
-
-    # Если есть 'матч 123456' — это id, и его исключаем из кандидатов для суммы/кэфа
-    match_id = None
+    # --- Определяем ID матча, если есть конструкция "матч 123456" ---
+    match_id_index: int | None = None
     m_match = re.search(r"матч\s+(\d+)", text_lower)
     if m_match:
-        match_id = m_match.group(1)
+        match_id_str = m_match.group(1)
+        # Ищем это число среди num_matches
+        for idx, m in enumerate(num_matches):
+            token = m.group(1)
+            clean = token.replace(",", ".")
+            # Для ID матча ожидаем целое число
+            if clean.isdigit() and clean == match_id_str:
+                match_id_index = idx
+                break
 
-    numbers_for_parsing: list[str] = []
-    for n in numbers:
-        # отбрасываем id матча
-        if match_id is not None and n.replace(",", ".") == match_id:
-            continue
-        numbers_for_parsing.append(n)
+    def _num_to_float(m: re.Match) -> float | None:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            return None
 
     stake: float | None = None
     odds: float | None = None
+    stake_index: int | None = None
 
-    # 1) Пытаемся взять первое "очищенное" число как сумму
-    if numbers_for_parsing:
-        try:
-            stake = float(numbers_for_parsing[0].replace(",", "."))
-        except ValueError:
-            stake = None
+    # --- Логика выбора суммы ставки ---
+    if match_id_index is not None:
+        # 1) Сначала пытаемся найти число ПЕРЕД ID матча (ставка 2000 на матч 123456)
+        if match_id_index > 0:
+            stake_index = match_id_index - 1
+        # 2) Иначе берём число ПОСЛЕ ID матча (ставка на матч 123456 2000)
+        elif match_id_index + 1 < len(num_matches):
+            stake_index = match_id_index + 1
+    else:
+        # Без "матч" → как раньше: первое число — сумма
+        stake_index = 0
 
-    # 2) Паттерны для кэфа
+    if stake_index is not None:
+        stake = _num_to_float(num_matches[stake_index])
 
-    # 2.1) рядом со словами "коэф/кф/кэф/коэфф/коэффициент"
+    # --- Поиск коэффициента по ключевым словам "коэф/кф/за/по" ---
+
+    # 1) рядом с словами "коэф/кф/кэф/коэфф/коэффициент"
     coef_pattern = re.compile(
         r"(коэф(фициент)?|коeff|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
         re.IGNORECASE,
@@ -129,7 +146,7 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
         except ValueError:
             odds = None
 
-    # 2.2) конструкции "за 1.85" / "по 1,75"
+    # 2) конструкции "за 1.85" / "по 1,75"
     if odds is None:
         za_pattern = re.compile(
             r"\b(за|по)\s*(\d+([\.,]\d+)?)",
@@ -140,22 +157,31 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
             try:
                 candidate_odds = float(m_za.group(2).replace(",", "."))
                 if 1.01 <= candidate_odds <= 20:
-                    # защита от случая, когда сумма и кэф совпадают
-                    if not (stake is not None and stake >= 50 and candidate_odds == stake):
+                    # защитимся от ситуации, когда кэф = сумме ставки
+                    if not (
+                        stake is not None
+                        and stake >= 50
+                        and abs(candidate_odds - stake) < 1e-9
+                    ):
                         odds = candidate_odds
             except ValueError:
                 pass
 
-    # 2.3) если всё ещё нет кэфа — берём второе число как кэф (из очищенного списка)
-    if odds is None and len(numbers_for_parsing) >= 2:
-        try:
-            candidate_odds = float(numbers_for_parsing[1].replace(",", "."))
-            if candidate_odds >= 1.01:
-                odds = candidate_odds
-        except ValueError:
-            odds = None
+    # 3) Если всё ещё нет кэфа — берём первое подходящее число,
+    #    которое не является ни ID матча, ни суммой
+    if odds is None:
+        for idx, m in enumerate(num_matches):
+            if idx == stake_index or idx == match_id_index:
+                continue
+            candidate = _num_to_float(m)
+            if candidate is None:
+                continue
+            if candidate >= 1.01:
+                odds = candidate
+                break
 
     return stake, odds
+
 
 
 def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
@@ -163,6 +189,10 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     Пытаемся вытащить:
     - outcome: П1/П2/Х/1X/X2/12, тотал, фора и т.п.
     - event: текст о матче/командах (после 'на ...')
+
+    Спец-кейс:
+    - 'ставка на матч 123456 2000'
+      → event = 'матч 123456'
     """
     text = raw_text.lower()
 
@@ -233,7 +263,13 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
 
     outcome = " ; ".join(dict.fromkeys(outcome_parts)) if outcome_parts else None
 
-    # ----- EVENT: текст после "на ..." -----
+    # ----- Спец-кейс: "на матч 123456" -----
+    m_event_match = re.search(r"на\s+матч\s+(\d+)", text)
+    if m_event_match:
+        event = f"матч {m_event_match.group(1)}"
+        return outcome, event
+
+    # ----- ОБЩИЙ СЛУЧАЙ EVENT: текст после " на ..." -----
     lower = text
     idx = lower.find(" на ")
     if idx != -1:
@@ -255,18 +291,11 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
             if pos != -1:
                 end_pos = min(end_pos, pos)
         event_candidate = after[:end_pos].strip(" -–—,:;")
-
         if event_candidate:
-            # Спец-кейс: 'матч 123456 2000' → 'матч 123456'
-            ec_lower = event_candidate.lower()
-            m_match_tail = re.match(r"(матч\s+\d+)\s+\d+(\s+.*)?$", ec_lower)
-            if m_match_tail:
-                keep_len = len(m_match_tail.group(1))
-                event = event_candidate[:keep_len]
-            else:
-                event = event_candidate
+            event = event_candidate
 
     return outcome, event
+
 
 
 
