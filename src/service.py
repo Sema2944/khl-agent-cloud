@@ -103,6 +103,48 @@ async def agent_last_bets(
 
     return {"bets": out}
 
+@app.post("/agent/settle-bet")
+async def api_settle_bet(
+    data: dict,
+    session: Session = Depends(get_session),
+):
+    """
+    Отмечаем ставку как win/lose/push по запросу Telegram-кнопки.
+    """
+    try:
+        user_id = int(data.get("user_id"))
+        bet_id = int(data.get("bet_id"))
+        result = data.get("result")  # "win" | "lose" | "push"
+    except Exception:
+        return {"reply": "Некорректные данные для расчёта ставки."}
+
+    # Рассчитываем ставку
+    bet = settle_bet(session, user_id, bet_id, result)
+    if bet is None:
+        return {"reply": f"Ставка {bet_id} не найдена."}
+
+    # Приводим результат в «человеческий»
+    if result == "win":
+        word = "выигрыш"
+    elif result == "lose":
+        word = "проигрыш"
+    else:
+        word = "возврат"
+
+    lines = [f"Ставка {bet_id} отмечена: {word}."]
+
+    # PnL
+    if bet.profit is not None:
+        sign = "+" if bet.profit >= 0 else ""
+        lines.append(f"PnL: {sign}{bet.profit:.0f}")
+
+    # Обновляем банк
+    bank = get_user_bank(session, user_id)
+    if bank is not None and bet.profit is not None:
+        user = change_user_bank(session, user_id, bet.profit)
+        lines.append(f"Банк обновлён: {user.bank:.0f}")
+
+    return {"reply": "\n".join(lines)}
 
 
 # ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПАРСИНГА ------------------
