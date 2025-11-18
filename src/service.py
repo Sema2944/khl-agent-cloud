@@ -158,7 +158,7 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     return stake, odds
 
 
-def def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
+def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     """
     Пытаемся вытащить:
     - outcome: П1/П2/Х/1X/X2/12, тотал, фора и т.п.
@@ -261,13 +261,13 @@ def def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]
             ec_lower = event_candidate.lower()
             m_match_tail = re.match(r"(матч\s+\d+)\s+\d+(\s+.*)?$", ec_lower)
             if m_match_tail:
-                # длина первой части 'матч 123456'
                 keep_len = len(m_match_tail.group(1))
                 event = event_candidate[:keep_len]
             else:
                 event = event_candidate
 
     return outcome, event
+
 
 
 def def _extract_first_number(text: str) -> float | None:
