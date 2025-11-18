@@ -1877,7 +1877,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # 13) ДОБАВЛЕНИЕ СТАВКИ
+      # 13) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -1894,7 +1894,10 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             outcome=outcome,
         )
 
-        resp_lines = [f"Ставка сохранена (id: {bet.id}).", "", f"Текст: {bet.raw_text}"]
+        resp_lines: list[str] = []
+        resp_lines.append(f"Ставка сохранена (id: {bet.id}).")
+        resp_lines.append("")
+        resp_lines.append(f"Текст: {bet.raw_text}")
         if event:
             resp_lines.append(f"Событие: {event}")
         if outcome:
@@ -1904,18 +1907,26 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if odds is not None:
             resp_lines.append(f"Коэффициент: {odds:.2f}")
 
+        # 🧠 Краткий живой комментарий к ставке
+        resp_lines.extend(_build_quick_bet_comment(stake, odds, outcome))
+
+        # Как отмечать результат (кнопки в Telegram + текстовый fallback)
         resp_lines.append(
-            "\nКогда узнаешь результат, напиши, например:\n"
-            f"'ставка {bet.id} выиграла', 'ставка {bet.id} проиграла' "
-            f"или 'ставка {bet.id} возврат'.\n"
-            "Посмотреть: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
+            "Когда матч закончится — отметь результат в боте: "
+            f"кнопкой под ставкой или текстом вида "
+            f"'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'."
+        )
+        resp_lines.append(
+            "Посмотреть историю: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
         )
 
+        # Подсказка по банк-менеджменту, если банк уже задан
         bank = get_user_bank(session, user_id)
         if bank is not None:
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
 
         return "\n".join(resp_lines)
+
 
     # 14) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
