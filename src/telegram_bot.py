@@ -127,7 +127,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     → возвращаем ответ пользователю.
 
     Если это ответ про 'Ставка сохранена (id: N)',
-    добавляем инлайн-кнопки: Выиграла / Проиграла / Возврат.
+    добавляем инлайн-кнопки: Выиграла / Проиграла / Возврат
+    и подчищаем старый текст про 'напиши, например...'.
     """
     if not update.message:
         return
@@ -159,6 +160,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Если нашли id ставки — добавляем инлайн-кнопки для результата
     if stake_id is not None:
+        # Чистим хвост "Когда узнаешь результат, напиши, например: ..."
+        marker = "Когда узнаешь результат, напиши, например:"
+        pos = reply.find(marker)
+        if pos != -1:
+            reply = reply[:pos].rstrip()
+            reply += (
+                "\n\nКогда матч закончится — просто нажми кнопку ниже, "
+                "чтобы отметить результат ставки. 👇"
+            )
+
         keyboard = build_stake_result_keyboard(stake_id)
         await update.message.reply_text(reply, reply_markup=keyboard)
     else:
