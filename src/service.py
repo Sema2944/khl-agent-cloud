@@ -25,10 +25,48 @@ from .bets_db import (
 from .khl_client import get_today_khl_events
 from .khl_form_client import get_team_form, TeamForm
 
+# 👇 ВАЖНО: импортируем запуск телеграм-бота
+from .telegram_bot import main as run_telegram_bot
+
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent")
 
+
+class AgentQuery(BaseModel):
+    user_id: int
+    message: str
+
+
+class AgentResponse(BaseModel):
+    reply: str
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    """
+    Хук старта FastAPI:
+    - инициализируем БД
+    - запускаем Telegram-бота в отдельном потоке
+    """
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    logger.info("FastAPI сервис запущен")
+
+    def _run_tg_bot():
+        try:
+            logger.info("Запускаю Telegram-бота в фонового потоке...")
+            run_telegram_bot()
+        except Exception:
+            logger.exception("Ошибка в Telegram-боте")
+
+    t = threading.Thread(target=_run_tg_bot, name="telegram-bot", daemon=True)
+    t.start()
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "khl-agent"}
 
 class AgentQuery(BaseModel):
     user_id: int
