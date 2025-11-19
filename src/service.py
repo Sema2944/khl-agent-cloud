@@ -2065,6 +2065,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return "Твои последние ставки:\n" + "\n".join(lines)
 
       # 13) ДОБАВЛЕНИЕ СТАВКИ
+        # 13) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -2085,6 +2086,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         resp_lines.append(f"Ставка сохранена (id: {bet.id}).")
         resp_lines.append("")
         resp_lines.append(f"Текст: {bet.raw_text}")
+
         if event:
             resp_lines.append(f"Событие: {event}")
         if outcome:
@@ -2094,22 +2096,28 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if odds is not None:
             resp_lines.append(f"Коэффициент: {odds:.2f}")
 
-        # 🧠 Краткий живой комментарий к ставке
-        resp_lines.extend(_build_quick_bet_comment(stake, odds, outcome))
-
-        # Как отмечать результат (кнопки в Telegram + текстовый fallback)
         resp_lines.append(
-            "Когда матч закончится — отметь результат в боте: "
-            f"кнопкой под ставкой или текстом вида "
-            f"'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'."
+            "\n🧠 Быстрый комментарий по ставке:\n"
+            "• Я сохраню эту ставку в твою историю и учту в статистике.\n"
+            "• Когда матч закончится, отметь результат — так я смогу считать winrate и ROI."
         )
+
         resp_lines.append(
+            "\nКогда узнаешь результат, отметь ставку:\n"
+            f"• кнопкой под сообщением или\n"
+            f"• текстом вида 'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'.\n"
             "Посмотреть историю: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
         )
 
-        # Подсказка по банк-менеджменту, если банк уже задан
         bank = get_user_bank(session, user_id)
-        if bank is not None:
+        if bank is None:
+            # Первый онбординг по банку
+            resp_lines.append(
+                "\n💰 Чтобы я мог подсчитывать риск на дистанции и подсказывать размер ставки,\n"
+                "задай банк, например: 'мой банк 100000'."
+            )
+        else:
+            # Уже есть банк — даём подсказку по размеру ставки
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
 
         return "\n".join(resp_lines)
