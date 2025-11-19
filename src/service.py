@@ -1578,133 +1578,173 @@ def build_user_profile(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
-# ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
-
-
-# ------------------ АНАЛИТИКА МАТЧА КХЛ ПО ID ------------------
-
-
-def build_khl_match_analysis(event) -> str:
+def build_khl_match_analysis(ev) -> str:
     """
-    Разбор матча КХЛ:
-    - линия 1X2 с имплайд-вероятностями и маржой
-    - 'честные' вероятности без маржи
-    - форма команд по данным khl_form_client
-    - короткие выводы
+    Строим текстовый разбор матча КХЛ по событию ev.
+    Ожидаем, что ev имеет поля:
+    - id
+    - team1, team2
+    - markets: список рынков, среди которых ищем 1X2
     """
-    team1 = getattr(event, "team1", "?")
-    team2 = getattr(event, "team2", "?")
-    event_id = getattr(event, "id", "?")
-    markets = getattr(event, "markets", []) or []
+    title = f"{ev.team1} — {ev.team2} (id: {ev.id})"
 
-    lines: list[str] = []
-    lines.append("📊 Разбор матча КХЛ:")
-    lines.append(f"{team1} — {team2} (id: {event_id})")
-    lines.append("")
-
-    # --- 1) Ищем маркет 1X2 ---
+    # Ищем рынок 1X2
     market_1x2 = None
-    for m in markets:
+    for m in getattr(ev, "markets", []) or []:
         name = (getattr(m, "name", "") or "").upper()
-        if name in ("1X2", "1X", "3WAY", "3-WAY"):
+        if name in ("1X2", "3WAY", "3-WAY"):
             market_1x2 = m
             break
 
-    odds_list: list[tuple[str, float]] = []
-
-    if market_1x2:
-        outcomes = getattr(market_1x2, "outcomes", []) or []
-        for o in outcomes:
-            name = str(getattr(o, "name", "?"))
-            price = getattr(o, "price", None)
-            try:
-                coef = float(price)
-            except (TypeError, ValueError):
-                continue
-            if coef < 1.01:
-                continue
-            odds_list.append((name, coef))
-
-    if odds_list:
-        lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-        implied: list[tuple[str, float]] = []
-
-        for name, coef in odds_list:
-            p_imp = 100.0 / coef
-            implied.append((name, p_imp))
-            lines.append(f"• {name}: кэф {coef:.2f}, импл. вероятность ≈ {p_imp:.1f}%")
-
-        sum_implied = sum(p for _, p in implied)
-        if sum_implied > 0:
-            margin = sum_implied - 100.0
-            lines.append("")
-            lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
-
-            # 'Честные' вероятности без маржи
-            lines.append("")
-            lines.append("Оценка 'честных' вероятностей (без маржи бука):")
-            for (name, coef), (_, p_imp) in zip(odds_list, implied):
-                fair = p_imp * 100.0 / sum_implied
-                lines.append(f"• {name}: ≈ {fair:.1f}%")
-
-        # фаворит / андердог по линии
-        fav_name, fav_coef = min(odds_list, key=lambda x: x[1])
-        dog_name, dog_coef = max(odds_list, key=lambda x: x[1])
-        lines.append("")
-        lines.append("Структура матча по 1X2:")
-
-        ratio = dog_coef / fav_coef if fav_coef > 0 else None
-        if ratio is not None:
-            if ratio < 1.4:
-                lines.append(
-                    "• Линия достаточно ровная — ожидается более-менее равный матч без явного суперфаворита."
-                )
-            elif ratio < 2.2:
-                lines.append(
-                    f"• {fav_name} идёт фаворитом, но андердог ({dog_name}) по линии не выглядит безнадёжным."
-                )
-            else:
-                lines.append(
-                    f"• {fav_name} — явный фаворит по линии, {dog_name} играет роль заметного андердога."
-                )
-        else:
-            lines.append("• Фаворит и андердог по линии определяются, но коэффициенты странные.")
-
-        lines.append(
-            "• Помни, что линия отражает оценку букмекера и рынка, а не гарантию результата."
-        )
-    else:
-        lines.append(
-            "По этому матчу я не нашёл валидных коэффициентов по рынку 1X2. "
-            "Возможен лайв или временно снятая линия."
-        )
-
-    # --- 2) Форма команд ---
+    lines: list[str] = []
+    lines.append("📊 Разбор матча КХЛ:")
+    lines.append(title)
     lines.append("")
-    lines.append("📉 Форма команд (по последним матчам):")
 
-    form1 = get_team_form(team1)
-    form2 = get_team_form(team2)
+    if not market_1x2 or not getattr(market_1x2, "outcomes", None):
+        lines.append("По этому матчу я не нашёл рынок 1X2 с коэффициентами.")
+        lines.append("Используй этот разбор как ориентир по структуре матча, а линию смотри у бука.")
+        return "\n".join(lines)
 
-    def fmt_form(f, fallback_name: str) -> str:
-        if not f:
-            return f"{fallback_name}: форму не удалось оценить (недостаточно данных)."
-        # ОПИРАЕМСЯ НА ПОЛЯ, КОТОРЫЕ У ТЕБЯ УЖЕ ЕСТЬ В TeamForm:
-        # team_name, wins, losses, games, goals_for, goals_against, avg_total
-        return (
-            f"{f.team_name}: {f.wins}-{f.losses} за последние {f.games} матчей, "
-            f"забивают в среднем {f.goals_for:.1f}, пропускают {f.goals_against:.1f}, "
-            f"средний тотал ≈ {f.avg_total:.1f}."
-        )
+    # Разбираем исходы 1, X, 2
+    odds_map: dict[str, float] = {}
+    for o in market_1x2.outcomes:
+        name = (getattr(o, "name", "") or "").strip()
+        price = float(getattr(o, "price", 0.0) or 0.0)
+        if not price or price <= 1.0:
+            continue
+        odds_map[name] = price
 
-    lines.append("• " + fmt_form(form1, team1))
-    lines.append("• " + fmt_form(form2, team2))
+    # Пытаемся сопоставить стандартные исходы
+    odd_1 = odds_map.get("1")
+    odd_x = odds_map.get("X") or odds_map.get("x")
+    odd_2 = odds_map.get("2")
+
+    # Имплайд-вероятности
+    def implied(p: float | None) -> float | None:
+        if not p or p <= 1.0:
+            return None
+        return 100.0 / p
+
+    p1 = implied(odd_1)
+    px = implied(odd_x)
+    p2 = implied(odd_2)
+
+    total_imp = sum(v for v in (p1, px, p2) if v is not None)
+    margin = total_imp - 100.0 if total_imp else None
+
+    lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
+    if odd_1:
+        lines.append(f"• 1: кэф {odd_1:.2f}, импл. вероятность ≈ {p1:.1f}%")
+    if odd_x:
+        lines.append(f"• X: кэф {odd_x:.2f}, импл. вероятность ≈ {px:.1f}%")
+    if odd_2:
+        lines.append(f"• 2: кэф {odd_2:.2f}, импл. вероятность ≈ {p2:.1f}%")
+
+    if margin is not None:
+        lines.append("")
+        lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
+
+    # «Честные» вероятности (убираем маржу пропорционально)
+    if margin is not None and total_imp > 0:
+        k = 100.0 / total_imp
+        fp1 = p1 * k if p1 is not None else None
+        fpx = px * k if px is not None else None
+        fp2 = p2 * k if p2 is not None else None
+
+        lines.append("")
+        lines.append("Оценка 'честных' вероятностей (без маржи бука):")
+        if fp1 is not None:
+            lines.append(f"• 1: ≈ {fp1:.1f}%")
+        if fpx is not None:
+            lines.append(f"• X: ≈ {fpx:.1f}%")
+        if fp2 is not None:
+            lines.append(f"• 2: ≈ {fp2:.1f}%")
+    else:
+        fp1 = fp2 = fpx = None
+
+    lines.append("")
+    lines.append("Структура матча по 1X2:")
+    if fp1 and fp2:
+        if fp1 > fp2:
+            lines.append("• 1 идёт явным или умеренным фаворитом по линии.")
+        elif fp2 > fp1:
+            lines.append("• 2 идёт фаворитом по линии.")
+        else:
+            lines.append("• Линия скорее про равный матч, без явного фаворита.")
+    else:
+        lines.append("• По коэффициентам видно фаворита, но разброс не критичный.")
+
+    if odd_x and fpx:
+        lines.append("• Ничья (X) — альтернативный сценарий, который рынок не полностью отбрасывает.")
+
+    lines.append(
+        "• Помни, что линия отражает оценку букмекера и рынка, а не гарантию результата."
+    )
+
+    # Форма команд (если есть данные)
+    try:
+        form1: TeamForm | None = get_team_form(ev.team1)
+    except Exception:
+        logger.exception("Ошибка при получении формы команды %s", ev.team1)
+        form1 = None
+
+    try:
+        form2: TeamForm | None = get_team_form(ev.team2)
+    except Exception:
+        logger.exception("Ошибка при получении формы команды %s", ev.team2)
+        form2 = None
+
+    if form1 or form2:
+        lines.append("")
+        lines.append("📉 Форма команд (по последним матчам):")
+
+        def _form_line(name: str, f: TeamForm | None) -> str:
+            if not f:
+                return f"• {name}: нет данных по форме."
+            return (
+                f"• {name}: {f.wins}-{f.losses} за последние {f.games} матчей, "
+                f"забивают в среднем {f.goals_for:.1f}, "
+                f"пропускают {f.goals_against:.1f}, "
+                f"средний тотал ≈ {f.avg_total:.1f}."
+            )
+
+        lines.append(_form_line(ev.team1, form1))
+        lines.append(_form_line(ev.team2, form2))
 
     lines.append("")
     lines.append(
-        "Форма считается по последним матчам (через календарь КХЛ), "
-        "а линия даёт ориентир по ожиданиям рынка. "
+        "Форма считается по последним матчам, а линия даёт ориентир по ожиданиям рынка. "
         "Используй это как чек-лист, а не готовый прогноз."
+    )
+
+    # 🔥 Коуч-блок по коэффициентам
+    lines.append("")
+    lines.append("🧠 Как использовать эти коэффициенты под себя:")
+
+    if odd_1:
+        lines.append(
+            f"• Для кэфа 1 ({odd_1:.2f}) букмекер закладывает шанс около {p1:.1f}%."
+        )
+    if odd_2:
+        lines.append(
+            f"• Для кэфа 2 ({odd_2:.2f}) — шанс около {p2:.1f}%."
+        )
+    if odd_x:
+        lines.append(
+            f"• Для ничьей ({odd_x:.2f}) — около {px:.1f}%."
+        )
+
+    lines.append(
+        "Если твоя субъективная вероятность по какому-то исходу СТАБИЛЬНО выше, чем закладывает рынок, "
+        "то для тебя это потенциальный value на дистанции."
+    )
+    lines.append(
+        "Быстрый чек: честный кэф ≈ 100 / твоя_вероятность. "
+        "Если твой честный кэф ниже, чем у бука — ставка для тебя выглядит как value."
+    )
+    lines.append(
+        "Можно отдельно прогнать чистый коэффициент через value-чеклист: например, 'value 1.85' или 'проверка кэф 2.3'."
     )
 
     return "\n".join(lines)
