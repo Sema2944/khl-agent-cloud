@@ -2120,7 +2120,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # 13) ДОБАВЛЕНИЕ СТАВКИ
+       # 13) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -2148,17 +2148,26 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             resp_lines.append(f"Коэффициент: {odds:.2f}")
 
         resp_lines.append(
-            "\nКогда матч закончится — отметь результат в боте: "
-            "кнопкой под ставкой или текстом вида "
-            f"'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'.\n"
+            "\nКогда узнаешь результат, отметь его в боте:\n"
+            f"• кнопкой под ставкой\n"
+            f"• или текстом вида: 'ставка {bet.id} выиграла', 'ставка {bet.id} проиграла', 'ставка {bet.id} возврат'.\n"
             "Посмотреть историю: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
         )
 
         bank = get_user_bank(session, user_id)
         if bank is not None:
+            # Если банк уже задан — даём умный хинт про нагрузку на банк
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
+        else:
+            # Если банк не задан — мягкий онбординг
+            resp_lines.append(
+                "\n💰 Банк пока не задан.\n"
+                "Чтобы я мог считать нагрузку на банк и подсказывать размер ставки, "
+                "задай его один раз, например: 'мой банк 100000'."
+            )
 
         return "\n".join(resp_lines)
+
 
     # 14) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
