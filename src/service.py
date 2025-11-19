@@ -2064,9 +2064,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-      # 13) ДОБАВЛЕНИЕ СТАВКИ
-        # 13) ДОБАВЛЕНИЕ СТАВКИ
-    if text.startswith("ставка"):
+         # 13) ДОБАВЛЕНИЕ СТАВКИ
+    # Допускаем лёгкие опечатки в начале: "ставка", "ставк", "тавка"
+    norm_for_bet = text.lstrip()
+    if (
+        norm_for_bet.startswith("ставка")
+        or norm_for_bet.startswith("ставк")
+        or norm_for_bet.startswith("тавка")
+    ):
         raw_text = original_text.strip()
 
         stake, odds = _parse_stake_and_odds(raw_text)
@@ -2113,7 +2118,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         if bank is None:
             # Первый онбординг по банку
             resp_lines.append(
-                "\n💰 Чтобы я мог подсчитывать риск на дистанции и подсказывать размер ставки,\n"
+                "\n💰 Чтобы я мог подсчитывать риск и подсказывать размер ставки,\n"
                 "задай банк, например: 'мой банк 100000'."
             )
         else:
@@ -2121,6 +2126,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
 
         return "\n".join(resp_lines)
+
 
 
     # 14) ЗАГЛУШКИ
