@@ -1623,277 +1623,220 @@ def build_user_profile(session: Session, user_id: int) -> str:
 
 async def build_khl_match_analysis(ev) -> str:
     """
-  # ---------- РАСШИРЕННЫЙ РАЗБОР МАТЧА КХЛ ----------
-
-async def build_khl_match_analysis(event) -> str:
-    """
-    Строим разбор матча КХЛ:
-    - линия 1X2 + имплайд-вероятности и 'честные' проценты;
-    - форма команд через TeamForm;
-    - 'сила команды' через TeamStrengthSnapshot;
-    - MatchupView (темп/тотал, физика, вратари, риск апсета);
-    - опционально: контекстные заметки из hockey_logic.
+    Разбор матча КХЛ:
+    - линия 1X2 + имплайд-вероятности и «честные» проценты;
+    - форма команд по последним матчам;
+    - модельный матчап (темп, тоталы, риск апсета);
+    - турнирный контекст / мотивация.
     """
 
-    team1_name = getattr(event, "team1", "Команда 1")
-    team2_name = getattr(event, "team2", "Команда 2")
-    event_id = getattr(event, "id", "—")
+    team1_name = getattr(ev, "team1", "Команда 1")
+    team2_name = getattr(ev, "team2", "Команда 2")
+    event_id = getattr(ev, "id", None)
 
-    # ---------- 1. ЛИНИЯ 1X2 ----------
+    # ---------- 1. Ищем рынок 1X2 ----------
     market_1x2 = None
-    for m in getattr(event, "markets", []) or []:
+    for m in getattr(ev, "markets", []):
         name = (getattr(m, "name", "") or "").upper()
         if name in ("1X2", "1X", "3WAY", "3-WAY"):
             market_1x2 = m
             break
 
-    line_block_lines: list[str] = []
+    lines: list[str] = []
+    lines.append("📊 Разбор матча КХЛ:")
 
-    implied_1 = implied_x = implied_2 = None
+    title = f"{team1_name} — {team2_name}"
+    if event_id is not None:
+        title += f" (id: {event_id})"
+    lines.append(title)
+    lines.append("")
 
+    # ---------- 2. Линия 1X2 и честные вероятности ----------
     if market_1x2 and getattr(market_1x2, "outcomes", None):
-        # соберём кэфы
-        odds_map = {}
+        odds_map: dict[str, float] = {}
         for o in market_1x2.outcomes:
-            outcome_name = (getattr(o, "name", "") or "").strip().upper()
+            oname = (getattr(o, "name", "") or "").strip().upper()
             price = float(getattr(o, "price", 0.0) or 0.0)
-            odds_map[outcome_name] = price
+            if price <= 1.01:
+                continue
+            if oname in ("1", "HOME"):
+                odds_map["1"] = price
+            elif oname in ("2", "AWAY"):
+                odds_map["2"] = price
+            elif oname in ("X", "DRAW"):
+                odds_map["X"] = price
 
-        k1 = odds_map.get("1")
-        kx = odds_map.get("X") or odds_map.get("DRAW")
-        k2 = odds_map.get("2")
+        if odds_map:
+            lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
 
-        def _implied(p: float | None) -> float | None:
-            if not p or p <= 1.0:
-                return None
-            return 100.0 / p
+            inv_sum = 0.0
+            invs: dict[str, float] = {}
+            for k, v in odds_map.items():
+                inv = 1.0 / v
+                invs[k] = inv
+                inv_sum += inv
 
-        implied_1 = _implied(k1)
-        implied_x = _implied(kx)
-        implied_2 = _implied(k2)
+            # имплайд с маржей
+            imp_map: dict[str, float] = {}
+            for k, inv in invs.items():
+                p = inv / inv_sum * 100.0
+                imp_map[k] = p
+                lines.append(f"• {k}: кэф {odds_map[k]:.2f}, импл. вероятность ≈ {p:.1f}%")
 
-        line_block_lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-        if k1:
-            line_block_lines.append(
-                f"• 1: кэф {k1:.2f}"
-                + (f", импл. вероятность ≈ {implied_1:.1f}%" if implied_1 else "")
+            margin_pp = (inv_sum - 1.0) * 100.0
+            lines.append("")
+            lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin_pp:.1f} п.п.")
+            lines.append("")
+
+            # честные вероятности (без маржи)
+            lines.append("Оценка 'честных' вероятностей (без маржи бука):")
+            fair_sum = sum(invs.values())
+            fair_probs = {k: inv / fair_sum * 100.0 for k, inv in invs.items()}
+            ordered = []
+            for key, label in (("1", "1"), ("X", "X"), ("2", "2")):
+                if key in fair_probs:
+                    ordered.append((label, fair_probs[key]))
+
+            for label, p in ordered:
+                lines.append(f"• {label}: ≈ {p:.1f}%")
+
+            # краткая структура
+            lines.append("")
+            lines.append("Структура матча по 1X2:")
+            fav_comment_parts: list[str] = []
+
+            p1 = fair_probs.get("1")
+            px = fair_probs.get("X")
+            p2 = fair_probs.get("2")
+
+            if p1 is not None and p2 is not None:
+                if p1 > p2 + 5:
+                    fav_comment_parts.append("• 1 идёт фаворитом по линии.")
+                elif p2 > p1 + 5:
+                    fav_comment_parts.append("• 2 идёт фаворитом по линии.")
+                else:
+                    fav_comment_parts.append("• Явного фаворита между 1 и 2 нет.")
+
+            if px is not None:
+                fav_comment_parts.append(
+                    "• Ничья (X) может сыграть роль, особенно если топы любят «экономить» силы."
+                )
+
+            fav_comment_parts.append(
+                "• Помни, что линия отражает оценку букмекера и рынка, а не гарантию результата."
             )
-        if kx:
-            line_block_lines.append(
-                f"• X: кэф {kx:.2f}"
-                + (f", импл. вероятность ≈ {implied_x:.1f}%" if implied_x else "")
-            )
-        if k2:
-            line_block_lines.append(
-                f"• 2: кэф {k2:.2f}"
-                + (f", импл. вероятность ≈ {implied_2:.1f}%" if implied_2 else "")
-            )
 
-        # маржа и 'честные' вероятности
-        probs_sum = sum(p for p in [implied_1, implied_x, implied_2] if p is not None)
-        fair_1 = fair_x = fair_2 = None
-        margin_pp = None
-        if probs_sum and probs_sum > 0:
-            margin_pp = probs_sum - 100.0
-            if implied_1:
-                fair_1 = implied_1 / probs_sum * 100.0
-            if implied_x:
-                fair_x = implied_x / probs_sum * 100.0
-            if implied_2:
-                fair_2 = implied_2 / probs_sum * 100.0
-
-        if margin_pp is not None:
-            line_block_lines.append("")
-            line_block_lines.append(
-                f"Маржа букмекера по рынку 1X2 ≈ {margin_pp:.1f} п.п."
-            )
-
-        if fair_1 or fair_x or fair_2:
-            line_block_lines.append("")
-            line_block_lines.append(
-                "Оценка 'честных' вероятностей (без маржи бука):"
-            )
-            if fair_1:
-                line_block_lines.append(f"• 1: ≈ {fair_1:.1f}%")
-            if fair_x:
-                line_block_lines.append(f"• X: ≈ {fair_x:.1f}%")
-            if fair_2:
-                line_block_lines.append(f"• 2: ≈ {fair_2:.1f}%")
+            lines.extend(fav_comment_parts)
+            lines.append("")
     else:
-        line_block_lines.append("Линия 1X2 по этому матчу недоступна.")
+        lines.append("По рынку 1X2 нет данных, работаем только с формой и контекстом.")
+        lines.append("")
 
-    # ---------- 2. ФОРМА КОМАНД И СИЛА КОМАНДЫ ----------
-
+    # ---------- 3. Форма команд (из khl_form_client) ----------
+    form_lines: list[str] = []
     try:
         form1 = await _get_team_form_safe(team1_name)
-    except Exception:
-        logger.exception("Ошибка получения формы команды %s", team1_name)
-        form1 = None
-
-    try:
         form2 = await _get_team_form_safe(team2_name)
     except Exception:
-        logger.exception("Ошибка получения формы команды %s", team2_name)
+        logger.exception("Ошибка при получении формы команд для анализа матча")
+        form1 = None
         form2 = None
 
-    # заглушки, если формы нет
-    if form1 is None:
-        form1 = TeamForm(
-            team_name=team1_name,
-            wins=0,
-            losses=0,
-            ot_losses=0,
-            avg_goals_for=0.0,
-            avg_goals_against=0.0,
-            avg_total=0.0,
-            games_last_2_days=0,
-            games_last_3_days=0,
+    snapshots = []
+
+    if form1 and form2:
+        form_lines.append("📉 Форма команд (по последним матчам):")
+        form_lines.append(
+            f"• {team1_name}: {form1.wins}-{form1.losses}"
+            + (f"-{form1.ot_losses}" if form1.ot_losses else "")
+            + f" за последние {form1.games} матчей, "
+              f"забивают в среднем {form1.avg_goals_for:.1f}, "
+              f"пропускают {form1.avg_goals_against:.1f}, "
+              f"средний тотал ≈ {form1.avg_total:.1f}."
         )
-    if form2 is None:
-        form2 = TeamForm(
-            team_name=team2_name,
-            wins=0,
-            losses=0,
-            ot_losses=0,
-            avg_goals_for=0.0,
-            avg_goals_against=0.0,
-            avg_total=0.0,
-            games_last_2_days=0,
-            games_last_3_days=0,
+        form_lines.append(
+            f"• {team2_name}: {form2.wins}-{form2.losses}"
+            + (f"-{form2.ot_losses}" if form2.ot_losses else "")
+            + f" за последние {form2.games} матчей, "
+              f"забивают в среднем {form2.avg_goals_for:.1f}, "
+              f"пропускают {form2.avg_goals_against:.1f}, "
+              f"средний тотал ≈ {form2.avg_total:.1f}."
         )
-
-    snapshot1 = build_team_strength_from_form(team1_name, form1)
-    snapshot2 = build_team_strength_from_form(team2_name, form2)
-
-    matchup = build_matchup_view(snapshot1, snapshot2)
-
-    # ---------- 3. ТЕКСТ ПО МОДЕЛИ СИЛЫ ----------
-
-    model_lines: list[str] = []
-
-    if matchup.model_edge_side == "even":
-        model_lines.append(
-            "Модель видит матч ближе к равному: явного фаворита по сочетанию атаки/обороны и вратарей нет."
-        )
-    elif matchup.model_edge_side == "team1":
-        model_lines.append(
-            f"По модели фаворит скорее {team1_name}, "
-            f"преимущество оценивается как {matchup.model_edge_confidence:.0f}/100 по уверенности."
-        )
-    else:
-        model_lines.append(
-            f"По модели фаворит скорее {team2_name}, "
-            f"преимущество оценивается как {matchup.model_edge_confidence:.0f}/100 по уверенности."
-        )
-
-    # темп / тотал / физика / вратари
-    model_lines.append("")
-    model_lines.append("Темп и тоталы:")
-    model_lines.append(f"• {matchup.expected_pace_comment}")
-    model_lines.append(f"• {matchup.total_hint_comment}")
-
-    model_lines.append("")
-    model_lines.append("Стиль и жёсткость матча:")
-    model_lines.append(f"• {matchup.physicality_comment}")
-    model_lines.append(f"• {matchup.goalie_duel_comment}")
-
-    model_lines.append("")
-    model_lines.append("Риск апсета (сюрприза андердога):")
-    model_lines.append(
-        f"• Уровень: {matchup.upset_risk_level} — {matchup.upset_risk_comment}"
-    )
-
-    # ---------- 4. ФОРМА КОМАНД В ЧИСЛАХ ----------
-
-    def _fmt_record(form: TeamForm) -> str:
-        rec = f"{form.wins}-{form.losses}"
-        if getattr(form, "ot_losses", 0):
-            rec += f"-{form.ot_losses}"
-        return rec
-
-    form_lines: list[str] = []
-    form_lines.append("📉 Форма команд (по последним матчам):")
-    form_lines.append(
-        f"• {team1_name}: { _fmt_record(form1) }, "
-        f"забивают в среднем {form1.avg_goals_for:.1f}, "
-        f"пропускают {form1.avg_goals_against:.1f}, "
-        f"средний тотал ≈ {form1.avg_total:.1f}."
-    )
-    form_lines.append(
-        f"• {team2_name}: { _fmt_record(form2) }, "
-        f"забивают в среднем {form2.avg_goals_for:.1f}, "
-        f"пропускают {form2.avg_goals_against:.1f}, "
-        f"средний тотал ≈ {form2.avg_total:.1f}."
-    )
-
-    # усталость / бэк-ту-бэк
-    fatigue_notes: list[str] = []
-    if snapshot1.is_back_to_back or snapshot1.fatigue_score > 0:
-        fatigue_notes.append(
-            f"• {team1_name}: есть фактор усталости (серия матчей подряд)."
-        )
-    if snapshot2.is_back_to_back or snapshot2.fatigue_score > 0:
-        fatigue_notes.append(
-            f"• {team2_name}: есть фактор усталости (серия матчей подряд)."
-        )
-    if fatigue_notes:
         form_lines.append("")
-        form_lines.append("Фактор усталости:")
-        form_lines.extend(fatigue_notes)
+        form_lines.append(
+            "Форма считается по последним матчам, а линия даёт ориентир по ожиданиям рынка. "
+            "Используй это как чек-лист, а не готовый прогноз."
+        )
 
-    # ---------- 5. КОНТЕКСТНЫЕ ЗАМЕТКИ (СТАНДИНГИ, МОТИВАЦИЯ И Т.П.) ----------
+        # снимки силы команд для хоккейной модели
+        t1_snapshot = build_team_strength_from_form(team1_name, form1)
+        t2_snapshot = build_team_strength_from_form(team2_name, form2)
+        snapshots = [t1_snapshot, t2_snapshot]
 
+    if form_lines:
+        lines.append("")
+        lines.extend(form_lines)
+
+    # ---------- 4. Модельный матчап (темп, тоталы, апсет) ----------
+    if len(snapshots) == 2:
+        t1_snapshot, t2_snapshot = snapshots
+        matchup = build_matchup_view(t1_snapshot, t2_snapshot)
+
+        lines.append("")
+        lines.append("🧬 Модельный матчап по стилю и темпу:")
+
+        # кто фаворит по модели
+        if matchup.model_edge_side == "even":
+            lines.append("• По модели матч ближе к равному, без ярко выраженного фаворита.")
+        elif matchup.model_edge_side == "team1":
+            lines.append(
+                f"• По совокупности атаки/обороны и вратаря небольшой плюс на стороне {matchup.team1} "
+                f"(уверенность модели ≈ {matchup.model_edge_confidence:.0f} из 100)."
+            )
+        else:
+            lines.append(
+                f"• По совокупности атаки/обороны и вратаря небольшой плюс на стороне {matchup.team2} "
+                f"(уверенность модели ≈ {matchup.model_edge_confidence:.0f} из 100)."
+            )
+
+        # темп / тоталы
+        lines.append(f"• {matchup.expected_pace_comment}")
+        lines.append(f"• {matchup.total_hint_comment}")
+
+        # физика и вратари
+        lines.append(f"• {matchup.physicality_comment}")
+        lines.append(f"• {matchup.goalie_duel_comment}")
+
+        # риск апсета
+        lines.append(
+            f"• Риск апсета (сюрприза андердога): {matchup.upset_risk_level}.\n"
+            f"  {matchup.upset_risk_comment}"
+        )
+
+    # ---------- 5. Турнирный контекст / мотивация ----------
     context_lines: list[str] = []
     try:
-        # предполагаем, что hockey_logic.build_match_context_notes(team1, team2, league="KHL")
         notes = build_match_context_notes(team1_name, team2_name, league="KHL")
         if notes:
+            context_lines.append("")
             context_lines.append("📌 Турнирный контекст / мотивация:")
             context_lines.append(notes)
     except Exception:
         logger.exception("Ошибка при построении контекстных заметок по матчу")
 
-    # ---------- 6. ФИНАЛЬНЫЙ ТЕКСТ ДЛЯ БОТА ----------
-
-    out: list[str] = []
-    out.append("📊 Разбор матча КХЛ:")
-    out.append(f"{team1_name} — {team2_name} (id: {event_id})")
-    out.append("")
-
-    out.extend(line_block_lines)
-    out.append("")
-    out.extend(model_lines)
-    out.append("")
-    out.extend(form_lines)
-
     if context_lines:
-        out.append("")
-        out.extend(context_lines)
+        lines.append("")
+        lines.extend(context_lines)
 
-    out.append("")
-    out.append(
-        "Форма считается по последним матчам, а модель силы команд даёт ориентир по структуре игры. "
-        "Используй это как чек-лист, а не готовый прогноз."
-    )
-    out.append("")
-    out.append("🎯 Как использовать этот разбор для value:")
-    out.append(
-        "• Выбери исход (1, X или 2), который ты реально рассматриваешь.\n"
-        "• Прогоняй кэф через команды вида 'value 1.85' или 'проверка кэф 2.3' — я переведу коэффициент "
-        "в вероятность и дам чек-лист по value."
-    )
-    out.append("")
-    out.append("Примеры:")
-    out.append(f"• 'value 1.85' — если смотришь на победу {team1_name}")
-    out.append(f"• 'есть ли value в ставке по 2.10' — если смотришь на {team2_name}")
-    out.append("")
-    out.append(
-        "Если решишь ставить — сразу записывай ставку, например:\n"
-        f"• 'ставка 2000 на матч {event_id} победа {team1_name} по 1.85'\n"
-        f"• 'ставка 1500 на матч {event_id} тотал больше 5.5 за 1.90'"
+    # ---------- 6. Завершающий акцент ----------
+    lines.append("")
+    lines.append(
+        "Этот разбор не является командой 'ставить' или 'не ставить'. "
+        "Он даёт структурированный чек-лист: линия, форма, стиль игры, риск апсета и мотивация. "
+        "Финальное решение всегда за тобой."
     )
 
-    return "\n".join(out)
+    return "\n".join(lines)
 
 
 
