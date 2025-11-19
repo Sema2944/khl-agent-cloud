@@ -1685,6 +1685,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     original_text = message or ""
     text = original_text.lower().strip()
 
+    # --- авто-исправление распространённых опечаток / вариаций команды ---
+    # пользователь написал "тавка 1000 ..." вместо "ставка 1000 ..."
+    if text.startswith("тавка"):
+        # заменяем только первое слово, остальное оставляем как есть
+        text = "ставка" + text[len("тавка"):]
+    # дальше можно добавлять другие синонимы по мере надобности, например:
+    # if text.startswith("ставочка"):
+    #     text = "ставка" + text[len("ставочка"):]
+
     # 0) ГЛАВНОЕ МЕНЮ / СТАРТ
     if text in {"/start", "start", "меню", "главное меню", "help", "/help"}:
         return (
@@ -1713,6 +1722,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
             "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n"
         )
+
 
     # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ + АВТО-ОБНОВЛЕНИЕ БАНКА
     m_res = re.search(
