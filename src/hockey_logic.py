@@ -1,170 +1,230 @@
 # src/hockey_logic.py
 
+"""
+Хоккейная "контекстная" логика:
+- турнирный контекст (кто за что борется);
+- мотивация;
+- споты календаря (back-to-back, 3in4, важный следующий матч);
+- объяснение паттерна, когда топ может недоигрывать с аутсайдером
+  перед более важным соперником.
+
+Задача модуля сейчас:
+- дать человеку понятный чек-лист по мотивации;
+- сформировать текст, который мы вставляем в разбор матча;
+- держать аккуратный каркас под будущие реальные данные (таблица, календарь).
+"""
+
 from __future__ import annotations
 
-from typing import List, Optional
-
-from .khl_form_client import TeamForm
-
-
-def _safe_int(value, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        return int(value)
-    except Exception:
-        return default
+from dataclasses import dataclass
+from typing import Optional
 
 
-def _estimate_points_from_form(form: Optional[TeamForm]) -> int:
+# ---------- БАЗОВЫЕ СТРУКТУРЫ ДЛЯ ТАБЛИЦЫ И КАЛЕНДАРЯ ----------
+
+
+@dataclass
+class TeamStandingSummary:
     """
-    Грубая оценка 'очков' по форме.
-    Если в TeamForm есть wins/losses/ot_losses — используем их.
-    Если нет — просто возвращаем 0 (логика не сломается).
+    Краткое состояние команды в таблице.
+
+    Поля сделаны с запасом — сейчас мы их не заполняем из реального API,
+    но позже можно будет подключить источник и передавать сюда реальные значения.
     """
-    if form is None:
-        return 0
 
-    wins = _safe_int(getattr(form, "wins", 0))
-    ot_wins = _safe_int(getattr(form, "ot_wins", 0))
-    ot_losses = _safe_int(getattr(form, "ot_losses", 0))
+    team_name: str
 
-    # Супер-приблизительно: 2 очка за победу, 2 за победу в ОТ, 1 за поражение в ОТ
-    points = wins * 2 + ot_wins * 2 + ot_losses * 1
-    return points
+    # место в конференции / лиге
+    rank: Optional[int] = None
+
+    # отрыв от ближайших:
+    # (значения в очках, могут быть отрицательными, если команда впереди)
+    points_to_next_above: Optional[int] = None   # до ближайшей команды выше
+    points_to_next_below: Optional[int] = None   # до ближайшей команды ниже
+
+    # Боится ли вылететь из плей-офф / борется ли за топ-посев
+    is_fighting_for_playoff: Optional[bool] = None
+    is_secure_playoff_team: Optional[bool] = None
+    is_top_team: Optional[bool] = None           # топ-4 условно
+    is_bottom_team: Optional[bool] = None        # дно таблицы
 
 
-def _describe_totals(form: Optional[TeamForm]) -> str | None:
+@dataclass
+class ScheduleSpot:
     """
-    Короткое описание тоталов по команде.
-    Ожидаем, что в TeamForm могут быть:
-    - avg_scored / avg_allowed / avg_total
-    Если чего-то нет — просто молчим.
+    Позиция команды в календаре.
+
+    Это то место, куда отлично ложится твоя логика:
+    - "топ играет со слабым сейчас, а через день — с прямым конкурентом";
+    - back-to-back, 3 матча за 4 дня, перегрузка и т.п.
     """
-    if form is None:
+
+    team_name: str
+
+    # Нагрузка
+    is_back_to_back: bool = False     # играет второй день подряд
+    is_3in4: bool = False             # 3 матча за 4 дня
+    is_4in6: bool = False             # 4 матча за 6 дней
+
+    # Важность следующего матча
+    next_opponent: Optional[str] = None
+    next_opponent_is_direct_rival: bool = False  # прямой конкурент по таблице
+    next_game_is_very_important: bool = False    # условный "матч за 4 очка"
+
+
+# ---------- ВНУТРЕННИЙ ХЕЛПЕР: ОБЪЯСНЕНИЕ "МЯГКОГО" МАТЧА ДЛЯ ТОПА ----------
+
+
+def _describe_soft_spot_for_favourite(
+    fav: TeamStandingSummary | None,
+    dog: TeamStandingSummary | None,
+    fav_spot: ScheduleSpot | None,
+) -> Optional[str]:
+    """
+    Описывает ситуацию, когда у фаворита может быть 'мягкий' матч:
+    - фаворит из верхней части таблицы,
+    - соперник — явный низ,
+    - ближайший матч у фаворита с прямым конкурентом → возможен недо-настрой.
+    """
+
+    if fav is None or dog is None:
         return None
 
-    avg_scored = getattr(form, "avg_scored", None)
-    avg_allowed = getattr(form, "avg_allowed", None)
-    avg_total = getattr(form, "avg_total", None)
-
-    parts: List[str] = []
-    if isinstance(avg_scored, (int, float)):
-        parts.append(f"забивают в среднем {avg_scored:.1f}")
-    if isinstance(avg_allowed, (int, float)):
-        parts.append(f"пропускают {avg_allowed:.1f}")
-    if isinstance(avg_total, (int, float)):
-        parts.append(f"средний тотал ≈ {avg_total:.1f}")
-
-    if not parts:
+    # Нужны минимальные признаки: фаворит топ, соперник - низ.
+    if not (fav.is_top_team and dog.is_bottom_team):
         return None
 
-    return ", ".join(parts)
+    lines: list[str] = []
+    lines.append(
+        "Есть классический сценарий для сильных команд: "
+        "матч с аутсайдером иногда играется аккуратнее, "
+        "если на горизонте более важный соперник."
+    )
+
+    if fav_spot and (fav_spot.next_game_is_very_important or fav_spot.next_opponent_is_direct_rival):
+        # Привязываем к 'следующему матчу', если данные есть
+        if fav_spot.next_opponent:
+            lines.append(
+                f"{fav.team_name} может частично экономить силы на фоне "
+                f"ожидания более важного матча против {fav_spot.next_opponent}."
+            )
+        else:
+            lines.append(
+                f"{fav.team_name} может частично экономить силы, "
+                "потому что следующий матч серьёзнее по турнирному значению."
+            )
+
+        lines.append(
+            "В таких спотах часто видим: "
+            "более ровное распределение игрового времени, "
+            "меньше риска, допускают лишние моменты в защите."
+        )
+    else:
+        lines.append(
+            "Даже без явного 'матча за 4 очка' впереди, "
+            "топ может сыграть прагматично: забрать свои очки малой кровью, "
+            "без убийственного темпа все 60 минут."
+        )
+
+    lines.append(
+        "Это не означает, что фаворит обязан 'слить' игру, "
+        "но повышает риск недо-оценки аутсайдера и нервного матча."
+    )
+
+    return "\n".join(lines)
+
+
+# ---------- ОСНОВНАЯ ФУНКЦИЯ ДЛЯ SERVICE.PY ----------
 
 
 def build_match_context_notes(
     team1_name: str,
     team2_name: str,
-    form1: Optional[TeamForm],
-    form2: Optional[TeamForm],
-) -> List[str]:
+    league: str = "KHL",
+    team1_standing: Optional[TeamStandingSummary] = None,
+    team2_standing: Optional[TeamStandingSummary] = None,
+    team1_spot: Optional[ScheduleSpot] = None,
+    team2_spot: Optional[ScheduleSpot] = None,
+) -> str:
     """
-    Мини-хоккейная логика по матчу:
-    - кто выглядит 'сильнее' по форме (top vs underdog)
-    - есть ли риск странного матча (топ vs явный аутсайдер)
-    - что важно смотреть по игре (тоталы / темп и т.п.)
+    Собирает текстовый блок 'турнирный контекст / мотивация' для разбора матча.
 
-    На вход:
-    - названия команд (как в ev.team1 / ev.team2)
-    - объекты TeamForm (могут быть None, тогда логика мягко деградирует)
+    Сейчас:
+    - если нет реальных standing/spot-данных → даём общий чек-лист по мотивации
+      + объясняем паттерн 'топ vs низ + важный матч дальше', о котором ты говорил;
+    - если когда-нибудь начнём прокидывать реальные standing/spot,
+      сюда легко докрутим конкретику.
     """
-    notes: List[str] = []
 
-    # --- 1. Оценка формально 'сильной' и 'слабой' команды по форме ---
+    lines: list[str] = []
 
-    points1 = _estimate_points_from_form(form1)
-    points2 = _estimate_points_from_form(form2)
+    # 0. Заголовок внутри блока уже добавляет вызывающая функция,
+    # здесь пишем только содержимое.
 
-    diff = points1 - points2
+    # 1. Общий чек-лист по мотивации и таблице
+    lines.append(
+        "Перед ставкой по такому матчу полезно посмотреть на турнирный контекст, "
+        "а не только на коэффициенты."
+    )
+    lines.append("")
+    lines.append("Чек-лист по мотивации:")
+    lines.append("• Кто за что борется: за плей-офф, за топ-посев, чтобы не вылететь из зоны топ-8.")
+    lines.append("• Есть ли у одной из команд комфортный запас очков перед преследователями.")
+    lines.append("• Насколько критично каждой команде брать очки именно в этом матче.")
 
-    if diff > 4:
-        notes.append(
-            f"{team1_name} выглядит сильнее по недавней форме, чем {team2_name} "
-            f"(по очкам за последние матчи есть ощутимый запас)."
+    # 2. Объясняем твой сценарий: топ + слабый соперник + важный матч впереди
+    lines.append("")
+    lines.append(
+        "Отдельно стоит сценарий, когда топ-команда играет с явным аутсайдером, "
+        "а через матч или сразу после — более важная игра с прямым конкурентом."
+    )
+    lines.append(
+        "Логика клубов часто такая: слабый соперник всё равно не догонит в таблице, "
+        "а вот прямой конкурент сверху/снизу — может. Поэтому "
+        "иногда топ играет 'на полноги', экономит состав и рискует отдать очки аутсайдеру."
+    )
+
+    # 3. Если когда-нибудь начнём прокидывать реальные standing/spot — используем их
+    soft_spot_notes: list[str] = []
+
+    if team1_standing and team2_standing:
+        # Попробуем выбрать фаворита/андердога по таблице
+        fav = None
+        dog = None
+        fav_spot = None
+
+        if team1_standing.is_top_team and team2_standing.is_bottom_team:
+            fav, dog, fav_spot = team1_standing, team2_standing, team1_spot
+        elif team2_standing.is_top_team and team1_standing.is_bottom_team:
+            fav, dog, fav_spot = team2_standing, team1_standing, team2_spot
+
+        soft = _describe_soft_spot_for_favourite(fav, dog, fav_spot)
+        if soft:
+            soft_spot_notes.append("")
+            soft_spot_notes.append(soft)
+
+    # 4. Если реальных standing/spot нет — даём человеку понятную инструкцию, что смотреть
+    if not soft_spot_notes:
+        lines.append("")
+        lines.append("Как руками проверить риск 'мягкого' матча у фаворита:")
+        lines.append(
+            f"• Открой таблицу {league} и посмотри, нет ли у {team1_name} или {team2_name} "
+            "большого запаса очков над зоной плей-офф."
         )
-        strong_team = team1_name
-        weak_team = team2_name
-        strong_form = form1
-        weak_form = form2
-        strong_is_home = True  # условно, потом можно доработать
-    elif diff < -4:
-        notes.append(
-            f"{team2_name} выглядит сильнее по недавней форме, чем {team1_name} "
-            f"(по очкам за последние матчи есть ощутимый запас)."
+        lines.append(
+            "• Посмотри календарь: нет ли через 1–2 матча игры против прямого конкурента по таблице."
         )
-        strong_team = team2_name
-        weak_team = team1_name
-        strong_form = form2
-        weak_form = form1
-        strong_is_home = False
-    else:
-        strong_team = ""
-        weak_team = ""
-        strong_form = None
-        weak_form = None
-        strong_is_home = True
-        notes.append(
-            f"По недавней форме {team1_name} и {team2_name} выглядят довольно близко друг к другу."
+        lines.append(
+            "• Если такой матч есть, а текущий соперник — явный аутсайдер, "
+            "риск недо-мотивации фаворита выше, чем обычно."
         )
 
-    # --- 2. 'Риск странного матча' (условный сценарий, о котором ты говорил) ---
+    lines.extend(soft_spot_notes)
 
-    weird_risk = 0.0
-    if strong_team:
-        # Если сильная команда идёт заметно лучше, а слабая откровенно проседает —
-        # появляется риск 'недонастроя' фаворита.
-        weak_points = _estimate_points_from_form(weak_form)
-        if weak_points <= 4 and abs(diff) >= 6:
-            weird_risk = 0.7
-            notes.append(
-                f"Есть риск странного матча: {strong_team} явно сильнее по форме, "
-                f"{weak_team} смотрится аутсайдером. В таких играх фаворит иногда "
-                f"экономит силы и даёт сопернику слишком много шансов."
-            )
+    lines.append("")
+    lines.append(
+        "Важно: эта логика не даёт готовый прогноз, но помогает понять, "
+        "где фаворит может быть менее надёжен, чем подсказывает сухой коэффициент."
+    )
 
-    if 0.3 < weird_risk < 0.7:
-        notes.append(
-            "Риск 'странного' сценария (недонастрой фаворита, экономия сил, неожиданные провалы) — умеренный."
-        )
-    elif weird_risk >= 0.7:
-        notes.append(
-            "Риск 'странного' сценария (недонастрой фаворита, экономия сил под более важные матчи) — повышенный."
-        )
-
-    # --- 3. Контекст по тоталам ---
-
-    desc1 = _describe_totals(form1)
-    desc2 = _describe_totals(form2)
-
-    if desc1:
-        notes.append(f"{team1_name}: {desc1}.")
-    if desc2:
-        notes.append(f"{team2_name}: {desc2}.")
-
-    # Если это ярко атакующая команда против более закрытой — подсветим это.
-    if form1 and form2:
-        avg1 = getattr(form1, "avg_total", None)
-        avg2 = getattr(form2, "avg_total", None)
-        if isinstance(avg1, (int, float)) and isinstance(avg2, (int, float)):
-            if avg1 - avg2 >= 1.0:
-                notes.append(
-                    f"{team1_name} играют в более 'верхний' хоккей по тоталам, чем {team2_name}. "
-                    "Это важно учитывать, если смотришь в сторону тоталов."
-                )
-            elif avg2 - avg1 >= 1.0:
-                notes.append(
-                    f"{team2_name} играют в более 'верхний' хоккей по тоталам, чем {team1_name}. "
-                    "Это важно учитывать, если смотришь в сторону тоталов."
-                )
-
-    return notes
+    return "\n".join(lines)
