@@ -1674,25 +1674,12 @@ def build_khl_match_analysis(event) -> str:
 
 
 
-
-# ------------------ ЛОГИКА АГЕНТА ------------------
-
-
 async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     Простейший if/else-агент.
     """
     original_text = message or ""
     text = original_text.lower().strip()
-
-    # --- авто-исправление распространённых опечаток / вариаций команды ---
-    # пользователь написал "тавка 1000 ..." вместо "ставка 1000 ..."
-    if text.startswith("тавка"):
-        # заменяем только первое слово, остальное оставляем как есть
-        text = "ставка" + text[len("тавка"):]
-    # дальше можно добавлять другие синонимы по мере надобности, например:
-    # if text.startswith("ставочка"):
-    #     text = "ставка" + text[len("ставочка"):]
 
     # 0) ГЛАВНОЕ МЕНЮ / СТАРТ
     if text in {"/start", "start", "меню", "главное меню", "help", "/help"}:
@@ -1713,6 +1700,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'анализ матча 123' — odds-разбор по id\n\n"
             "📈 *Отчёты и инсайты по тебе*\n"
             "  • 'отчёт за неделю' — сводка по последним 7 дням\n"
+            "  • 'отчёт за месяц' — сводка за 30 дней\n"
             "  • 'лучшая ставка недели'\n"
             "  • 'ошибка недели'\n"
             "  • 'разбор моих рынков' — где ты силён, а где льёшь\n\n"
@@ -1720,13 +1708,19 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'профиль' — банк, статистика, сильные/слабые рынки, совет\n\n"
             "🧠 *Оценка конкретной ставки*\n"
             "  • 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
-            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n"
+            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n\n"
+            "🎯 *Проверка value-кэфа*\n"
+            "  • 'value 1.85'\n"
+            "  • 'проверка кэф 2.3'\n"
+            "  • 'есть ли value в ставке по 1.70'\n"
         )
-
 
     # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ + АВТО-ОБНОВЛЕНИЕ БАНКА
     m_res = re.search(
-        r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|возврат|refund|push|win|lose|loss)",
+        r"ставка\s+(\d+)\s+("
+        r"выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|"
+        r"возврат|refund|push|win|lose|loss"
+        r")",
         text,
     )
     if m_res:
@@ -1905,6 +1899,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "Отчёты и инсайты:\n"
             "• 'профиль'\n"
             "• 'отчёт за неделю'\n"
+            "• 'отчёт за месяц'\n"
             "• 'лучшая ставка недели'\n"
             "• 'ошибка недели'\n"
             "• 'разбор моих рынков'\n"
@@ -1920,6 +1915,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or ("отч" in text and "недел" in text)
     ):
         return build_weekly_report(session, user_id)
+
     # 8.1) ОТЧЁТ ЗА МЕСЯЦ
     if (
         "отчёт за месяц" in text
@@ -1955,7 +1951,22 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
             )
 
-        return build_khl_match_analysis(ev)
+        base_text = build_khl_match_analysis(ev)
+
+        extra = (
+            "\n\n🎯 Как использовать этот разбор для value:\n"
+            "• Выбери исход (1, X или 2), который ты реально рассматриваешь.\n"
+            "• Прогоняй кэф через команды вида 'value 1.85' или 'проверка кэф 2.3' — "
+            "я переведу коэффициент в вероятность и дам чек-лист по value.\n\n"
+            "Примеры:\n"
+            f"• 'value 1.85' — если смотришь на победу {ev.team1}\n"
+            "• 'есть ли value в ставке по 2.10' — если смотришь на андердога\n\n"
+            "Если решишь ставить — сразу записывай ставку, например:\n"
+            f"• 'ставка 2000 на матч {ev.id} победа {ev.team1} по 1.85'\n"
+            f"• 'ставка 1500 на матч {ev.id} тотал больше 5.5 за 1.90'\n"
+        )
+
+        return base_text + extra
 
     # 10) ОЦЕНКА СТАВКИ
     if (
@@ -1965,7 +1976,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or text.startswith("оценить ставку")
     ):
         return build_stake_evaluation(session, user_id, original_text)
-        
+
     # 10.1) VALUE-РАЗБОР КЭФА
     if (
         "value" in text
@@ -2018,7 +2029,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Матчи КХЛ на сегодня:\n" + "\n".join(lines)
 
-       # 12) МОИ СТАВКИ
+    # 12) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
         bets = get_last_bets(session, user_id, limit=5)
         if not bets:
@@ -2028,11 +2039,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         for b in bets:
             line_parts: list[str] = []
 
-            # Дата/время, если есть
             if b.created_at:
                 line_parts.append(f"{b.created_at:%d.%m %H:%M}")
 
-            # Исходный текст
             if b.raw_text:
                 line_parts.append(b.raw_text)
 
@@ -2064,14 +2073,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-         # 13) ДОБАВЛЕНИЕ СТАВКИ
-    # Допускаем лёгкие опечатки в начале: "ставка", "ставк", "тавка"
-    norm_for_bet = text.lstrip()
-    if (
-        norm_for_bet.startswith("ставка")
-        or norm_for_bet.startswith("ставк")
-        or norm_for_bet.startswith("тавка")
-    ):
+    # 13) ДОБАВЛЕНИЕ СТАВКИ
+    if text.startswith("ставка"):
         raw_text = original_text.strip()
 
         stake, odds = _parse_stake_and_odds(raw_text)
@@ -2087,11 +2090,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             outcome=outcome,
         )
 
-        resp_lines: list[str] = []
-        resp_lines.append(f"Ставка сохранена (id: {bet.id}).")
-        resp_lines.append("")
-        resp_lines.append(f"Текст: {bet.raw_text}")
-
+        resp_lines = [f"Ставка сохранена (id: {bet.id}).", "", f"Текст: {bet.raw_text}"]
         if event:
             resp_lines.append(f"Событие: {event}")
         if outcome:
@@ -2102,32 +2101,44 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             resp_lines.append(f"Коэффициент: {odds:.2f}")
 
         resp_lines.append(
-            "\n🧠 Быстрый комментарий по ставке:\n"
-            "• Я сохраню эту ставку в твою историю и учту в статистике.\n"
-            "• Когда матч закончится, отметь результат — так я смогу считать winrate и ROI."
-        )
-
-        resp_lines.append(
-            "\nКогда узнаешь результат, отметь ставку:\n"
-            f"• кнопкой под сообщением или\n"
-            f"• текстом вида 'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'.\n"
+            "\nКогда матч закончится — отметь результат в боте:\n"
+            "• кнопкой под этой ставкой\n"
+            f"• или текстом вроде 'ставка {bet.id} выиграла' / 'ставка {bet.id} проиграла' / 'ставка {bet.id} возврат'.\n"
             "Посмотреть историю: 'мои ставки', 'профиль' или 'Покажи мою статистику'."
         )
 
         bank = get_user_bank(session, user_id)
-        if bank is None:
-            # Первый онбординг по банку
-            resp_lines.append(
-                "\n💰 Чтобы я мог подсчитывать риск и подсказывать размер ставки,\n"
-                "задай банк, например: 'мой банк 100000'."
-            )
-        else:
-            # Уже есть банк — даём подсказку по размеру ставки
+        if bank is not None:
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
 
+        # лёгкий коуч-комментарий к ставке
+        resp_lines.append("")
+        resp_lines.append("🧠 Быстрый комментарий по ставке:")
+        if odds is not None:
+            if odds < 1.4:
+                resp_lines.append(
+                    "• Очень низкий кэф. Часто такие ставки мало что решают на дистанции, "
+                    "если не встроены в чёткую стратегию."
+                )
+            elif 1.4 <= odds <= 2.3:
+                resp_lines.append(
+                    "• Рабочий диапазон коэффициентов — хороший баланс между риском и наградой."
+                )
+            else:
+                resp_lines.append(
+                    "• Высокий кэф. Важно следить за оверставками и не раздувать риск в одной позиции."
+                )
+        if outcome and ("тотал" in outcome.lower() or "тб" in outcome.lower() or "тм" in outcome.lower()):
+            resp_lines.append(
+                "• Это ставка на тотал. Смотри на темп игры, качество атаки и спецбригады, "
+                "а не только на ощущение «будет весёлый матч»."
+            )
+
+        resp_lines.append(
+            "\nЭто не команда «ставить / не ставить», а короткий чек-лист, чтобы ты сам оценил идею ставки."
+        )
+
         return "\n".join(resp_lines)
-
-
 
     # 14) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
@@ -2171,6 +2182,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'мои ставки'\n"
         "• 'Покажи мою статистику'\n"
         "• 'отчёт за неделю'\n"
+        "• 'отчёт за месяц'\n"
         "• 'лучшая ставка недели'\n"
         "• 'ошибка недели'\n"
         "• 'разбор моих рынков'\n"
@@ -2178,35 +2190,3 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'анализ матча 123'\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
     )
-
-
-# ------------------ ЗАПУСК TELEGRAM-БОТА В ФОНЕ ------------------
-
-
-def _start_bot_background() -> None:
-    """
-    Стартуем Telegram-бота в отдельном потоке.
-    Если TELEGRAM_BOT_TOKEN не задан — просто пишем варнинг и не запускаем бота.
-    """
-    try:
-        token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if not token:
-            logger.warning(
-                "TELEGRAM_BOT_TOKEN не задан; Telegram-бот не будет запущен."
-            )
-            return
-
-        from . import telegram_bot
-
-        logger.info("Запускаю Telegram-бота в фонового потоке...")
-        t = threading.Thread(
-            target=telegram_bot.main,
-            name="telegram-bot-thread",
-            daemon=True,
-        )
-        t.start()
-    except Exception:
-        logger.exception("Не удалось запустить Telegram-бота в фоне")
-
-
-_start_bot_background()
