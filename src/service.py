@@ -35,24 +35,17 @@ from .hockey_model import (
 )
 import inspect
 
-async def safe_get_team_form(team_name: str) -> TeamForm | None:
+async def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
-    Безопасный вызов get_team_form:
-    - если get_team_form async — ждём через await;
-    - если sync — просто вызываем;
-    - при ошибке возвращаем None и логируем.
+    Заглушка для PRO-формы команды.
+
+    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
+    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
+    Когда появится get_team_advanced_form в khl_form_client, просто
+    обновим эту функцию и начнём использовать PRO-метрики.
     """
-    try:
-        if inspect.iscoroutinefunction(get_team_form):
-            return await get_team_form(team_name)
-        # на всякий случай: если это корутина, но не помечена как coroutinefunction
-        result = get_team_form(team_name)
-        if inspect.iscoroutine(result):
-            return await result
-        return result
-    except Exception:
-        logger.exception("Ошибка при получении формы команды %s", team_name)
-        return None
+    return None
+
 
 # 👇 запуск телеграм-бота
 from .telegram_bot import main as run_telegram_bot
