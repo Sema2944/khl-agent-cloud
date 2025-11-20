@@ -35,7 +35,7 @@ from .hockey_model import (
 )
 import inspect
 
-async def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
     Заглушка для PRO-формы команды.
 
@@ -45,6 +45,7 @@ async def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None
     обновим эту функцию и начнём использовать PRO-метрики.
     """
     return None
+
 
 
 # 👇 запуск телеграм-бота
