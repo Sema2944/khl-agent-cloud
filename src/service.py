@@ -191,24 +191,14 @@ class AgentResponse(BaseModel):
 @app.on_event("startup")
 def on_startup() -> None:
     """
-    Хук старта FastAPI:
-    - инициализируем БД
-    - настраиваем логи
-    - запускаем Telegram-бота в отдельном потоке
+    Старт FastAPI:
+    - инициализация базы
+    - настройка логов
+    БЕЗ запуска Telegram-бота!
     """
     logging.basicConfig(level=logging.INFO)
     init_db()
-    logger.info("FastAPI сервис запущен")
-
-    def _run_tg_bot():
-        try:
-            logger.info("Запускаю Telegram-бота в фонового потоке...")
-            run_telegram_bot()
-        except Exception:
-            logger.exception("Ошибка в Telegram-боте")
-
-    t = threading.Thread(target=_run_tg_bot, name="telegram-bot", daemon=True)
-    t.start()
+    logger.info("FastAPI сервис запущен (бот работает в отдельном Worker).")
 
 
 @app.get("/")
