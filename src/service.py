@@ -1932,8 +1932,55 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'профиль' — банк, статистика, сильные/слабые рынки, совет\n\n"
             "🧠 *Оценка конкретной ставки*\n"
             "  • 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
-            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n"
+            "  • 'что скажешь про ставку 1000 на СКА по 1.9'\n\n"
+            "💎 *Премиум*\n"
+            "  • 'премиум' — узнать, что даёт подписка\n"
+            "  • 'активировать премиум' — включить демо-премиум на 30 дней\n"
         )
+
+    # 0.1) АКТИВИРОВАТЬ ПРЕМИУМ (ручной триггер)
+    if "активировать премиум" in text:
+        user = session.get(User, user_id)
+        if user is None:
+            user = User(id=user_id, bank=None)
+        # даём 30 дней
+        user.premium_until = datetime.utcnow() + timedelta(days=30)
+        session.add(user)
+        session.commit()
+        until_str = user.premium_until.strftime("%d.%m.%Y")
+        return (
+            f"💎 Премиум активирован на 30 дней (до {until_str}).\n\n"
+            "Теперь тебе доступно:\n"
+            "• расширенный отчёт за неделю и месяц\n"
+            "• разбор твоих рынков\n"
+            "• лучшая ставка недели / ошибка недели\n"
+        )
+
+    # 0.2) ОПИСАНИЕ ПРЕМИУМА
+    if "премиум" in text or "premium" in text:
+        if is_premium(session, user_id):
+            user = session.get(User, user_id)
+            until_str = user.premium_until.strftime("%d.%m.%Y") if user and user.premium_until else "неизвестно"
+            return (
+                "💎 У тебя уже активен премиум.\n"
+                f"Действует до: {until_str}.\n\n"
+                "Что он даёт:\n"
+                "• расширенный недельный и месячный отчёт\n"
+                "• разбор твоих рынков\n"
+                "• лучшая ставка недели / ошибка недели\n"
+                "• более точные рекомендации по игре\n"
+            )
+        else:
+            return (
+                "💎 *Премиум-режим* — это следующий уровень.\n\n"
+                "Что будет доступно:\n"
+                "• Расширенный отчёт за неделю и месяц\n"
+                "• Разбор твоих рынков (где льёшь, где зарабатываешь)\n"
+                "• Ошибка недели — где потерял больше всего\n"
+                "• Лучшая ставка недели — что у тебя реально работает\n\n"
+                "Сейчас оплата ещё не подключена, поэтому премиум можно включить в демо-режиме.\n"
+                "Напиши: *активировать премиум*."
+            )
 
     # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ + АВТО-ОБНОВЛЕНИЕ БАНКА
     m_res = re.search(
@@ -1987,10 +2034,20 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or "личный кабинет" in text
         or "мой аккаунт" in text
     ):
-        return build_user_profile(session, user_id)
+        base_profile = build_user_profile(session, user_id)
+        # достраиваем блок про премиум
+        if is_premium(session, user_id):
+            user = session.get(User, user_id)
+            until_str = user.premium_until.strftime("%d.%m.%Y") if user and user.premium_until else "неизвестно"
+            premium_block = f"\n\n💎 Premium: активен до {until_str}."
+        else:
+            premium_block = (
+                "\n\n🔒 Premium: не активен.\n"
+                "Напиши 'премиум', чтобы узнать, что он даёт."
+            )
+        return base_profile + premium_block
 
     # 3) КОМАНДЫ БАНКА
-
     if (
         "состояние банка" in text
         or text.strip() == "мой банк"
@@ -2005,7 +2062,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return _build_bank_status_text(bank)
 
     m_set_bank = re.search(
-        r"(мой\s+банк|установи\s+банк|банк)\s+(\d+([\.,]\д+)?)",
+        r"(мой\s+банк|установи\s+банк|банк)\s+(\d+([\.,]\d+)?)",
         text,
     )
     if m_set_bank:
@@ -2052,6 +2109,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "лучшая ставка недели" in text
         or ("лучш" in text and "ставк" in text and "недел" in text)
     ):
+        if not is_premium(session, user_id):
+            return (
+                "🔒 'Лучшая ставка недели' доступна в премиум-режиме.\n"
+                "Напиши 'премиум', чтобы узнать детали или активировать демо."
+            )
         return build_best_bet_insight(session, user_id)
 
     # 5) ОШИБКА НЕДЕЛИ
@@ -2060,6 +2122,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or ("худш" in text and "ставк" in text and "недел" in text)
         or ("ошибк" in text and "недел" in text)
     ):
+        if not is_premium(session, user_id):
+            return (
+                "🔒 'Ошибка недели' доступна в премиум-режиме.\n"
+                "Напиши 'премиум', чтобы включить."
+            )
         return build_worst_bet_insight(session, user_id)
 
     # 6) РАЗБОР МОИХ РЫНКОВ
@@ -2069,6 +2136,12 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or ("анализ" in text and "рынк" in text)
         or ("мои рынки" in text)
     ):
+        if not is_premium(session, user_id):
+            return (
+                "🔒 Разбор твоих рынков доступен в премиум-режиме.\n"
+                "Я покажу, где ты стабильно льёшь, а где зарабатываешь.\n\n"
+                "Напиши: 'активировать премиум'."
+            )
         return build_user_market_insights(session, user_id)
 
     # 7) ОБЩАЯ СТАТИСТИКА
@@ -2131,6 +2204,18 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or "отчет за неделю" in text
         or ("отч" in text and "недел" in text)
     ):
+        if not is_premium(session, user_id):
+            # лёгкий, но честный paywall
+            stats = get_user_stats(session, user_id)
+            return (
+                "✨ Краткий отчёт за неделю:\n"
+                f"Всего ставок: {stats.total_bets}\n"
+                f"Рассчитано (win/lose): {stats.settled_bets}\n"
+                f"ROI: {stats.roi:.2f}%\n\n"
+                "Расширенный отчёт (ошибка недели, лучшая ставка, рынки, советы)\n"
+                "доступен в премиум-режиме.\n\n"
+                "Напиши: 'премиум' или 'активировать премиум'."
+            )
         return build_weekly_report(session, user_id)
 
     # 8.1) ОТЧЁТ ЗА МЕСЯЦ
@@ -2139,6 +2224,16 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or "отчет за месяц" in text
         or ("отч" in text and "месяц" in text)
     ):
+        if not is_premium(session, user_id):
+            stats = get_user_stats(session, user_id)
+            return (
+                "✨ Краткий отчёт за месяц:\n"
+                f"Всего ставок: {stats.total_bets}\n"
+                f"Рассчитано (win/lose): {stats.settled_bets}\n"
+                f"ROI: {stats.roi:.2f}%\n\n"
+                "Полный месячный отчёт с разбором твоих привычек и рынков доступен в премиум.\n"
+                "Напиши: 'премиум'."
+            )
         return build_monthly_report(session, user_id)
 
     # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
@@ -2168,14 +2263,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
             )
 
-        # build_khl_match_analysis — обычная функция, БЕЗ await
         try:
+            # сейчас build_khl_match_analysis у нас sync, если сделаешь async — можно будет await
             return build_khl_match_analysis(ev)
         except Exception:
             logger.exception("Ошибка внутри build_khl_match_analysis")
             return (
                 "Не смог собрать детальный разбор матча (внутренняя ошибка агента).\n"
-                "Пока можно пользоваться общими командами: "
+                "Я это поправлю, а пока можно пользоваться общими командами: "
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
 
@@ -2315,9 +2410,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         )
 
     if "премиум" in text or "premium" in text:
+        # сюда обычно не дойдём, потому что обработали выше,
+        # но оставим на всякий случай:
         return (
-            "Премиум-режим пока не активирован.\n"
-            "План: value-ставки, расширенная аналитика, персональные рекомендации."
+            "Премиум-режим даёт расширенные отчёты и аналитику по тебе.\n"
+            "Напиши: 'активировать премиум'."
         )
 
     # 15) HELP ПО УМОЛЧАНИЮ
@@ -2347,5 +2444,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'разбор моих рынков'\n"
         "• 'КХЛ сегодня'\n"
         "• 'анализ матча 123456'\n"
+        "• 'премиум'\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
     )
