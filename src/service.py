@@ -2093,7 +2093,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_monthly_report(session, user_id)
 
-         # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
+            # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
@@ -2120,8 +2120,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
             )
 
-        # ⚙️ ключевой момент: теперь разбора матча — async и использует хоккейную модель
-        return await build_khl_match_analysis(ev)
+        # ✅ БЕЗ await — это обычная функция, которая возвращает строку
+        return build_khl_match_analysis(ev)
+
 
 
 
