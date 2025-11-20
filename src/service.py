@@ -96,16 +96,26 @@ def root():
 
 # ---------- SAFE-ХЕЛПЕР ДЛЯ ФОРМЫ КОМАНДЫ ----------
 
-async def _get_team_form_safe(team_name: str) -> TeamForm:
-    """
-    Универсальный вызов get_team_form:
-    - если get_team_form async → ждём через await
-    - если sync → вызываем напрямую.
-    Так не важно, как реализован khl_form_client.
-    """
-    if inspect.iscoroutinefunction(get_team_form):
-        return await get_team_form(team_name)
-    return get_team_form(team_name)
+async def get_team_form_safe(team_name: str) -> TeamForm | None:
+    try:
+        if inspect.iscoroutinefunction(get_team_form):
+            return await get_team_form(team_name)
+        return get_team_form(team_name)
+    except Exception:
+        logger.exception("Ошибка при получении формы команды %s", team_name)
+        return None
+
+
+# ---------- NEW: SAFE advanced form getter (PRO version) ----------
+async def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+    try:
+        if inspect.iscoroutinefunction(get_team_advanced_form):
+            return await get_team_advanced_form(team_name)
+        return get_team_advanced_form(team_name)
+    except Exception:
+        logger.exception("Ошибка при получении TeamAdvancedForm для %s", team_name)
+        return None
+
 
 
 # ---------- API-ЭНДПОИНТЫ ДЛЯ АГЕНТА ----------
