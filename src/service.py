@@ -11,7 +11,7 @@ from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
-from .db import init_db, get_session
+from .db import init_db, get_session, User
 from .bets_db import (
     get_user_stats,
     add_bet,
@@ -37,6 +37,17 @@ import inspect
 
 logger = logging.getLogger(__name__)
 
+def is_premium(session: Session, user_id: int) -> bool:
+    """
+    Простая проверка: активен ли премиум у пользователя.
+    """
+    user = session.get(User, user_id)
+    if not user or not getattr(user, "premium_until", None):
+        return False
+    # сравниваем с UTC, чтобы не завязываться на локальное время
+    return user.premium_until > datetime.utcnow()
+
+
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
     Заглушка для PRO-формы команды.
@@ -47,6 +58,20 @@ def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     обновим эту функцию и начнём использовать PRO-метрики.
     """
     return None
+
+
+
+def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+    """
+    Заглушка для PRO-формы команды.
+
+    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
+    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
+    Когда появится get_team_advanced_form в khl_form_client, просто
+    обновим эту функцию и начнём использовать PRO-метрики.
+    """
+    return None
+
 
 
 def build_khl_match_analysis(ev) -> str:
