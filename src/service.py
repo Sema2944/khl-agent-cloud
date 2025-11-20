@@ -2015,7 +2015,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return _build_bank_status_text(bank)
 
     m_set_bank = re.search(
-        r"(мой\s+банк|установи\s+банк|банк)\s+(\d+([\.,]\d+)?)",
+        r"(мой\s+банк|установи\s+банк|банк)\s+(\d+([\.,]\д+)?)",
         text,
     )
     if m_set_bank:
@@ -2151,7 +2151,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_monthly_report(session, user_id)
 
-           # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
+    # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
@@ -2178,20 +2178,16 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
             )
 
-        # ВАЖНО: build_khl_match_analysis — async, поэтому его нужно await-ить
+        # build_khl_match_analysis — обычная функция, БЕЗ await
         try:
-            return await build_khl_match_analysis(ev)
+            return build_khl_match_analysis(ev)
         except Exception:
             logger.exception("Ошибка внутри build_khl_match_analysis")
             return (
                 "Не смог собрать детальный разбор матча (внутренняя ошибка агента).\n"
-                "Я это поправлю, а пока можно пользоваться общими командами: "
+                "Пока можно пользоваться общими командами: "
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
-
-
-
-
 
     # 10) ОЦЕНКА СТАВКИ
     if (
@@ -2265,7 +2261,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-       # 13) ДОБАВЛЕНИЕ СТАВКИ
+    # 13) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -2312,7 +2308,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
 
         return "\n".join(resp_lines)
-
 
     # 14) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
@@ -2364,4 +2359,3 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         "• 'анализ матча 123456'\n"
         "• или напиши 'меню', чтобы увидеть основные разделы."
     )
-
