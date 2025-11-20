@@ -1650,12 +1650,11 @@ def build_user_profile(session: Session, user_id: int) -> str:
 
 def build_khl_match_analysis(ev) -> str:
     """
-    Высокоуровневый разбор матча КХЛ.
+    Базовый и максимально устойчивый разбор матча КХЛ.
 
-    На выходе — готовый текст для бота:
-    - линия 1X2 + имплайд-вероятности и "честные" проценты;
-    - если получается — хоккейный матчап (темп, тоталы, вратари, риск апсета);
-    - безопасно обрабатывает любые ошибки: в худшем случае показывает только линию.
+    Специально без вызовов формы/модели, чтобы:
+    - не ловить 500-ки;
+    - всегда отдавать хотя бы разбор линии 1X2.
     """
 
     team1_name = getattr(ev, "team1", "Команда 1")
@@ -1685,9 +1684,11 @@ def build_khl_match_analysis(ev) -> str:
         price = getattr(o, "price", None)
         if not key or price is None:
             continue
-        odds_map[key] = float(price)
+        try:
+            odds_map[key] = float(price)
+        except (TypeError, ValueError):
+            continue
 
-    # Нормально обрабатываем разные обозначения (1, X, 2 / HOME, DRAW, AWAY и т.п.)
     def _pick_odds(*names: str) -> float | None:
         for n in names:
             if n in odds_map:
@@ -1699,15 +1700,25 @@ def build_khl_match_analysis(ev) -> str:
     odds_2 = _pick_odds("2", "AWAY")
 
     if odds_1 is None or odds_x is None or odds_2 is None:
-        return (
-            f"📊 Разбор матча КХЛ:\n"
-            f"{team1_name} — {team2_name} (id: {event_id})\n\n"
-            "По этому матчу нашёлся рынок, но не удалось корректно прочитать все три "
-            "коэффициента 1X2. Показываю только то, что есть:\n"
-            + "\n".join(f"• {k}: {v}" for k, v in odds_map.items())
+        # На всякий случай — показываем всё, что есть
+        lines = [
+            f"📊 Разбор матча КХЛ:",
+            f"{team1_name} — {team2_name} (id: {event_id})",
+            "",
+            "Не удалось корректно прочитать все три коэффициента 1X2.",
+            "Показываю только те исходы, которые нашёл:",
+        ]
+        for k, v in odds_map.items():
+            lines.append(f"• {k}: кэф {v:.2f}")
+        lines.append("")
+        lines.append(
+            "Используй эти коэффициенты как ориентир. "
+            "Для value-чека можешь прогонять конкретный кэф через команды вида "
+            "'value 1.85' или 'проверка кэф 2.3'."
         )
+        return "\n".join(lines)
 
-    # --- 3. Считаем имплайд-вероятности и "честные" проценты ---
+    # --- 3. Имплайд-вероятности и маржа ---
     imp_1 = 100.0 / odds_1
     imp_x = 100.0 / odds_x
     imp_2 = 100.0 / odds_2
@@ -1743,101 +1754,19 @@ def build_khl_match_analysis(ev) -> str:
     lines.append(f"• 1: ≈ {fair_1:.1f}%")
     lines.append(f"• X: ≈ {fair_x:.1f}%")
     lines.append(f"• 2: ≈ {fair_2:.1f}%")
-
-    # --- 4. Пытаемся построить хоккейный матчап (форма, темп, апсет и т.п.) ---
-    try:
-        form1: TeamForm | None = get_team_form(team1_name)
-        form2: TeamForm | None = get_team_form(team2_name)
-    except Exception:
-        logger.exception("Ошибка при получении формы команд для анализа матча")
-        form1 = form2 = None
-
-    if not form1 or not form2:
-        # Формы нет — честно говорим, что даём только линию
-        lines.append("")
-        lines.append(
-            "Не удалось собрать форму команд — показываю только разбор линии 1X2."
-        )
-        lines.append("")
-        lines.append(
-            "Используй это как чек-лист по коэффициентам и вероятностям, "
-            "а не как готовый прогноз. Для оценки value по конкретному исходу "
-            "прогоняй кэф через команды вида 'value 1.85' или 'проверка кэф 2.3'."
-        )
-        return "\n".join(lines)
-
-    # --- 5. Строим снимки силы команд и матчап через hockey_model ---
-    try:
-        snap1 = build_team_strength_from_form(team1_name, form1)
-        snap2 = build_team_strength_from_form(team2_name, form2)
-        matchup = build_matchup_view(snap1, snap2)
-    except Exception:
-        logger.exception("Ошибка при построении хоккейного матчапа")
-        lines.append("")
-        lines.append(
-            "Форма команд частично недоступна, поэтому показываю только линию и базовые проценты."
-        )
-        return "\n".join(lines)
-
-    # --- 6. Добавляем комментарии по темпу, тоталам, вратарям и риску апсета ---
     lines.append("")
-    lines.append("📈 Хоккейный матчап (по модели):")
 
-    # кто фаворит по модели
-    if matchup.model_edge_side == "even":
-        lines.append("• Модель видит матч близким к равному по суммарной силе.")
-    elif matchup.model_edge_side == "team1":
-        lines.append(
-            f"• Небольшой перевес по модели на стороне {team1_name} "
-            f"(уверенность ≈ {matchup.model_edge_confidence:.0f}%)."
-        )
-    else:
-        lines.append(
-            f"• Небольшой перевес по модели на стороне {team2_name} "
-            f"(уверенность ≈ {matchup.model_edge_confidence:.0f}%)."
-        )
-
-    # темп / тотал
-    lines.append(matchup.expected_pace_comment)
-    lines.append(matchup.total_hint_comment)
-
-    # физика / вратари / апсет
-    lines.append(matchup.physicality_comment)
-    lines.append(matchup.goalie_duel_comment)
-    lines.append(f"Риск апсета: {matchup.upset_risk_level}. {matchup.upset_risk_comment}")
-
-    # --- 7. Турнирный / мотивационный контекст через hockey_logic ---
-    try:
-        context_block = build_match_context_notes(
-            team1_name=team1_name,
-            team2_name=team2_name,
-            matchup=matchup,
-            form1=form1,
-            form2=form2,
-        )
-    except TypeError:
-        # если сигнатура другая / старая версия функции — не ломаемся
-        try:
-            context_block = build_match_context_notes(team1_name, team2_name)
-        except Exception:
-            logger.exception("Ошибка в build_match_context_notes (fallback)")
-            context_block = ""
-    except Exception:
-        logger.exception("Ошибка в build_match_context_notes")
-        context_block = ""
-
-    if context_block:
-        lines.append("")
-        lines.append(context_block)
-
-    # --- 8. Финальное напоминание про value и ответственность ---
+    lines.append(
+        "Как использовать:\n"
+        "1) Определи, какой исход ты вообще рассматриваешь (1 / X / 2).\n"
+        "2) Прогоняй кэф через команды вида 'value 1.85' или 'есть ли value в ставке по 2.10' — "
+        "я переведу его в вероятность и дам чек-лист по value.\n"
+        "3) Сравни свою оценку шансов с тем, что закладывает рынок."
+    )
     lines.append("")
     lines.append(
-        "Используй этот разбор как чек-лист для своих решений по ставке, "
-        "а не как готовый прогноз. Если выбираешь конкретный исход — "
-        "прогоняй коэффициент через команды вида 'value 1.85' или "
-        "'есть ли value в ставке по 2.10', чтобы оценить имплайд-вероятность "
-        "и своё возможное преимущество над линией."
+        "Это не прогноз и не команда 'ставить/не ставить', а рабочий чек-лист по линии. "
+        "Финальное решение всегда за тобой."
     )
 
     return "\n".join(lines)
