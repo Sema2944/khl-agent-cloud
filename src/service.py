@@ -35,6 +35,8 @@ from .hockey_model import (
 )
 import inspect
 
+logger = logging.getLogger(__name__)
+
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
     Заглушка для PRO-формы команды.
@@ -47,11 +49,132 @@ def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     return None
 
 
+def build_khl_match_analysis(ev) -> str:
+    """
+    Базовый и максимально устойчивый разбор матча КХЛ.
+
+    Специально без вызовов формы/модели, чтобы:
+    - не ловить 500-ки;
+    - всегда отдавать хотя бы разбор линии 1X2.
+    """
+
+    team1_name = getattr(ev, "team1", "Команда 1")
+    team2_name = getattr(ev, "team2", "Команда 2")
+    event_id = getattr(ev, "id", "—")
+
+    # --- 1. Находим рынок 1X2 ---
+    market_1x2 = None
+    for m in getattr(ev, "markets", []) or []:
+        name = (getattr(m, "name", "") or "").upper()
+        if name in ("1X2", "1X", "3WAY", "3-WAY"):
+            market_1x2 = m
+            break
+
+    if not market_1x2:
+        return (
+            f"📊 Разбор матча КХЛ:\n"
+            f"{team1_name} — {team2_name} (id: {event_id})\n\n"
+            "Я не нашёл рынок 1X2 по этому матчу. "
+            "Попробуй другой матч или позже — возможно, линия ещё не выставлена."
+        )
+
+    # --- 2. Собираем коэффициенты 1 / X / 2 ---
+    odds_map: dict[str, float] = {}
+    for o in getattr(market_1x2, "outcomes", []) or []:
+        key = (getattr(o, "name", "") or "").strip()
+        price = getattr(o, "price", None)
+        if not key or price is None:
+            continue
+        try:
+            odds_map[key] = float(price)
+        except (TypeError, ValueError):
+            continue
+
+    def _pick_odds(*names: str) -> float | None:
+        for n in names:
+            if n in odds_map:
+                return odds_map[n]
+        return None
+
+    odds_1 = _pick_odds("1", "HOME")
+    odds_x = _pick_odds("X", "DRAW")
+    odds_2 = _pick_odds("2", "AWAY")
+
+    if odds_1 is None or odds_x is None or odds_2 is None:
+        # На всякий случай — показываем всё, что есть
+        lines = [
+            f"📊 Разбор матча КХЛ:",
+            f"{team1_name} — {team2_name} (id: {event_id})",
+            "",
+            "Не удалось корректно прочитать все три коэффициента 1X2.",
+            "Показываю только те исходы, которые нашёл:",
+        ]
+        for k, v in odds_map.items():
+            lines.append(f"• {k}: кэф {v:.2f}")
+        lines.append("")
+        lines.append(
+            "Используй эти коэффициенты как ориентир. "
+            "Для value-чека можешь прогонять конкретный кэф через команды вида "
+            "'value 1.85' или 'проверка кэф 2.3'."
+        )
+        return "\n".join(lines)
+
+    # --- 3. Имплайд-вероятности и маржа ---
+    imp_1 = 100.0 / odds_1
+    imp_x = 100.0 / odds_x
+    imp_2 = 100.0 / odds_2
+    imp_sum = imp_1 + imp_x + imp_2
+    margin = imp_sum - 100.0
+
+    if imp_sum > 0:
+        fair_1 = imp_1 / imp_sum * 100.0
+        fair_x = imp_x / imp_sum * 100.0
+        fair_2 = imp_2 / imp_sum * 100.0
+    else:
+        fair_1 = fair_x = fair_2 = 0.0
+
+    lines: list[str] = []
+    lines.append("📊 Разбор матча КХЛ:")
+    lines.append(f"{team1_name} — {team2_name} (id: {event_id})")
+    lines.append("")
+
+    lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
+    lines.append(
+        f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%"
+    )
+    lines.append(
+        f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%"
+    )
+    lines.append(
+        f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%"
+    )
+    lines.append("")
+    lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
+    lines.append("")
+    lines.append("Оценка 'честных' вероятностей (без маржи бука):")
+    lines.append(f"• 1: ≈ {fair_1:.1f}%")
+    lines.append(f"• X: ≈ {fair_x:.1f}%")
+    lines.append(f"• 2: ≈ {fair_2:.1f}%")
+    lines.append("")
+
+    lines.append(
+        "Как использовать:\n"
+        "1) Определи, какой исход ты вообще рассматриваешь (1 / X / 2).\n"
+        "2) Прогоняй кэф через команды вида 'value 1.85' или 'есть ли value в ставке по 2.10' — "
+        "я переведу его в вероятность и дам чек-лист по value.\n"
+        "3) Сравни свою оценку шансов с тем, что закладывает рынок."
+    )
+    lines.append("")
+    lines.append(
+        "Это не прогноз и не команда 'ставить/не ставить', а рабочий чек-лист по линии. "
+        "Финальное решение всегда за тобой."
+    )
+
+    return "\n".join(lines)
+
 
 # 👇 запуск телеграм-бота
 from .telegram_bot import main as run_telegram_bot
-
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent")
 
@@ -63,6 +186,34 @@ class AgentQuery(BaseModel):
 
 class AgentResponse(BaseModel):
     reply: str
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    """
+    Хук старта FastAPI:
+    - инициализируем БД
+    - настраиваем логи
+    - запускаем Telegram-бота в отдельном потоке
+    """
+    logging.basicConfig(level=logging.INFO)
+    init_db()
+    logger.info("FastAPI сервис запущен")
+
+    def _run_tg_bot():
+        try:
+            logger.info("Запускаю Telegram-бота в фонового потоке...")
+            run_telegram_bot()
+        except Exception:
+            logger.exception("Ошибка в Telegram-боте")
+
+    t = threading.Thread(target=_run_tg_bot, name="telegram-bot", daemon=True)
+    t.start()
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "khl-agent"}
 
 
 @app.on_event("startup")
