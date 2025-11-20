@@ -60,6 +60,18 @@ def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     return None
 
 
+def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+    """
+    Заглушка для PRO-формы команды.
+
+    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
+    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
+    Когда появится get_team_advanced_form в khl_form_client, просто
+    обновим эту функцию и начнём использовать PRO-метрики.
+    """
+    return None
+
+
 
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
