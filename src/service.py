@@ -2035,7 +2035,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_monthly_report(session, user_id)
 
-            # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
+           # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
@@ -2062,8 +2062,17 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Сначала напиши 'КХЛ сегодня', выбери id матча из списка, а потом 'анализ матча <id>'."
             )
 
-        # ✅ БЕЗ await — это обычная функция, которая возвращает строку
-        return build_khl_match_analysis(ev)
+        # ВАЖНО: build_khl_match_analysis — async, поэтому его нужно await-ить
+        try:
+            return await build_khl_match_analysis(ev)
+        except Exception:
+            logger.exception("Ошибка внутри build_khl_match_analysis")
+            return (
+                "Не смог собрать детальный разбор матча (внутренняя ошибка агента).\n"
+                "Я это поправлю, а пока можно пользоваться общими командами: "
+                "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
+            )
+
 
 
 
