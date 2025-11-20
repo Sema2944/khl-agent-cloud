@@ -24,12 +24,17 @@ from .bets_db import (
 )
 
 from .khl_client import get_today_khl_events
-from .khl_form_client import get_team_form, TeamForm
+from .khl_form_client import (
+    get_team_form,
+    TeamForm,
+    TeamAdvancedForm,  # 👈 добавили
+)
 from .hockey_model import (
     build_team_strength_from_form,
     build_matchup_view,
 )
 import inspect
+
 async def safe_get_team_form(team_name: str) -> TeamForm | None:
     """
     Безопасный вызов get_team_form:
