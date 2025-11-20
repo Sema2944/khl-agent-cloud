@@ -1812,7 +1812,7 @@ def build_khl_match_analysis(ev) -> str:
     team2_name = getattr(ev, "team2", "Команда 2")
     event_id = getattr(ev, "id", "—")
 
-    # --- 1. Находим рынок 1X2 ---
+    # --- 1. Naходим рынок 1X2 ---
     market_1x2 = None
     for m in getattr(ev, "markets", []) or []:
         name = (getattr(m, "name", "") or "").upper()
@@ -1840,7 +1840,7 @@ def build_khl_match_analysis(ev) -> str:
         except (TypeError, ValueError):
             continue
 
-    def _pick_odds(*names: str) -> float | None:
+    def _pick_odds(*names: str):
         for n in names:
             if n in odds_map:
                 return odds_map[n]
@@ -1851,25 +1851,23 @@ def build_khl_match_analysis(ev) -> str:
     odds_2 = _pick_odds("2", "AWAY")
 
     if odds_1 is None or odds_x is None or odds_2 is None:
-        # На всякий случай — показываем всё, что есть
         lines = [
             f"📊 Разбор матча КХЛ:",
             f"{team1_name} — {team2_name} (id: {event_id})",
             "",
             "Не удалось корректно прочитать все три коэффициента 1X2.",
-            "Показываю только те исходы, которые нашёл:",
+            "Показываю только то, что найдено:",
         ]
         for k, v in odds_map.items():
             lines.append(f"• {k}: кэф {v:.2f}")
         lines.append("")
         lines.append(
-            "Используй эти коэффициенты как ориентир. "
-            "Для value-чека можешь прогонять конкретный кэф через команды вида "
-            "'value 1.85' или 'проверка кэф 2.3'."
+            "Можно прогонять найденные коэффициенты через 'value 1.85' "
+            "— я переведу кэф в вероятность."
         )
         return "\n".join(lines)
 
-    # --- 3. Имплайд-вероятности и маржа ---
+    # --- 3. Имплайд-вероятности ---
     imp_1 = 100.0 / odds_1
     imp_x = 100.0 / odds_x
     imp_2 = 100.0 / odds_2
@@ -1883,44 +1881,30 @@ def build_khl_match_analysis(ev) -> str:
     else:
         fair_1 = fair_x = fair_2 = 0.0
 
-    lines: list[str] = []
+    lines = []
     lines.append("📊 Разбор матча КХЛ:")
     lines.append(f"{team1_name} — {team2_name} (id: {event_id})")
     lines.append("")
-
     lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-    lines.append(
-        f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%"
-    )
-    lines.append(
-        f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%"
-    )
-    lines.append(
-        f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%"
-    )
+    lines.append(f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%")
+    lines.append(f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%")
+    lines.append(f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%")
     lines.append("")
-    lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
+    lines.append(f"Маржа букмекера ≈ {margin:.1f} п.п.")
     lines.append("")
-    lines.append("Оценка 'честных' вероятностей (без маржи бука):")
+    lines.append("Оценка 'честных' вероятностей (без маржи):")
     lines.append(f"• 1: ≈ {fair_1:.1f}%")
     lines.append(f"• X: ≈ {fair_x:.1f}%")
     lines.append(f"• 2: ≈ {fair_2:.1f}%")
     lines.append("")
-
     lines.append(
-        "Как использовать:\n"
-        "1) Определи, какой исход ты вообще рассматриваешь (1 / X / 2).\n"
-        "2) Прогоняй кэф через команды вида 'value 1.85' или 'есть ли value в ставке по 2.10' — "
-        "я переведу его в вероятность и дам чек-лист по value.\n"
-        "3) Сравни свою оценку шансов с тем, что закладывает рынок."
-    )
-    lines.append("")
-    lines.append(
-        "Это не прогноз и не команда 'ставить/не ставить', а рабочий чек-лист по линии. "
-        "Финальное решение всегда за тобой."
+        "Используй это как чек-лист, а не прогноз:\n"
+        "• выбери исход (1/X/2),\n"
+        "• прогоняй кэф через команды вида 'value 2.10'."
     )
 
     return "\n".join(lines)
+
 
 
 
