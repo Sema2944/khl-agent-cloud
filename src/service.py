@@ -2046,7 +2046,7 @@ def build_khl_match_analysis(ev) -> str:
     team2_name = getattr(ev, "team2", "Команда 2")
     event_id = getattr(ev, "id", "—")
 
-    # --- 1. Naходим рынок 1X2 ---
+    # --- 1. Находим рынок 1X2 ---
     market_1x2 = None
     for m in getattr(ev, "markets", []) or []:
         name = (getattr(m, "name", "") or "").upper()
@@ -2137,18 +2137,19 @@ def build_khl_match_analysis(ev) -> str:
         "• прогоняй кэф через команды вида 'value 2.10'."
     )
 
-    # --- 4. Турнирная логика и мотивация (твоё видение) ---
-    lines.extend(
-        _build_tournament_motivation_hint(
-            team1_name=team1_name,
-            team2_name=team2_name,
-            odds_1=odds_1,
-            odds_x=odds_x,
-            odds_2=odds_2,
-        )
-    )
+    # --- 4. Турнирная логика и мотивация (твоя идея про «топ / середняк / дно») ---
+    try:
+        ctx = build_match_context_notes(team1_name, team2_name, league="KHL")
+    except Exception:
+        ctx = ""
+
+    if ctx:
+        lines.append("")
+        lines.append("📌 Турнирный контекст и мотивация:")
+        lines.append(ctx)
 
     return "\n".join(lines)
+
 
 
 
