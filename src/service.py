@@ -2569,14 +2569,40 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
 
-    # 10) ОЦЕНКА СТАВКИ
+      # 10) ОЦЕНКА СТАВКИ
     if (
         "оценка ставки" in text
         or ("что скажешь" in text and "ставк" in text)
         or ("как тебе" in text and "ставк" in text)
         or text.startswith("оценить ставку")
     ):
-        return build_stake_evaluation(session, user_id, original_text)
+        try:
+            result = build_stake_evaluation(session, user_id, original_text)
+        except Exception:
+            logger.exception("Ошибка в build_stake_evaluation")
+            return (
+                "Не смог проанализировать ставку — возможно, она в необычном формате.\n"
+                "Попробуй так: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'"
+            )
+
+        if not result:
+            return (
+                "Я не смог понять параметры ставки.\n"
+                "Формат: 'оценка ставки 1000 на СКА тотал больше 4.5 за 1.82'"
+            )
+
+        # Если премиум — отдаём полный текст
+        if is_premium(session, user_id):
+            return result
+
+        # Если без премиума — отдаём сокращённую версию + апселл
+        short = result.split("\n\n")[0]  # оставляем первый смысловой блок
+
+        return (
+            f"{short}\n\n"
+            "🔒 Полный разбор доступен в премиум-режиме.\n"
+            "Напиши: 'активировать премиум'."
+        )
 
     # 10.1) VALUE-РАЗБОР КЭФА
     if (
