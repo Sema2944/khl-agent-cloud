@@ -247,29 +247,10 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     if worst_bet is not None and getattr(worst_bet, "profit", None) is not None:
         lines.append("")
         lines.append("⚠️ Самая слабая ставка месяца:")
-        bet_dt = worst_bet.created_at
-        date_str = bet_dt.strftime("%d.%m") if bet_dt else "дата неизвестна"
-        lines.append(f"• Дата: {date_str}")
-        if getattr(worst_bet, "raw_text", None):
-            lines.append(f"• {worst_bet.raw_text}")
-        else:
-            parts = []
-            if getattr(worst_bet, "event", None):
-                parts.append(str(worst_bet.event))
-            if getattr(worst_bet, "outcome", None):
-                parts.append(str(worst_bet.outcome))
-            if getattr(worst_bet, "stake", None):
-                parts.append(f"ставка: {worst_bet.stake:g}")
-            if getattr(worst_bet, "odds", None):
-                parts.append(f"кэф: {worst_bet.odds:.2f}")
-            if parts:
-                lines.append("• " + ", ".join(parts))
-        lines.append(f"• Результат: {worst_bet.profit:.0f}")
-
-        lines.append(
-            "Важно не просто зафиксировать минус, а понять причину: "
-            "переоценил команду, зашёл в неудобный рынок или перегрузил банк."
-        )
+            lines.append(
+        "Важно не просто зафиксировать минус, а понять причину: "
+        "переоценил команду, зашёл в неудобный рынок или перегрузил банк."
+    )
 
     # Краткий вывод по стилю игры
     lines.append("")
@@ -277,19 +258,19 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     if roi >= 0:
         lines.append(
             "Месяц в целом в плюсе или около нуля. Это хороший знак: у тебя уже есть рабочие "
-            "паттерны. Задача — отфильтровать лишний мусор и усиливать сильные стороны."
+            "паттерны. Твоя задача — отфильтровать лишний шум и усиливать сильные стороны."
         )
-    else:service.py
+    else:
         lines.append(
-            "Месяц в минусе. Это не приговор, а материал для работы: важно посмотреть, "
-            "какие именно типы ставок тянут результат вниз, и скорректировать стратегию."
+            "Месяц в минусе. Это не приговор, а материал для работы: важно понять, "
+            "какие типы ставок тянут результат вниз, и скорректировать стратегию."
         )
 
     lines.append(
         "\nЧтобы углубиться, попробуй:\n"
         "• 'лучшая ставка недели' — короткий горизонт\n"
         "• 'ошибка недели' — свежие ошибки\n"
-        "• 'разбор моих рынков' — какие типы рынков тебя тянут вверх/вниз"
+        "• 'разбор моих рынков' — какие рынки тебя тянут вверх/вниз"
     )
 
     return "\n".join(lines)
