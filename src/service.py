@@ -1626,7 +1626,7 @@ def build_value_analysis(raw_text: str) -> str:
     lines.append(f"Коэффициент: {odds:.2f}")
     lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
 
-    if user_prob is None:
+        if user_prob is None:
         lines.append("")
         lines.append(
             "Ты не указал свою оценку вероятности.\n"
@@ -1634,11 +1634,12 @@ def build_value_analysis(raw_text: str) -> str:
         )
         lines.append("")
         lines.append(
-            "Пример запроса:\n"
-            "• 'value 1.85 при вероятности 60%'\n"
-            "• 'value ставка по 2.10, шанс 48%'"
+            "Примеры запросов:\n"
+            "• 'оценка ставки 1000 на СКА по 1.85, шанс 60%'\n"
+            "• 'оценка ставки 5000 на ЦСКА по 2.10, вероятность 48%'"
         )
         return "\n".join(lines)
+
 
     # 'справедливый' кэф по твоей оценке
     fair_odds_by_user = 100.0 / user_prob
