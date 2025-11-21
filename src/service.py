@@ -2476,12 +2476,14 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
 
-      # 10) ОЦЕНКА СТАВКИ
+          # 10) ОЦЕНКА СТАВКИ
     if (
         "оценка ставки" in text
-        or ("что скажешь" in text and "ставк" in text)
-        or ("как тебе" in text and "ставк" in text)
-        or text.startswith("оценить ставку")
+        or ("оцен" in text and "ставк" in text)               # «оцени ставку…»
+        or ("разбор" in text and "ставк" in text)             # «разбор ставки…»
+        or ("что скажешь" in text and "ставк" in text)        # «что скажешь про ставку…»
+        or ("как тебе" in text and "ставк" in text)           # «как тебе ставка…»
+        or text.startswith("оценить ставку")                  # «оценить ставку…»
     ):
         try:
             result = build_stake_evaluation(session, user_id, original_text)
@@ -2489,21 +2491,21 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             logger.exception("Ошибка в build_stake_evaluation")
             return (
                 "Не смог проанализировать ставку — возможно, она в необычном формате.\n"
-                "Попробуй так: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'"
+                "Попробуй так: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'."
             )
 
         if not result:
             return (
                 "Я не смог понять параметры ставки.\n"
-                "Формат: 'оценка ставки 1000 на СКА тотал больше 4.5 за 1.82'"
+                "Используй формат: 'оценка ставки 1000 на СКА тотал больше 4.5 за 1.82'."
             )
 
-        # Если премиум — отдаём полный текст
+        # -------- Премиум / Не премиум --------
         if is_premium(session, user_id):
-            return result
+            return result  # отдаём полный разбор
 
-        # Если без премиума — отдаём сокращённую версию + апселл
-        short = result.split("\n\n")[0]  # оставляем первый смысловой блок
+        # Без премиума → отдаем только первый смысловой блок
+        short = result.split("\n\n")[0]
 
         return (
             f"{short}\n\n"
