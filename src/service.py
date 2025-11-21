@@ -146,134 +146,122 @@ def build_weekly_report(session: Session, user_id: int) -> str:
 
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
-    Месячный отчёт по игре пользователя: итоги, лучшая/худшая ставка, краткий разбор.
-    Берём последние 30 дней от текущей даты (UTC).
+    Отчёт за последние 30 дней по ставкам пользователя.
+    Берём все ставки пользователя и фильтруем по дате created_at.
     """
-    from .bets_db import get_all_bets  # уже импортирован сверху, но так функция самодостаточна
+    from .bets_db import get_all_bets  # чтобы функция была автономной
 
-    today = datetime.utcnow().date()
-    start_date = today - timedelta(days=30)
+    today = datetime.utcnow()
+    period_start = today - timedelta(days=30)
 
-    all_bets = get_all_bets(session, user_id) or []
+    bets_all = get_all_bets(session, user_id) or []
 
-    # Фильтруем ставки по дате за последние 30 дней
-    period_bets: list = []
-    for b in all_bets:
-        if not getattr(b, "created_at", None):
-            continue
-        bet_date = b.created_at.date()
-        if start_date <= bet_date <= today:
-            period_bets.append(b)
+    # фильтруем только те, у кого есть created_at и он в пределах 30 дней
+    bets = [
+        b for b in bets_all
+        if getattr(b, "created_at", None) is not None
+        and b.created_at >= period_start
+    ]
 
-    if not period_bets:
+    if not bets:
         return (
-            f"📈 Отчёт за последние 30 дней "
-            f"({start_date.strftime('%d.%m')}–{today.strftime('%d.%m')}):\n"
             "За последние 30 дней у тебя не было записанных ставок. "
             "Как только набросаешь историю за месяц, я соберу подробный отчёт."
         )
 
-    # Базовые метрики
-    total_bets = len(period_bets)
-    settled = [b for b in period_bets if getattr(b, "result", None) in ("win", "lose")]
-    pushes = [b for b in period_bets if getattr(b, "result", None) == "push"]
+    # базовые выборки
+    settled = [b for b in bets if getattr(b, "result", None) in ("win", "lose")]
+    pushes = [b for b in bets if getattr(b, "result", None) == "push"]
+    wins = [b for b in settled if b.result == "win"]
 
+    total_bets = len(bets)
     settled_count = len(settled)
     pushes_count = len(pushes)
 
-    wins = [b for b in settled if b.result == "win"]
-    winrate = (len(wins) / settled_count * 100) if settled_count > 0 else 0.0
+    total_stake = sum(
+        float(b.stake) for b in bets
+        if getattr(b, "stake", None) is not None
+    )
+    total_pnl = sum(
+        float(b.profit) for b in bets
+        if getattr(b, "profit", None) is not None
+    )
 
-    pnl = 0.0
-    total_stake = 0.0
-    for b in period_bets:
-        if getattr(b, "profit", None) is not None:
-            pnl += b.profit
-        if getattr(b, "stake", None) is not None:
-            total_stake += float(b.stake)
+    winrate = (len(wins) / settled_count * 100.0) if settled_count > 0 else 0.0
+    roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else 0.0
 
-    roi = (pnl / total_stake * 100) if total_stake > 0 else 0.0
+    # лучшая / худшая ставка по прибыли
+    bets_with_profit = [
+        b for b in bets
+        if getattr(b, "profit", None) is not None
+    ]
+    best_bet = max(bets_with_profit, key=lambda b: b.profit) if bets_with_profit else None
+    worst_bet = min(bets_with_profit, key=lambda b: b.profit) if bets_with_profit else None
 
-    # Лучшая / худшая ставка по прибыли
-    profitable_bets = [b for b in period_bets if getattr(b, "profit", None) is not None]
-    best_bet = max(profitable_bets, key=lambda b: b.profit) if profitable_bets else None
-    worst_bet = min(profitable_bets, key=lambda b: b.profit) if profitable_bets else None
+    period_str = f"{period_start:%d.%m}–{today:%d.%m}"
 
     lines: list[str] = []
-
-    # Шапка отчёта
-    lines.append(
-        f"📈 Отчёт за последние 30 дней "
-        f"({start_date.strftime('%d.%m')}–{today.strftime('%d.%m')}):"
-    )
+    lines.append(f"📈 Отчёт за последние 30 дней ({period_str}):")
     lines.append(f"Всего ставок: {total_bets}")
     lines.append(f"Рассчитано (win/lose): {settled_count}")
     if pushes_count:
         lines.append(f"Возвратов: {pushes_count}")
     lines.append(f"Винрейт: {winrate:.1f}%")
     lines.append(f"ROI: {roi:.2f}%")
-    lines.append(f"PnL за период: {pnl:.0f}")
+
+    sign_pnl = "+" if total_pnl >= 0 else ""
+    lines.append(f"PnL за период: {sign_pnl}{total_pnl:.0f}")
     lines.append(f"Общий объём ставок: {total_stake:.0f}")
 
     # Лучшая ставка месяца
-    if best_bet is not None and getattr(best_bet, "profit", None) is not None:
+    if best_bet is not None:
         lines.append("")
         lines.append("🏆 Лучшая ставка месяца:")
-        bet_dt = best_bet.created_at
-        date_str = bet_dt.strftime("%d.%m") if bet_dt else "дата неизвестна"
-        lines.append(f"• Дата: {date_str}")
+        if getattr(best_bet, "created_at", None):
+            lines.append(f"• Дата: {best_bet.created_at:%d.%m %H:%M}")
         if getattr(best_bet, "raw_text", None):
             lines.append(f"• {best_bet.raw_text}")
-        else:
-            parts: list[str] = []
-            if getattr(best_bet, "event", None):
-                parts.append(str(best_bet.event))
-            if getattr(best_bet, "outcome", None):
-                parts.append(str(best_bet.outcome))
-            if getattr(best_bet, "stake", None):
-                parts.append(f"ставка: {best_bet.stake:g}")
-            if getattr(best_bet, "odds", None):
-                parts.append(f"кэф: {best_bet.odds:.2f}")
-            if parts:
-                lines.append("• " + ", ".join(parts))
         lines.append(f"• Результат: +{best_bet.profit:.0f}")
 
-        lines.append(
-            "Идея: посмотри, что именно ты увидел в этом матче/рынке. "
-            "Такие решения стоит искать и повторять."
-        )
-
-    # Худшая ставка месяца
-    if worst_bet is not None and getattr(worst_bet, "profit", None) is not None:
+    # Самая слабая ставка месяца
+    if worst_bet is not None and worst_bet is not best_bet:
         lines.append("")
         lines.append("⚠️ Самая слабая ставка месяца:")
-            lines.append(
-        "Важно не просто зафиксировать минус, а понять причину: "
-        "переоценил команду, зашёл в неудобный рынок или перегрузил банк."
-    )
+        if getattr(worst_bet, "created_at", None):
+            lines.append(f"• Дата: {worst_bet.created_at:%d.%m %H:%M}")
+        if getattr(worst_bet, "raw_text", None):
+            lines.append(f"• {worst_bet.raw_text}")
+        sign_w = "+" if worst_bet.profit >= 0 else ""
+        lines.append(f"• Результат: {sign_w}{worst_bet.profit:.0f}")
 
-    # Краткий вывод по стилю игры
+        lines.append(
+            "Важно не просто зафиксировать минус, а понять причину: "
+            "переоценил команду, зашёл в неудобный рынок или перегрузил банк."
+        )
+
+    # Краткий вывод
     lines.append("")
     lines.append("🧠 Вывод по месяцу:")
     if roi >= 0:
         lines.append(
             "Месяц в целом в плюсе или около нуля. Это хороший знак: у тебя уже есть рабочие "
-            "паттерны. Твоя задача — отфильтровать лишний шум и усиливать сильные стороны."
+            "паттерны. Задача — отфильтровать лишний мусор и усиливать сильные стороны."
         )
     else:
         lines.append(
-            "Месяц в минусе. Это не приговор, а материал для работы: важно понять, "
-            "какие типы ставок тянут результат вниз, и скорректировать стратегию."
+            "Месяц в минусе. Это не приговор, а материал для работы: важно посмотреть, "
+            "какие именно типы ставок тянут результат вниз, и скорректировать стратегию."
         )
 
     lines.append(
         "\nЧтобы углубиться, попробуй:\n"
         "• 'лучшая ставка недели' — короткий горизонт\n"
         "• 'ошибка недели' — свежие ошибки\n"
-        "• 'разбор моих рынков' — какие рынки тебя тянут вверх/вниз"
+        "• 'разбор моих рынков' — какие типы рынков тебя тянут вверх/вниз"
     )
 
     return "\n".join(lines)
+
 
 
 
