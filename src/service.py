@@ -1566,6 +1566,7 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
     )
 
     return "\n".join(lines)
+    
 def build_value_analysis(raw_text: str) -> str:
     """
     Value-разбор кэфа:
@@ -1592,7 +1593,7 @@ def build_value_analysis(raw_text: str) -> str:
         except ValueError:
             user_prob = None
 
-    # вариант: 'вероятн 60', 'оценка 55', 'шанс 62'
+        # вариант: 'вероятн 60', 'оценка 55', 'шанс 62'
     if user_prob is None:
         m_prob = re.search(
             r"(вероятн|оценк|шанс)[^\d]{0,10}(\d+([\.,]\d+)?)",
@@ -1603,6 +1604,11 @@ def build_value_analysis(raw_text: str) -> str:
                 user_prob = float(m_prob.group(2).replace(",", "."))
             except ValueError:
                 user_prob = None
+
+    # ограничим адекватный диапазон
+    if user_prob is not None and not (0 < user_prob < 100):
+        user_prob = None
+
 
     # ограничим адекватный диапазон
     if user_prob is not None and not (0 < user_prob < 100):
