@@ -2476,40 +2476,72 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
 
-          # 10) ОЦЕНКА СТАВКИ
+             # 10) ОЦЕНКА СТАВКИ
     if (
         "оценка ставки" in text
-        or ("оцен" in text and "ставк" in text)               # «оцени ставку…»
-        or ("разбор" in text and "ставк" in text)             # «разбор ставки…»
-        or ("что скажешь" in text and "ставк" in text)        # «что скажешь про ставку…»
-        or ("как тебе" in text and "ставк" in text)           # «как тебе ставка…»
-        or text.startswith("оценить ставку")                  # «оценить ставку…»
+        or ("что скажешь" in text and "ставк" in text)
+        or ("как тебе" in text and "ставк" in text)
+        or text.startswith("оценить ставку")
     ):
+        detailed_result: str | None = None
+        value_result: str | None = None
+
+        # 1) Пытаемся сделать полноценный разбор ставки (по истории / профилю)
         try:
-            result = build_stake_evaluation(session, user_id, original_text)
+            detailed_result = build_stake_evaluation(session, user_id, original_text)
         except Exception:
             logger.exception("Ошибка в build_stake_evaluation")
+
+        # 2) Параллельно считаем value-разбор по кэфу и вероятности из текста
+        try:
+            value_result = build_value_analysis(original_text)
+        except Exception:
+            logger.exception("Ошибка в build_value_analysis")
+            value_result = None
+
+        # 3) Если вообще ничего не получилось — честно говорим об этом
+        if not detailed_result and not value_result:
             return (
-                "Не смог проанализировать ставку — возможно, она в необычном формате.\n"
-                "Попробуй так: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'."
+                "Я не смог разобрать эту ставку.\n"
+                "Попробуй один из форматов:\n"
+                "• 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
+                "• 'оценка ставки 5000 на Зенит победа за 1.75'\n"
+                "• или добавь вероятность: 'оценка ставки 1000 на СКА по 1.85, шанс 60%'"
             )
 
-        if not result:
-            return (
-                "Я не смог понять параметры ставки.\n"
-                "Используй формат: 'оценка ставки 1000 на СКА тотал больше 4.5 за 1.82'."
-            )
-
-        # -------- Премиум / Не премиум --------
+        # 4) Премиум-пользователь: отдаём всё, что есть, без урезаний
         if is_premium(session, user_id):
-            return result  # отдаём полный разбор
+            parts: list[str] = []
 
-        # Без премиума → отдаем только первый смысловой блок
-        short = result.split("\n\n")[0]
+            if detailed_result:
+                parts.append(detailed_result)
+
+            if value_result:
+                # Добавляем пустую строку-разделитель между блоками
+                parts.append("")
+                parts.append(value_result)
+
+            return "\n".join(parts)
+
+        # 5) Без премиума: короткий preview + value-разбор + апселл
+        preview_lines: list[str] = []
+
+        if detailed_result:
+            # Берём первый смысловой блок из подробного разбора
+            preview_lines.append(detailed_result.split("\n\n")[0])
+
+        if value_result:
+            preview_lines.append("")
+            preview_lines.append(value_result)
+
+        preview_text = "\n".join(preview_lines) if preview_lines else (
+            value_result or "Я разобрал ставку, но не смог корректно собрать текст ответа."
+        )
 
         return (
-            f"{short}\n\n"
-            "🔒 Полный разбор доступен в премиум-режиме.\n"
+            f"{preview_text}\n\n"
+            "🔒 Расширенный разбор ставки (глубже по твоей статистике, рискам и динамике банка)\n"
+            "доступен в премиум-режиме.\n"
             "Напиши: 'активировать премиум'."
         )
 
