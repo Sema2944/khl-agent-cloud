@@ -37,6 +37,7 @@ import inspect
 
 logger = logging.getLogger(__name__)
 
+
 def is_premium(session: Session, user_id: int) -> bool:
     """
     Простая проверка: активен ли премиум у пользователя.
@@ -48,29 +49,76 @@ def is_premium(session: Session, user_id: int) -> bool:
     return user.premium_until > datetime.utcnow()
 
 
-def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+def build_weekly_report(session: Session, user_id: int) -> str:
     """
-    Заглушка для PRO-формы команды.
-
-    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
-    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
-    Когда появится get_team_advanced_form в khl_form_client, просто
-    обновим эту функцию и начнём использовать PRO-метрики.
+    Простая MVP-версия недельного отчёта.
+    Пока считаем общую статистику, позже добавим фильтрацию по датам.
     """
-    return None
+    stats = get_user_stats(session, user_id)
+
+    if stats.total_bets == 0:
+        return (
+            "✨ Недельный отчёт\n\n"
+            "Пока у тебя нет ни одной сохранённой ставки.\n"
+            "Начни с первой: 'ставка 1000 на СКА тотал больше 5.5 за 1.9'."
+        )
+
+    if stats.settled_bets == 0 and stats.pushes == 0:
+        return (
+            "✨ Недельный отчёт\n\n"
+            f"Всего ставок: {stats.total_bets}\n"
+            "Пока ни одна ставка не рассчитана (нет win/lose).\n"
+            "Когда отметишь результаты, я посчитаю винрейт и ROI."
+        )
+
+    lines: list[str] = []
+    lines.append("✨ Недельный отчёт (MVP-версия)\n")
+    lines.append(f"Всего ставок: {stats.total_bets}")
+    lines.append(f"Рассчитано (win/lose): {stats.settled_bets}")
+    if stats.pushes:
+        lines.append(f"Возвратов: {stats.pushes}")
+    lines.append(f"Винрейт: {stats.winrate:.1f}%")
+    lines.append(f"ROI: {stats.roi:.2f}%")
+    lines.append(f"Плюс/минус: {stats.pnl:.0f}")
+    lines.append(f"Общий объём ставок: {stats.total_stake:.0f}")
+
+    lines.append(
+        "\nСовет недели:\n"
+        "• Держи фиксированный % от банка на ставку.\n"
+        "• Не догоняй проигрыш следующей ставкой.\n"
+        "• Фокусируйся на рынках, которые стабильно плюсуют."
+    )
+
+    return "\n".join(lines)
 
 
-def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
+def build_monthly_report(session: Session, user_id: int) -> str:
     """
-    Заглушка для PRO-формы команды.
-
-    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
-    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
-    Когда появится get_team_advanced_form в khl_form_client, просто
-    обновим эту функцию и начнём использовать PRO-метрики.
+    Простая MVP-версия месячного отчёта.
+    Пока без фильтрации по датам.
     """
-    return None
+    stats = get_user_stats(session, user_id)
 
+    if stats.total_bets == 0:
+        return (
+            "✨ Месячный отчёт\n\n"
+            "Пока нет ставок, поэтому отчёт пуст.\n"
+            "Как только начнёшь вести историю — покажу картину."
+        )
+
+    lines: list[str] = []
+    lines.append("✨ Месячный отчёт (MVP-версия)\n")
+    lines.append(f"Всего ставок: {stats.total_bets}")
+    lines.append(f"Рассчитано (win/lose): {stats.settled_bets}")
+    if stats.pushes:
+        lines.append(f"Возвратов: {stats.pushes}")
+    if stats.settled_bets > 0:
+        lines.append(f"Винрейт: {stats.winrate:.1f}%")
+        lines.append(f"ROI: {stats.roi:.2f}%")
+        lines.append(f"PnL: {stats.pnl:.0f}")
+        lines.append(f"Общий объём ставок: {stats.total_stake:.0f}")
+
+    return "\n".join(lines)
 
 
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
