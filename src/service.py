@@ -2803,7 +2803,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         return build_khl_today_matches_demo()
 
-        )
 
     # 12) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
