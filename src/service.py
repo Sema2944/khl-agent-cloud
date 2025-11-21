@@ -1960,6 +1960,76 @@ def build_user_profile(session: Session, user_id: int) -> str:
     )
 
     return "\n".join(lines)
+def _build_tournament_motivation_hint(
+    team1_name: str,
+    team2_name: str,
+    odds_1: float,
+    odds_x: float,
+    odds_2: float,
+) -> list[str]:
+    """
+    Хинт по 'турнирной логике' и мотивации на основе линии 1X2.
+    Это приближение: мы не знаем реальную таблицу, но видим силу/разрыв по кэфам.
+    """
+    lines: list[str] = []
+
+    # Определяем фаворита и андердога по кэфам
+    fav_side = None
+    fav_odds = None
+    dog_side = None
+    dog_odds = None
+
+    if odds_1 < odds_2:
+        fav_side, fav_odds = "1", odds_1
+        dog_side, dog_odds = "2", odds_2
+        fav_name, dog_name = team1_name, team2_name
+    else:
+        fav_side, fav_odds = "2", odds_2
+        dog_side, dog_odds = "1", odds_1
+        fav_name, dog_name = team2_name, team1_name
+
+    # Базовый комментарий только если фаворит выраженный
+    # Например, фаворит ≤ 1.55 и андердог ≥ 3.50
+    if fav_odds <= 1.55 and dog_odds >= 3.50:
+        lines.append("")
+        lines.append("🧠 Турнирная логика и мотивация:")
+
+        lines.append(
+            f"По линии видно, что {fav_name} — явный фаворит ({fav_side} за {fav_odds:.2f}), "
+            f"а {dog_name} — андердог ({dog_side} за {dog_odds:.2f})."
+        )
+
+        # Риск "расслабленного" матча против слабого
+        lines.append(
+            "В таких матчах топ-команды часто играют аккуратнее по ходу сезона: "
+            "могут экономить силы, давать больше времени молодым и не 'давить' весь матч."
+        )
+
+        # Ничья / ОТ
+        if odds_x <= 4.20:
+            lines.append(
+                "Кэф на ничью не зашкаливает — рынок допускает сценарий, когда фаворит "
+                "спокойно доводит игру до равного счёта и решает всё в ОТ/буллитах."
+            )
+        else:
+            lines.append(
+                "Кэф на ничью высокий, но всё равно в матчах 'топ vs аутсайдер' нередко видим "
+                "равную концовку, если фаворит не включает максимум."
+            )
+
+        # Что такие матчи значат для ставок
+        lines.append(
+            "Для ставок это значит, что чистая победа фаворита в основное время по низкому кэфу "
+            "несёт дополнительный риск: команда может 'не дожимать' аутсайдера."
+        )
+        lines.append(
+            "Чаще в таких расстановках рассматривают:\n"
+            "• аккуратные форы на аутсайдера (+1.5 / +2.5),\n"
+            "• ничью или игру через ОТ/буллиты,\n"
+            "• тоталы с учётом возможного низкого темпа (если нет явного 'безумного' хоккея)."
+        )
+
+    return lines
 
 
 def build_khl_match_analysis(ev) -> str:
@@ -2044,7 +2114,7 @@ def build_khl_match_analysis(ev) -> str:
     else:
         fair_1 = fair_x = fair_2 = 0.0
 
-    lines = []
+    lines: list[str] = []
     lines.append("📊 Разбор матча КХЛ:")
     lines.append(f"{team1_name} — {team2_name} (id: {event_id})")
     lines.append("")
@@ -2066,7 +2136,19 @@ def build_khl_match_analysis(ev) -> str:
         "• прогоняй кэф через команды вида 'value 2.10'."
     )
 
+    # --- 4. Турнирная логика и мотивация (твоё видение) ---
+    lines.extend(
+        _build_tournament_motivation_hint(
+            team1_name=team1_name,
+            team2_name=team2_name,
+            odds_1=odds_1,
+            odds_x=odds_x,
+            odds_2=odds_2,
+        )
+    )
+
     return "\n".join(lines)
+
 
 
 
