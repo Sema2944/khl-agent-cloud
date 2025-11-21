@@ -2799,13 +2799,10 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_value_analysis(original_text)
 
-    # 11) МАТЧИ КХЛ НА СЕГОДНЯ (демо-режим: один матч)
+       # 11) МАТЧИ КХЛ НА СЕГОДНЯ (демо-режим, несколько матчей)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
-        return (
-            "Матчи КХЛ на сегодня:\n"
-            "СКА — ЦСКА (id: 123456) | 1X2: 1: 1.85, X: 3.9, 2: 2.1\n\n"
-            "Чтобы получить разбор конкретного матча, напиши, например: "
-            "'анализ матча 123456' (используй id из списка выше)."
+        return build_khl_today_matches_demo()
+
         )
 
     # 12) МОИ СТАВКИ
