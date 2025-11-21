@@ -295,6 +295,7 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
+
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
     Заглушка для PRO-формы команды.
