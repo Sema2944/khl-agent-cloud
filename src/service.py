@@ -1582,7 +1582,6 @@ def build_value_analysis(raw_text: str) -> str:
 
     # 2) достаём пользовательскую вероятность
     text = raw_text.lower()
-
     user_prob: float | None = None
 
     # вариант: '60%' / '60 %'
@@ -1606,9 +1605,8 @@ def build_value_analysis(raw_text: str) -> str:
                 user_prob = None
 
     # ограничим адекватный диапазон
-    if user_prob is not None:
-        if not (0 < user_prob < 100):
-            user_prob = None
+    if user_prob is not None and not (0 < user_prob < 100):
+        user_prob = None
 
     lines: list[str] = []
     lines.append("🎯 Value-разбор ставки:")
@@ -1680,6 +1678,8 @@ def build_value_analysis(raw_text: str) -> str:
     )
 
     return "\n".join(lines)
+
+
 def _build_quick_bet_comment(
     stake: float | None,
     odds: float | None,
@@ -1751,100 +1751,7 @@ def _build_quick_bet_comment(
         "Это не команда «ставить / не ставить», а короткий чек-лист, чтобы ты сам оценил идею ставки."
     )
     return lines
-def build_value_analysis(raw_text: str) -> str:
-    """
-    Простейший value-разбор коэффициента по тексту.
-    Логика:
-    1) Пытаемся вытащить кэф через общий парсер ставок (_parse_stake_and_odds)
-       — он ловит конструкции типа 'по 1.9', 'кэф 2.1' и т.п.
-    2) Если не получилось — просто ищем число в тексте и считаем, что это кэф.
-    """
-    # 1) Пытаемся вытащить кэф обычным парсером
-    _, odds = _parse_stake_and_odds(raw_text)
 
-    # 2) Если не нашли — пробуем просто взять число из текста
-    if odds is None:
-        num_matches = re.findall(r"(\d+([\.,]\d+)?)", raw_text)
-        if num_matches:
-            # Берём последнее число в строке — чаще всего это и есть кэф
-            candidate_str = num_matches[-1][0]
-            try:
-                candidate = float(candidate_str.replace(",", "."))
-                if candidate >= 1.01:
-                    odds = candidate
-            except ValueError:
-                odds = None
-
-    lines: list[str] = []
-    lines.append("🎯 Проверка коэффициента (value-чеклист):")
-    clean = raw_text.strip()
-    if clean:
-        lines.append(f"Текст: {clean}")
-    lines.append("")
-
-    if odds is None or odds < 1.01:
-        lines.append(
-            "Я не смог понять коэффициент из текста.\n"
-            "Напиши, например:\n"
-            "• 'value 1.85'\n"
-            "• 'проверка кэф 2.3'\n"
-            "• 'есть ли value в ставке по 1.70'"
-        )
-        return "\n".join(lines)
-
-    # Имплайд-вероятность
-    implied = 100.0 / odds
-    lines.append(f"Коэффициент: {odds:.2f}")
-    lines.append(f"Имплайд-вероятность (что закладывает букмекер): ≈ {implied:.1f}%")
-    lines.append("")
-
-    # Интерпретация диапазона кэфа
-    if odds < 1.40:
-        lines.append(
-            "• Очень низкий кэф — рынок говорит, что событие почти обязано зайти.\n"
-            "  В таких местах value редко бывает большим: маржа бука и редкие минусы сильно бьют по банку."
-        )
-    elif odds < 1.80:
-        lines.append(
-            "• Умеренный кэф — это зона фаворитов. Value чаще всего возникает, "
-            "если рынок недооценил форму/состав или ты лучше читаешь матчап."
-        )
-    elif odds <= 3.00:
-        lines.append(
-            "• Рабочий диапазон кэфов. Здесь чаще всего и живут интересные value-ставки: "
-            "всё решает твою оценку вероятности."
-        )
-    else:
-        lines.append(
-            "• Высокий кэф — это про редкие события. Value бывает, но важно не путать его "
-            "с простым желанием поймать большой коэффициент."
-        )
-
-    lines.append("")
-    lines.append("Как понять, есть ли value лично для тебя:")
-
-    lines.append(
-        "1) Спроси себя честно: *какова реальная вероятность, что ставка зайдёт?* "
-        "Например, ты считаешь, что шанс 60%."
-    )
-    lines.append(
-        "2) Посчитай свой 'честный' кэф: 100 / твоя_вероятность.\n"
-        "   • Если думаешь, что шанс 60%, честный кэф ≈ 1.67.\n"
-        "   • Если 45% — честный кэф ≈ 2.22."
-    )
-    lines.append(
-        "3) Сравни с линией бука:\n"
-        f"   • Если твой честный кэф НИЖЕ {odds:.2f} → для тебя это потенциальный value.\n"
-        f"   • Если ВЫШЕ {odds:.2f} → рынок оценивает событие оптимистичнее, чем ты."
-    )
-
-    lines.append("")
-    lines.append(
-        "Важно: сам по себе коэффициент не 'хороший' и не 'плохой'. Value появляется только тогда, "
-        "когда твоя оценка вероятности устойчиво лучше, чем у рынка на длинной дистанции."
-    )
-
-    return "\n".join(lines)
 
 
 
