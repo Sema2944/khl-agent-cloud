@@ -1273,113 +1273,149 @@ def _get_market_category(outcome: str | None) -> str:
 
 def build_user_market_insights(session: Session, user_id: int) -> str:
     """
-    Анализ по типам рынков (1X2, тоталы, форы, другое) по ВСЕМ ставкам пользователя.
+    Разбор рынков (тоталы, исходы, форы, другое) за всё время:
+    считает количество ставок, winrate, ROI и PnL по каждому типу
+    и даёт простой вывод — какие рынки сильные, а какие сливают банк.
     """
-    bets = get_all_bets(session, user_id)
+    from .bets_db import get_all_bets  # уже есть в импортах сверху, здесь для автономности
 
+    bets = get_all_bets(session, user_id) or []
     if not bets:
         return (
-            "У тебя пока нет сохранённых ставок. "
-            "Как только появится история, я покажу, какие рынки заходят лучше всего."
+            "Пока у тебя нет ни одной сохранённой ставки.\n"
+            "Как только наиграешь выборку, я покажу, какие рынки у тебя сильные, а какие сливают банк."
         )
 
-    settled = [b for b in bets if b.result in ("win", "lose")]
-    if not settled:
-        return (
-            "У тебя есть сохранённые ставки, но ещё ни одна не рассчитана.\n"
-            "Когда появятся win/lose, я смогу разобрать твои рынки."
-        )
+    def detect_market(b) -> str:
+        """
+        Грубая, но рабочая классификация рынка по тексту.
+        """
+        text_parts = [
+            (getattr(b, "outcome", "") or ""),
+            (getattr(b, "event", "") or ""),
+            (getattr(b, "raw_text", "") or ""),
+        ]
+        t = " ".join(text_parts).lower()
 
-    stats_by_cat: dict[str, dict[str, float]] = {}
+        if "тотал" in t or "тб" in t or "тм" in t:
+            return "тоталы"
+        if "фора" in t or "гандикап" in t:
+            return "форы"
+        if "побед" in t or "в основное время" in t or "1х2" in t or "1x2" in t:
+            return "исходы"
+        return "другое"
 
-    for b in settled:
-        cat = _get_market_category(b.outcome)
-        d = stats_by_cat.setdefault(
-            cat,
-            {
-                "bets": 0,
-                "wins": 0,
-                "losses": 0,
-                "stake": 0.0,
-                "pnl": 0.0,
-            },
-        )
-        d["bets"] += 1
-        if b.result == "win":
-            d["wins"] += 1
-        elif b.result == "lose":
-            d["losses"] += 1
-        if b.stake is not None:
-            d["stake"] += float(b.stake)
-        if b.profit is not None:
-            d["pnl"] += float(b.profit)
+    # Агрегация по рынкам
+    from collections import defaultdict
 
-    for cat, d in stats_by_cat.items():
-        if d["bets"] > 0:
-            d["winrate"] = d["wins"] / d["bets"] * 100.0
-        else:
-            d["winrate"] = None
-        if d["stake"] > 0:
-            d["roi"] = d["pnl"] / d["stake"] * 100.0
-        else:
-            d["roi"] = None
+    agg = defaultdict(lambda: {
+        "bets": 0,
+        "settled": 0,
+        "wins": 0,
+        "pnl": 0.0,
+        "stake_sum": 0.0,
+    })
 
-    cats_with_sample = [
-        (cat, d) for cat, d in stats_by_cat.items() if d["bets"] >= 3
-    ]
-    best_cat = None
-    worst_cat = None
-    if cats_with_sample:
-        best_cat = max(
-            cats_with_sample,
-            key=lambda x: x[1].get("roi", float("-inf")),
-        )
-        worst_cat = min(
-            cats_with_sample,
-            key=lambda x: x[1].get("roi", float("inf")),
-        )
+    for b in bets:
+        market = detect_market(b)
+        a = agg[market]
+        a["bets"] += 1
 
+        stake = getattr(b, "stake", None)
+        if stake is not None:
+            a["stake_sum"] += float(stake)
+
+        result = getattr(b, "result", None)
+        profit = getattr(b, "profit", None)
+
+        if result in ("win", "lose"):
+            a["settled"] += 1
+            if result == "win":
+                a["wins"] += 1
+
+        if profit is not None:
+            a["pnl"] += float(profit)
+
+    # Формируем основной блок
     lines: list[str] = []
     lines.append("📊 Разбор по типам рынков (за всё время):")
-    for cat, d in stats_by_cat.items():
-        line = f"• {cat}: ставок {int(d['bets'])}"
-        if d.get("winrate") is not None:
-            line += f", winrate {d['winrate']:.1f}%"
-        if d.get("roi") is not None:
-            line += f", ROI {d['roi']:.2f}%"
-        if d["pnl"]:
-            sign = "+" if d["pnl"] >= 0 else ""
-            line += f", PnL {sign}{d['pnl']:.0f}"
-        lines.append(line)
+
+    market_rows = []
+
+    for market, a in agg.items():
+        bets_count = a["bets"]
+        settled = a["settled"]
+        wins = a["wins"]
+        pnl = a["pnl"]
+        stake_sum = a["stake_sum"]
+
+        winrate = (wins / settled * 100) if settled > 0 else 0.0
+        roi = (pnl / stake_sum * 100) if stake_sum > 0 else 0.0
+
+        market_rows.append(
+            {
+                "name": market,
+                "bets": bets_count,
+                "winrate": winrate,
+                "roi": roi,
+                "pnl": pnl,
+            }
+        )
+
+    # Сортируем по количеству ставок, чтобы сначала показать самые частые рынки
+    market_rows.sort(key=lambda r: r["bets"], reverse=True)
+
+    for row in market_rows:
+        lines.append(
+            f"• {row['name']}: ставок {row['bets']}, "
+            f"winrate {row['winrate']:.1f}%, ROI {row['roi']:.2f}%, "
+            f"PnL {row['pnl']:+.0f}"
+        )
+
+    # Если выборка совсем маленькая — мягкий дисклеймер
+    total_settled = sum(r["bets"] for r in market_rows)
+    if total_settled < 5:
+        lines.append(
+            "\nВыборка по рынкам пока небольшая. Чем больше сыграешь, "
+            "тем точнее я смогу подсветить сильные и слабые зоны."
+        )
+
+    # Вывод: сильные и слабые рынки
+    # Сильные = ROI > 0 и ставок ≥ 2
+    strong = [r for r in market_rows if r["roi"] > 0 and r["bets"] >= 2]
+    weak = [r for r in market_rows if r["roi"] < 0 and r["bets"] >= 2]
 
     lines.append("")
 
-    if best_cat and worst_cat and best_cat[0] != worst_cat[0]:
-        bcat, bd = best_cat
-        wcat, wd = worst_cat
-        lines.append("✅ Твой самый сильный рынок:")
+    if strong:
+        strong_names = ", ".join(r["name"] for r in strong)
+        lines.append(f"✅ Сильные рынки: {strong_names}.")
         lines.append(
-            f"• {bcat}: winrate {bd['winrate']:.1f}%, ROI {bd['roi']:.2f}% "
-            f"на выборке {int(bd['bets'])} ставок."
-        )
-        lines.append("")
-        lines.append("⚠️ Рынок, который тянет вниз:")
-        lines.append(
-            f"• {wcat}: winrate {wd['winrate']:.1f}%, ROI {wd['roi']:.2f}% "
-            f"на выборке {int(wd['bets'])} ставок."
-        )
-        lines.append("")
-        lines.append(
-            "Идея: усиливай игру на сильных рынках и аккуратно относись к слабым — "
-            "там можно снижать размер ставки или вводить дополнительные фильтры."
+            "Их имеет смысл развивать: искать похожие ситуации, "
+            "держать адекватный размер ставки и играть по той же логике."
         )
     else:
+        lines.append("Пока явных сильных рынков не выделяется — выборка маленькая или результаты плавают.")
+
+    if weak:
+        weak_names = ", ".join(r["name"] for r in weak)
+        lines.append("")
+        lines.append(f"⚠️ Рынки, которые тянут результат вниз: {weak_names}.")
         lines.append(
-            "Пока выборка по рынкам небольшая или распределена неявно.\n"
-            "Когда набросаешь больше ставок, я смогу точнее подсветить сильные и слабые зоны."
+            "По ним стоит снизить нагрузку (размер ставки) или временно убрать из игры, "
+            "пока не поймёшь, почему они не заходят."
         )
 
+    lines.append(
+        "\nХочешь посмотреть свежие ошибки и удачные решения — спроси:\n"
+        "• 'лучшая ставка недели'\n"
+        "• 'ошибка недели'\n"
+        "• 'отчёт за неделю'\n"
+        "• 'отчёт за месяц'"
+    )
+
     return "\n".join(lines)
+
 
 
 # ------------------ БАНК И РЕКОМЕНДАЦИИ ПО РАЗМЕРУ СТАВКИ ------------------
