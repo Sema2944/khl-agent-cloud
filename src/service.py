@@ -2890,12 +2890,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_value_analysis(original_text)
 
-       # 11) МАТЧИ КХЛ НА СЕГОДНЯ (демо-режим, несколько матчей)
+           # 11) МАТЧИ КХЛ НА СЕГОДНЯ (демо-режим, несколько матчей)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         return build_khl_today_matches_demo()
 
+    # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
+    if "экспресс" in text:
+        return build_express_evaluation(original_text)
 
-    # 12) МОИ СТАВКИ
+    # 13) МОИ СТАВКИ
     if "мои ставки" in text or ("ставки" in text and "мои" in text):
         bets = get_last_bets(session, user_id, limit=5)
         if not bets:
@@ -2939,7 +2942,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "Твои последние ставки:\n" + "\n".join(lines)
 
-    # 13) ДОБАВЛЕНИЕ СТАВКИ
+    # 14) ДОБАВЛЕНИЕ СТАВКИ
     if text.startswith("ставка"):
         raw_text = original_text.strip()
 
@@ -2987,7 +2990,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(resp_lines)
 
-    # 14) ЗАГЛУШКИ
+    # 15) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
         return (
             "Раздел аналитики матчей расширяется.\n"
@@ -3010,7 +3013,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "Напиши: 'активировать премиум'."
         )
 
-    # 15) HELP ПО УМОЛЧАНИЮ
+    # 16) HELP ПО УМОЛЧАНИЮ
     return (
         "Я AI-агент для ставок по хоккею.\n"
         "Сейчас умею:\n"
