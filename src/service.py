@@ -1570,7 +1570,7 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
 def build_value_analysis(raw_text: str) -> str:
     """
     Value-разбор кэфа:
-    - парсим кэф (через существующий _parse_stake_and_odds)
+    - парсим кэф
     - парсим твою оценку вероятности (например '60%' или 'вероятность 60')
     - считаем:
         * имплайд-вероятность
@@ -1578,11 +1578,43 @@ def build_value_analysis(raw_text: str) -> str:
         * edge (разница в п.п.)
         * ожидаемое матожидание (EV)
     """
-    # 1) достаём кэф – используем уже готовый парсер
+    text = raw_text.lower()
+
+    # 1) Пытаемся вытащить кэф через общий парсер
     _, odds = _parse_stake_and_odds(raw_text)
 
-    # 2) достаём пользовательскую вероятность
-    text = raw_text.lower()
+    # 1.1) Если не получилось — пробуем сами достать число как кэф
+    if odds is None:
+        num_matches = re.findall(r"(\d+([\.,]\d+)?)", text)
+        for m in num_matches:
+            try:
+                val = float(m[0].replace(",", "."))
+            except ValueError:
+                continue
+            # разумный диапазон кэфа
+            if 1.01 <= val <= 20.0:
+                odds = val
+                break
+
+    lines: list[str] = []
+    lines.append("🎯 Value-разбор ставки:")
+
+    if odds is None:
+        lines.append("")
+        lines.append(
+            "Я не смог вытащить коэффициент из текста.\n"
+            "Напиши что-то вроде: 'value ставка по 1.85 при вероятности 60%'."
+        )
+        return "\n".join(lines)
+
+    # 2) Имплайд-вероятность по кэфу
+    implied_prob = 100.0 / odds
+
+    lines.append("")
+    lines.append(f"Коэффициент: {odds:.2f}")
+    lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
+
+    # 3) Парсим пользовательскую вероятность
     user_prob: float | None = None
 
     # вариант: '60%' / '60 %'
@@ -1609,24 +1641,7 @@ def build_value_analysis(raw_text: str) -> str:
     if user_prob is not None and not (0 < user_prob < 100):
         user_prob = None
 
-    lines: list[str] = []
-    lines.append("🎯 Value-разбор ставки:")
-
-    if odds is None:
-        lines.append("")
-        lines.append(
-            "Я не смог вытащить коэффициент из текста.\n"
-            "Напиши что-то вроде: 'value ставка по 1.85 при вероятности 60%'."
-        )
-        return "\n".join(lines)
-
-    # имплайд-вероятность по кэфу
-    implied_prob = 100.0 / odds
-
-    lines.append("")
-    lines.append(f"Коэффициент: {odds:.2f}")
-    lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
-
+    # Если пользователь не дал свою вероятность — даём лёгкий чек и просим её
     if user_prob is None:
         lines.append("")
         lines.append(
@@ -1641,7 +1656,7 @@ def build_value_analysis(raw_text: str) -> str:
         )
         return "\n".join(lines)
 
-    # 'справедливый' кэф по твоей оценке
+    # 4) 'Справедливый' кэф по твоей оценке
     fair_odds_by_user = 100.0 / user_prob
 
     # edge в п.п. и EV
@@ -1679,9 +1694,6 @@ def build_value_analysis(raw_text: str) -> str:
     )
 
     return "\n".join(lines)
-
-import math
-import re
 
 
 def build_express_analysis(raw_text: str) -> str:
@@ -2398,6 +2410,30 @@ def build_khl_match_analysis(ev) -> str:
         lines.append("📌 Турнирный контекст и мотивация:")
         lines.append(ctx)
 
+    return "\n".join(lines)
+
+def build_khl_today_matches_demo() -> str:
+    """
+    Демо-версия списка матчей КХЛ на сегодня.
+    Пока без реального парсинга — статический пример с одним матчем.
+    """
+    lines: list[str] = []
+    lines.append("🏒 Матчи КХЛ на сегодня (демо-режим):")
+    lines.append("")
+    lines.append("1) СКА — ЦСКА (id: 123456)")
+    lines.append("   Линия 1X2 (пример):")
+    lines.append("   • 1 — 1.85")
+    lines.append("   • X — 3.90")
+    lines.append("   • 2 — 2.10")
+    lines.append("")
+    lines.append("Как использовать:")
+    lines.append("• выбери матч и запомни id (например, 123456)")
+    lines.append("• попроси: 'анализ матча 123456' — я разберу линию 1X2 по нему")
+    lines.append("")
+    lines.append(
+        "Это демо-режим: позже сюда добавим реальные матчи, парсинг линии "
+        "и аналитику по форме команд."
+    )
     return "\n".join(lines)
 
 def build_help_text() -> str:
