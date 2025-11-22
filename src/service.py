@@ -3027,7 +3027,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(resp_lines)
 
-    # 15) ЗАГЛУШКИ
+         # 15) ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
         return (
             "Раздел аналитики матчей расширяется.\n"
@@ -3051,7 +3051,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         )
 
     # 16) HELP ПО УМОЛЧАНИЮ
-    return (
+    return build_help_text()
+
             # 15) HELP ПО УМОЛЧАНИЮ
     return build_help_text()
 
