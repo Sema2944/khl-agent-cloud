@@ -2190,6 +2190,97 @@ def _build_tournament_motivation_hint(
         )
 
     return lines
+def build_express_evaluation(raw_text: str) -> str:
+    """
+    Простейший разбор экспресса:
+    - вытаскиваем все числа-подобные коэффициенты из текста;
+    - фильтруем только те, что похожи на кэфы (1.01–15.0);
+    - считаем общий кэф, имплайд-вероятность и даём комментарий по рискам.
+    """
+    text = raw_text.replace(",", ".")
+    matches = re.findall(r"(\d+(\.\d+)?)", text)
+
+    odds_list: list[float] = []
+    for m in matches:
+        num_str = m[0]
+        try:
+            val = float(num_str)
+        except ValueError:
+            continue
+
+        # считаем кэфами только вменяемый диапазон
+        if 1.01 <= val <= 15.0:
+            odds_list.append(val)
+
+    lines: list[str] = []
+    lines.append("🎯 Разбор экспресса:")
+
+    clean = raw_text.strip()
+    if clean:
+        lines.append(f"Текст: {clean}")
+    lines.append("")
+
+    if len(odds_list) < 2:
+        lines.append(
+            "Я не нашёл в тексте хотя бы двух коэффициентов, чтобы собрать экспресс.\n"
+            "Напиши, например:\n"
+            "• 'экспресс 1.85 1.70 2.10'\n"
+            "• или 'экспресс по 1.9, 1.7 и 2.3'"
+        )
+        return "\n".join(lines)
+
+    # считаем общий коэффициент
+    total_odds = 1.0
+    for o in odds_list:
+        total_odds *= o
+
+    implied_prob = 100.0 / total_odds
+
+    # чуть-чуть аналитики
+    n = len(odds_list)
+    avg_leg_odds = total_odds ** (1.0 / n)
+
+    lines.append("Коэффициенты в экспрессе:")
+    lines.append("• " + " × ".join(f"{o:.2f}" for o in odds_list))
+    lines.append("")
+    lines.append(f"Общий кэф экспресса: {total_odds:.2f}")
+    lines.append(f"Имплайд-вероятность (что всё зайдёт): ≈ {implied_prob:.1f}%")
+    lines.append("")
+    lines.append(f"Количество событий в экспрессе: {n}")
+    lines.append(f"Средний кэф на одно плечо: ≈ {avg_leg_odds:.2f}")
+
+    lines.append("")
+    # Комментарий по рискам
+    if n <= 2:
+        lines.append(
+            "• Небольшой экспресс. Риск выше, чем в ординаре, но ещё в разумных пределах, "
+            "если каждое плечо обосновано."
+        )
+    elif n <= 4:
+        lines.append(
+            "• Уже ощутимый экспресс. Любая ошибка по одному из плеч ломает весь купон — "
+            "важно не превращать такие ставки в основу стратегии."
+        )
+    else:
+        lines.append(
+            "• Много плеч в экспрессе. Вероятность полного захода падает очень быстро, "
+            "даже если каждое событие по отдельности кажется 'почти железным'."
+        )
+
+    if total_odds >= 5.0:
+        lines.append(
+            "• Высокий общий кэф — психологически притягательно, но это почти всегда "
+            "про редкие сценарии. Тут особенно важно думать не о выигрыше, а о дистанции."
+        )
+
+    lines.append("")
+    lines.append(
+        "Если хочешь проверить value по отдельному плечу, напиши что-то вроде:\n"
+        "• 'value 1.85 при вероятности 60%'\n"
+        "Или оцени каждое событие отдельно, а не только общий кэф."
+    )
+
+    return "\n".join(lines)
 
 
 def build_khl_match_analysis(ev) -> str:
