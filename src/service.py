@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from fastAPI import FastAPI, Depends
+from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
