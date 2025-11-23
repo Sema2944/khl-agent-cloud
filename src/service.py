@@ -2,12 +2,11 @@
 
 from .hockey_logic import build_match_context_notes
 import logging
-import threading
 import os
 import re
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Depends
+from fastAPI import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -31,15 +30,14 @@ from .khl_client import (
 from .khl_form_client import (
     get_team_form,
     TeamForm,
-    TeamAdvancedForm,  # 👈 добавили
-)
-from .hockey_model import (
-    build_team_strength_from_form,
-    build_matchup_view,
+    TeamAdvancedForm,
 )
 import inspect
 
 logger = logging.getLogger(__name__)
+
+
+# ===================== ПРЕМИУМ =====================
 
 
 def is_premium(session: Session, user_id: int) -> bool:
@@ -51,6 +49,9 @@ def is_premium(session: Session, user_id: int) -> bool:
         return False
     # сравниваем с UTC, чтобы не завязываться на локальное время
     return user.premium_until > datetime.utcnow()
+
+
+# ===================== ОТЧЁТ ЗА НЕДЕЛЮ =====================
 
 
 def build_weekly_report(session: Session, user_id: int) -> str:
@@ -91,9 +92,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     lines.append(f"Плюс/минус за неделю: {stats.pnl:.0f}")
     lines.append(f"Общий объём ставок: {stats.total_stake:.0f}")
 
-    # Банк и средний % от банка
-    from .bets_db import get_user_bank  # если импорт уже есть сверху, эту строку можно убрать
-
     bank = get_user_bank(session, user_id)
     if bank is not None and stats.total_bets > 0:
         avg_stake = stats.total_stake / stats.total_bets
@@ -103,7 +101,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
         lines.append("💰 Нагрузка на банк:")
         lines.append(f"Средний размер ставки: {avg_stake:.0f} ({stake_pct:.1f}% от банка).")
 
-        # Комментарий по риску
         if stake_pct <= 1:
             lines.append(
                 "Ты играешь очень консервативно. Это безопасно, но профит будет приходить медленнее."
@@ -123,7 +120,6 @@ def build_weekly_report(session: Session, user_id: int) -> str:
                 "а не на управляемую стратегию. Профессиональная игра — это обычно до 3% от банка."
             )
 
-    # Общий совет недели
     lines.append("")
     lines.append("🧠 Совет недели:")
     if stats.roi < 0:
@@ -147,20 +143,21 @@ def build_weekly_report(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
+# ===================== ОТЧЁТ ЗА МЕСЯЦ =====================
+
 
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
     Отчёт за последние 30 дней по ставкам пользователя.
     Берём все ставки пользователя и фильтруем по дате created_at.
     """
-    from .bets_db import get_all_bets  # чтобы функция была автономной
+    from .bets_db import get_all_bets  # автономность
 
     today = datetime.utcnow()
     period_start = today - timedelta(days=30)
 
     bets_all = get_all_bets(session, user_id) or []
 
-    # фильтруем только те, у кого есть created_at и он в пределах 30 дней
     bets = [
         b for b in bets_all
         if getattr(b, "created_at", None) is not None
@@ -173,7 +170,6 @@ def build_monthly_report(session: Session, user_id: int) -> str:
             "Как только набросаешь историю за месяц, я соберу подробный отчёт."
         )
 
-    # базовые выборки
     settled = [b for b in bets if getattr(b, "result", None) in ("win", "lose")]
     pushes = [b for b in bets if getattr(b, "result", None) == "push"]
     wins = [b for b in settled if b.result == "win"]
@@ -194,7 +190,6 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     winrate = (len(wins) / settled_count * 100.0) if settled_count > 0 else 0.0
     roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else 0.0
 
-    # лучшая / худшая ставка по прибыли
     bets_with_profit = [
         b for b in bets
         if getattr(b, "profit", None) is not None
@@ -217,7 +212,6 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     lines.append(f"PnL за период: {sign_pnl}{total_pnl:.0f}")
     lines.append(f"Общий объём ставок: {total_stake:.0f}")
 
-    # Лучшая ставка месяца
     if best_bet is not None:
         lines.append("")
         lines.append("🏆 Лучшая ставка месяца:")
@@ -227,7 +221,6 @@ def build_monthly_report(session: Session, user_id: int) -> str:
             lines.append(f"• {best_bet.raw_text}")
         lines.append(f"• Результат: +{best_bet.profit:.0f}")
 
-    # Самая слабая ставка месяца
     if worst_bet is not None and worst_bet is not best_bet:
         lines.append("")
         lines.append("⚠️ Самая слабая ставка месяца:")
@@ -237,13 +230,11 @@ def build_monthly_report(session: Session, user_id: int) -> str:
             lines.append(f"• {worst_bet.raw_text}")
         sign_w = "+" if worst_bet.profit >= 0 else ""
         lines.append(f"• Результат: {sign_w}{worst_bet.profit:.0f}")
-
         lines.append(
             "Важно не просто зафиксировать минус, а понять причину: "
             "переоценил команду, зашёл в неудобный рынок или перегрузил банк."
         )
 
-    # Краткий вывод
     lines.append("")
     lines.append("🧠 Вывод по месяцу:")
     if roi >= 0:
@@ -267,26 +258,34 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
+# ===================== SAFE-ХЕЛПЕРЫ ДЛЯ ФОРМЫ =====================
+
+
+async def get_team_form_safe(team_name: str) -> TeamForm | None:
+    try:
+        if inspect.iscoroutinefunction(get_team_form):
+            return await get_team_form(team_name)
+        return get_team_form(team_name)
+    except Exception:
+        logger.exception("Ошибка при получении формы команды %s", team_name)
+        return None
 
 
 def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
     """
     Заглушка для PRO-формы команды.
-
-    Сейчас мы ещё не подключили реальный парсер продвинутой формы,
-    поэтому аккуратно возвращаем None, чтобы не ломать бэкенд.
-    Когда появится get_team_advanced_form в khl_form_client, просто
-    обновим эту функцию и начнём использовать PRO-метрики.
     """
     return None
 
+
+# ===================== РАЗБОР МАТЧА КХЛ =====================
 
 
 def build_khl_match_analysis(ev) -> str:
     """
     Базовый и максимально устойчивый разбор матча КХЛ.
 
-    Специально без вызовов формы/модели, чтобы:
+    Без жёсткой завязки на внешние данные, чтобы:
     - не ловить 500-ки;
     - всегда отдавать хотя бы разбор линии 1X2.
     """
@@ -295,7 +294,7 @@ def build_khl_match_analysis(ev) -> str:
     team2_name = getattr(ev, "team2", "Команда 2")
     event_id = getattr(ev, "id", "—")
 
-    # --- 1. Находим рынок 1X2 ---
+    # 1. Находим рынок 1X2
     market_1x2 = None
     for m in getattr(ev, "markets", []) or []:
         name = (getattr(m, "name", "") or "").upper()
@@ -311,7 +310,7 @@ def build_khl_match_analysis(ev) -> str:
             "Попробуй другой матч или позже — возможно, линия ещё не выставлена."
         )
 
-    # --- 2. Собираем коэффициенты 1 / X / 2 ---
+    # 2. Собираем коэффициенты 1 / X / 2
     odds_map: dict[str, float] = {}
     for o in getattr(market_1x2, "outcomes", []) or []:
         key = (getattr(o, "name", "") or "").strip()
@@ -334,9 +333,8 @@ def build_khl_match_analysis(ev) -> str:
     odds_2 = _pick_odds("2", "AWAY")
 
     if odds_1 is None or odds_x is None or odds_2 is None:
-        # На всякий случай — показываем всё, что есть
         lines = [
-            f"📊 Разбор матча КХЛ:",
+            "📊 Разбор матча КХЛ:",
             f"{team1_name} — {team2_name} (id: {event_id})",
             "",
             "Не удалось корректно прочитать все три коэффициента 1X2.",
@@ -352,7 +350,7 @@ def build_khl_match_analysis(ev) -> str:
         )
         return "\n".join(lines)
 
-    # --- 3. Имплайд-вероятности и маржа ---
+    # 3. Имплайд-вероятности и маржа
     imp_1 = 100.0 / odds_1
     imp_x = 100.0 / odds_x
     imp_2 = 100.0 / odds_2
@@ -370,17 +368,10 @@ def build_khl_match_analysis(ev) -> str:
     lines.append("📊 Разбор матча КХЛ:")
     lines.append(f"{team1_name} — {team2_name} (id: {event_id})")
     lines.append("")
-
     lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-    lines.append(
-        f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%"
-    )
-    lines.append(
-        f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%"
-    )
-    lines.append(
-        f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%"
-    )
+    lines.append(f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%")
+    lines.append(f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%")
+    lines.append(f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%")
     lines.append("")
     lines.append(f"Маржа букмекера по рынку 1X2 ≈ {margin:.1f} п.п.")
     lines.append("")
@@ -389,7 +380,6 @@ def build_khl_match_analysis(ev) -> str:
     lines.append(f"• X: ≈ {fair_x:.1f}%")
     lines.append(f"• 2: ≈ {fair_2:.1f}%")
     lines.append("")
-
     lines.append(
         "Как использовать:\n"
         "1) Определи, какой исход ты вообще рассматриваешь (1 / X / 2).\n"
@@ -397,6 +387,18 @@ def build_khl_match_analysis(ev) -> str:
         "я переведу его в вероятность и дам чек-лист по value.\n"
         "3) Сравни свою оценку шансов с тем, что закладывает рынок."
     )
+
+    # 4. Турнирный контекст и мотивация
+    try:
+        ctx = build_match_context_notes(team1_name, team2_name, league="KHL")
+    except Exception:
+        ctx = ""
+
+    if ctx:
+        lines.append("")
+        lines.append("📌 Турнирный контекст и мотивация:")
+        lines.append(ctx)
+
     lines.append("")
     lines.append(
         "Это не прогноз и не команда 'ставить/не ставить', а рабочий чек-лист по линии. "
@@ -406,8 +408,8 @@ def build_khl_match_analysis(ev) -> str:
     return "\n".join(lines)
 
 
-# 👇 запуск телеграм-бота
-from .telegram_bot import main as run_telegram_bot
+# ===================== FASTAPI ПРИЛОЖЕНИЕ =====================
+
 
 app = FastAPI(title="KHL AI Betting Agent")
 
@@ -427,7 +429,7 @@ def on_startup() -> None:
     Старт FastAPI:
     - инициализация базы
     - настройка логов
-    БЕЗ запуска Telegram-бота!
+    БЕЗ запуска Telegram-бота (бот можно крутить в отдельном worker-е).
     """
     logging.basicConfig(level=logging.INFO)
     init_db()
@@ -439,59 +441,8 @@ def root():
     return {"status": "ok", "service": "khl-agent"}
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    """
-    Хук старта FastAPI:
-    - инициализируем БД
-    - настраиваем логи
-    - запускаем Telegram-бота в отдельном потоке
-    """
-    logging.basicConfig(level=logging.INFO)
-    init_db()
-    logger.info("FastAPI сервис запущен")
+# ===================== API-ЭНДПОИНТЫ ДЛЯ АГЕНТА =====================
 
-    def _run_tg_bot():
-        try:
-            logger.info("Запускаю Telegram-бота в фонового потоке...")
-            run_telegram_bot()
-        except Exception:
-            logger.exception("Ошибка в Telegram-боте")
-
-    t = threading.Thread(target=_run_tg_bot, name="telegram-bot", daemon=True)
-    t.start()
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "khl-agent"}
-
-
-# ---------- SAFE-ХЕЛПЕР ДЛЯ ФОРМЫ КОМАНДЫ ----------
-
-async def get_team_form_safe(team_name: str) -> TeamForm | None:
-    try:
-        if inspect.iscoroutinefunction(get_team_form):
-            return await get_team_form(team_name)
-        return get_team_form(team_name)
-    except Exception:
-        logger.exception("Ошибка при получении формы команды %s", team_name)
-        return None
-
-
-# ---------- NEW: SAFE advanced form getter (PRO version) ----------
-async def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
-    try:
-        if inspect.iscoroutinefunction(get_team_advanced_form):
-            return await get_team_advanced_form(team_name)
-        return get_team_advanced_form(team_name)
-    except Exception:
-        logger.exception("Ошибка при получении TeamAdvancedForm для %s", team_name)
-        return None
-
-
-
-# ---------- API-ЭНДПОИНТЫ ДЛЯ АГЕНТА ----------
 
 @app.post("/agent/query", response_model=AgentResponse)
 async def agent_query(
@@ -516,10 +467,6 @@ async def agent_last_bets(
     limit: int = 5,
     session: Session = Depends(get_session),
 ):
-    """
-    Отдаём последние ставки пользователя в структурированном виде,
-    чтобы Telegram-бот мог красиво показать их с кнопками.
-    """
     bets = get_last_bets(session, user_id, limit=limit)
 
     out: list[dict] = []
@@ -556,12 +503,10 @@ async def api_settle_bet(
     except Exception:
         return {"reply": "Некорректные данные для расчёта ставки."}
 
-    # Рассчитываем ставку
     bet = settle_bet(session, user_id, bet_id, result)
     if bet is None:
         return {"reply": f"Ставка {bet_id} не найдена."}
 
-    # Приводим результат в «человеческий» вид
     if result == "win":
         word = "выигрыш"
     elif result == "lose":
@@ -571,12 +516,10 @@ async def api_settle_bet(
 
     lines: list[str] = [f"Ставка {bet_id} отмечена: {word}."]
 
-    # PnL
     if bet.profit is not None:
         sign = "+" if bet.profit >= 0 else ""
         lines.append(f"PnL: {sign}{bet.profit:.0f}")
 
-    # Обновляем банк
     bank = get_user_bank(session, user_id)
     if bank is not None and bet.profit is not None:
         user = change_user_bank(session, user_id, bet.profit)
@@ -584,52 +527,8 @@ async def api_settle_bet(
 
     return {"reply": "\n".join(lines)}
 
-# ↓ дальше оставляем твой существующий код: run_agent, build_khl_match_analysis и т.д.
 
-async def api_settle_bet(
-    data: dict,
-    session: Session = Depends(get_session),
-):
-    """
-    Отмечаем ставку как win/lose/push по запросу Telegram-кнопки.
-    """
-    try:
-        user_id = int(data.get("user_id"))
-        bet_id = int(data.get("bet_id"))
-        result = data.get("result")  # "win" | "lose" | "push"
-    except Exception:
-        return {"reply": "Некорректные данные для расчёта ставки."}
-
-    # Рассчитываем ставку
-    bet = settle_bet(session, user_id, bet_id, result)
-    if bet is None:
-        return {"reply": f"Ставка {bet_id} не найдена."}
-
-    # Приводим результат в «человеческий»
-    if result == "win":
-        word = "выигрыш"
-    elif result == "lose":
-        word = "проигрыш"
-    else:
-        word = "возврат"
-
-    lines = [f"Ставка {bet_id} отмечена: {word}."]
-
-    # PnL
-    if bet.profit is not None:
-            lines.append(f"PnL: {sign}{bet.profit:.0f}")
-
-    # Обновляем банк
-    bank = get_user_bank(session, user_id)
-    if bank is not None and bet.profit is not None:
-        user = change_user_bank(session, user_id, bet.profit)
-        lines.append(f"Банк обновлён: {user.bank:.0f}")
-
-    return {"reply": "\n".join(lines)}
-
-    sign = "+" if bet.profit >= 0 else ""
-
-# ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПАРСИНГА ------------------
+# ===================== ХЕЛПЕРЫ ПАРСИНГА СТАВОК =====================
 
 
 def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
@@ -640,23 +539,19 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     - 'ставка на матч 123456 2000'
       → матч 123456 (ID), ставка 2000.
     """
-    # Все числа с позициями
     num_matches = list(re.finditer(r"(\d+([\.,]\d+)?)", raw_text))
     if not num_matches:
         return None, None
 
     text_lower = raw_text.lower()
 
-    # --- Определяем ID матча, если есть конструкция "матч 123456" ---
     match_id_index: int | None = None
     m_match = re.search(r"матч\s+(\d+)", text_lower)
     if m_match:
         match_id_str = m_match.group(1)
-        # Ищем это число среди num_matches
         for idx, m in enumerate(num_matches):
             token = m.group(1)
             clean = token.replace(",", ".")
-            # Для ID матча ожидаем целое число
             if clean.isdigit() and clean == match_id_str:
                 match_id_index = idx
                 break
@@ -671,24 +566,17 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     odds: float | None = None
     stake_index: int | None = None
 
-    # --- Логика выбора суммы ставки ---
     if match_id_index is not None:
-        # 1) Сначала пытаемся найти число ПЕРЕД ID матча (ставка 2000 на матч 123456)
         if match_id_index > 0:
             stake_index = match_id_index - 1
-        # 2) Иначе берём число ПОСЛЕ ID матча (ставка на матч 123456 2000)
         elif match_id_index + 1 < len(num_matches):
             stake_index = match_id_index + 1
     else:
-        # Без "матч" → как раньше: первое число — сумма
         stake_index = 0
 
     if stake_index is not None:
         stake = _num_to_float(num_matches[stake_index])
 
-    # --- Поиск коэффициента по ключевым словам "коэф/кф/за/по" ---
-
-    # 1) рядом с словами "коэф/кф/кэф/коэфф/коэффициент"
     coef_pattern = re.compile(
         r"(коэф(фициент)?|коeff|коэфф|кэф|кф|коэффициент)\s*[:=]?\s*(\d+([\.,]\d+)?)",
         re.IGNORECASE,
@@ -702,7 +590,6 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
         except ValueError:
             odds = None
 
-    # 2) конструкции "за 1.85" / "по 1,75"
     if odds is None:
         za_pattern = re.compile(
             r"\b(за|по)\s*(\d+([\.,]\d+)?)",
@@ -713,7 +600,6 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
             try:
                 candidate_odds = float(m_za.group(2).replace(",", "."))
                 if 1.01 <= candidate_odds <= 20:
-                    # защитимся от ситуации, когда кэф = сумме ставки
                     if not (
                         stake is not None
                         and stake >= 50
@@ -723,8 +609,6 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
             except ValueError:
                 pass
 
-    # 3) Если всё ещё нет кэфа — берём первое подходящее число,
-    #    которое не является ни ID матча, ни суммой
     if odds is None:
         for idx, m in enumerate(num_matches):
             if idx == stake_index or idx == match_id_index:
@@ -737,7 +621,6 @@ def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
                 break
 
     return stake, odds
-
 
 
 def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
@@ -755,7 +638,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     outcome_parts: list[str] = []
     event: str | None = None
 
-    # ----- 1X2: П1 / П2 / Х / 1X / X2 / 12 -----
     if re.search(r"\bп1\b", text):
         outcome_parts.append("П1")
     if re.search(r"\bп2\b", text):
@@ -773,7 +655,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     if re.search(r"\bх2\b", text):
         outcome_parts.append("X2")
 
-    # ----- Тоталы -----
     m_total = re.search(
         r"тотал\s+(больше|меньше)\s*(\d+([\.,]\d+)?)",
         text,
@@ -784,7 +665,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
         prefix = "ТБ" if "больше" in sign else "ТМ"
         outcome_parts.append(f"{prefix} {line.replace('.', ',')}")
 
-    # ТБ / ТМ сокращённо
     m_tb_tm = re.search(
         r"\bт(б|м)\s*(\d+([\.,]\d+)?)",
         text,
@@ -795,7 +675,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
         prefix = "ТБ" if letter == "б" else "ТМ"
         outcome_parts.append(f"{prefix} {line.replace('.', ',')}")
 
-    # ----- Форы -----
     m_fora_short = re.search(
         r"\bф(1|2)\s*\(?\s*([+-]?\d+([\.,]\d+)?)\s*\)?",
         text,
@@ -819,17 +698,15 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
 
     outcome = " ; ".join(dict.fromkeys(outcome_parts)) if outcome_parts else None
 
-    # ----- Спец-кейс: "на матч 123456" -----
     m_event_match = re.search(r"на\s+матч\s+(\d+)", text)
     if m_event_match:
         event = f"матч {m_event_match.group(1)}"
         return outcome, event
 
-    # ----- ОБЩИЙ СЛУЧАЙ EVENT: текст после " на ..." -----
     lower = text
     idx = lower.find(" на ")
     if idx != -1:
-        after = raw_text[idx + 4 :]  # всё после " на "
+        after = raw_text[idx + 4 :]
         cut_keywords = [
             " тотал",
             " фора",
@@ -853,13 +730,10 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     return outcome, event
 
 
-
-
 def _extract_first_number(text: str) -> float | None:
     """
     Достаём первое число из строки (для банка, пополнения и т.п.).
     """
-    # Важно: здесь латинская \d, а не русская "д"
     m = re.search(r"(\d+([\.,]\d+)?)", text)
     if not m:
         return None
@@ -869,7 +743,7 @@ def _extract_first_number(text: str) -> float | None:
         return None
 
 
-# ------------------ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПО СТАВКАМ ------------------
+# ===================== ХЕЛПЕРЫ ПО ВРЕМЕНИ / ВЫБОРКЕ =====================
 
 
 def _get_last_7d_bets(session: Session, user_id: int):
@@ -877,7 +751,7 @@ def _get_last_7d_bets(session: Session, user_id: int):
     Достаём все ставки пользователя за последние 7 дней.
     Возвращаем: (ставки, начало периода, конец периода).
     """
-    from .bets_db import Bet  # локальный импорт, чтобы не плодить циклы
+    from .bets_db import Bet
 
     now = datetime.utcnow()
     period_start = now - timedelta(days=7)
@@ -890,228 +764,10 @@ def _get_last_7d_bets(session: Session, user_id: int):
     return bets, period_start, now
 
 
-# ------------------ ОТЧЁТ ЗА НЕДЕЛЮ ------------------
-
-
-# ------------------ ОТЧЁТ ЗА МЕСЯЦ ------------------
-
-
-def build_monthly_report(session: Session, user_id: int) -> str:
-    """
-    Отчёт за последние 30 дней по ставкам пользователя.
-    Берём все ставки пользователя и фильтруем по дате created_at.
-    """
-    bets_all = get_all_bets(session, user_id)
-
-    now = datetime.utcnow()
-    period_start = now - timedelta(days=30)
-
-    # фильтруем только те, у кого есть created_at и он в пределах 30 дней
-    bets = [
-        b for b in bets_all
-        if b.created_at is not None and b.created_at >= period_start
-    ]
-
-    if not bets:
-        return (
-            "За последние 30 дней у тебя не было записанных ставок. "
-            "Как только набросаешь историю за месяц, я соберу подробный отчёт."
-        )
-
-    settled = [b for b in bets if b.result in ("win", "lose")]
-    pushes = [b for b in bets if b.result == "push"]
-    wins = [b for b in bets if b.result == "win"]
-
-    total_bets = len(bets)
-    settled_count = len(settled)
-    pushes_count = len(pushes)
-
-    total_stake = sum(b.stake or 0 for b in bets if b.stake is not None)
-    total_pnl = sum(b.profit or 0 for b in bets if b.profit is not None)
-
-    winrate = (
-        (len(wins) / settled_count * 100.0) if settled_count > 0 else None
-    )
-    roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else None
-
-    bets_with_profit = [b for b in bets if b.profit is not None]
-    best_bet = (
-        max(bets_with_profit, key=lambda b: b.profit)
-        if bets_with_profit
-        else None
-    )
-    worst_bet = (
-        min(bets_with_profit, key=lambda b: b.profit)
-        if bets_with_profit
-        else None
-    )
-
-    period_str = f"{period_start:%d.%m}–{now:%d.%m}"
-
-    lines: list[str] = []
-    lines.append(f"📈 Отчёт за последние 30 дней ({period_str}):")
-    lines.append(f"Всего ставок: {total_bets}")
-
-    if settled_count > 0:
-        lines.append(f"Рассчитано (win/lose): {settled_count}")
-    if pushes_count > 0:
-        lines.append(f"Возвратов: {pushes_count}")
-
-    if winrate is not None:
-        lines.append(f"Винрейт: {winrate:.1f}%")
-    if roi is not None:
-        lines.append(f"ROI: {roi:.2f}%")
-    if total_pnl:
-        sign = "+" if total_pnl >= 0 else ""
-        lines.append(f"PnL за период: {sign}{total_pnl:.0f}")
-    if total_stake:
-        lines.append(f"Общий объём ставок: {total_stake:.0f}")
-
-    if best_bet is not None and worst_bet is not None and best_bet != worst_bet:
-        lines.append("")
-        lines.append("🏆 Лучшая ставка месяца:")
-        desc_best = best_bet.raw_text or ""
-        sign_best = "+" if (best_bet.profit or 0) >= 0 else ""
-        pnl_best = f"{sign_best}{(best_bet.profit or 0):.0f}"
-        if best_bet.created_at:
-            lines.append(f"• Дата: {best_bet.created_at:%d.%m %H:%M}")
-        if desc_best:
-            lines.append(f"• {desc_best}")
-        lines.append(f"• Результат: {pnl_best}")
-
-        lines.append("")
-        lines.append("⚠️ Самая слабая ставка месяца:")
-        desc_worst = worst_bet.raw_text or ""
-        sign_worst = "+" if (worst_bet.profit or 0) >= 0 else ""
-        pnl_worst = f"{sign_worst}{(worst_bet.profit or 0):.0f}"
-        if worst_bet.created_at:
-            lines.append(f"• Дата: {worst_bet.created_at:%d.%m %H:%M}")
-        if desc_worst:
-            lines.append(f"• {desc_worst}")
-        lines.append(f"• Результат: {pnl_worst}")
-
-    lines.append("")
-    lines.append(
-        "Месячный горизонт лучше показывает, где ты реально зарабатываешь, а где льёшь. "
-        "Смотри на типы рынков, лиги и размеры ставок, которые тянут результат вниз."
-    )
-
-    return "\n".join(lines)
-
-
-
-def build_monthly_report(session: Session, user_id: int) -> str:
-    """
-    Отчёт за последние 30 дней по ставкам пользователя.
-    По структуре похож на недельный, но с другим периодом.
-    """
-    from .bets_db import Bet  # локальный импорт, чтобы не плодить циклы
-
-    now = datetime.utcnow()
-    period_start = now - timedelta(days=30)
-
-    bets = session.exec(
-        select(Bet).where(
-            Bet.user_id == user_id,
-            Bet.created_at >= period_start,
-        )
-    ).all()
-
-    if not bets:
-        return (
-            "За последние 30 дней у тебя не было записанных ставок. "
-            "Как только набросаешь историю за месяц, я соберу подробный отчёт."
-        )
-
-    settled = [b for b in bets if b.result in ("win", "lose")]
-    pushes = [b for b in bets if b.result == "push"]
-    wins = [b for b in bets if b.result == "win"]
-
-    total_bets = len(bets)
-    settled_count = len(settled)
-    pushes_count = len(pushes)
-
-    total_stake = sum(b.stake or 0 for b in bets if b.stake is not None)
-    total_pnl = sum(b.profit or 0 for b in bets if b.profit is not None)
-
-    winrate = (
-        (len(wins) / settled_count * 100.0) if settled_count > 0 else None
-    )
-    roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else None
-
-    bets_with_profit = [b for b in bets if b.profit is not None]
-    best_bet = (
-        max(bets_with_profit, key=lambda b: b.profit)
-        if bets_with_profit
-        else None
-    )
-    worst_bet = (
-        min(bets_with_profit, key=lambda b: b.profit)
-        if bets_with_profit
-        else None
-    )
-
-    period_str = f"{period_start:%d.%m}–{now:%d.%m}"
-
-    lines: list[str] = []
-    lines.append(f"📈 Отчёт за последние 30 дней ({period_str}):")
-    lines.append(f"Всего ставок: {total_bets}")
-
-    if settled_count > 0:
-        lines.append(f"Рассчитано (win/lose): {settled_count}")
-    if pushes_count > 0:
-        lines.append(f"Возвратов: {pushes_count}")
-
-    if winrate is not None:
-        lines.append(f"Винрейт: {winrate:.1f}%")
-    if roi is not None:
-        lines.append(f"ROI: {roi:.2f}%")
-    if total_pnl:
-        sign = "+" if total_pnl >= 0 else ""
-        lines.append(f"PnL за период: {sign}{total_pnl:.0f}")
-    if total_stake:
-        lines.append(f"Общий объём ставок: {total_stake:.0f}")
-
-    if best_bet is not None and worst_bet is not None and best_bet != worst_bet:
-        lines.append("")
-        lines.append("🏆 Лучшая ставка месяца:")
-        desc_best = best_bet.raw_text or ""
-        sign_best = "+" if (best_bet.profit or 0) >= 0 else ""
-        pnl_best = f"{sign_best}{(best_bet.profit or 0):.0f}"
-        if best_bet.created_at:
-            lines.append(f"• Дата: {best_bet.created_at:%d.%m %H:%M}")
-        if desc_best:
-            lines.append(f"• {desc_best}")
-        lines.append(f"• Результат: {pnl_best}")
-
-        lines.append("")
-        lines.append("⚠️ Самая слабая ставка месяца:")
-        desc_worst = worst_bet.raw_text or ""
-        sign_worst = "+" if (worst_bet.profit or 0) >= 0 else ""
-        pnl_worst = f"{sign_worst}{(worst_bet.profit or 0):.0f}"
-        if worst_bet.created_at:
-            lines.append(f"• Дата: {worst_bet.created_at:%d.%m %H:%M}")
-        if desc_worst:
-            lines.append(f"• {desc_worst}")
-        lines.append(f"• Результат: {pnl_worst}")
-
-    lines.append("")
-    lines.append(
-        "Месячный горизонт лучше показывает, где ты реально зарабатываешь, а где льёшь. "
-        "Смотри на типы рынков, лиги и размеры ставок, которые тянут результат вниз."
-    )
-
-    return "\n".join(lines)
-
-
-
-# ------------------ ЛУЧШАЯ СТАВКА НЕДЕЛИ ------------------
+# ===================== ЛУЧШАЯ / ХУДШАЯ СТАВКА НЕДЕЛИ =====================
 
 
 def build_best_bet_insight(session: Session, user_id: int) -> str:
-    """
-    Коучинговый инсайт: лучшая ставка за 7 дней.
-    """
     bets, period_start, now = _get_last_7d_bets(session, user_id)
     bets_with_profit = [b for b in bets if b.profit is not None]
 
@@ -1153,23 +809,15 @@ def build_best_bet_insight(session: Session, user_id: int) -> str:
             lines.append("Ставка: " + " | ".join(parts))
 
     lines.append(f"Результат по прибыли: {pnl_best}")
-
     lines.append("")
     lines.append(
         "Идея: посмотри, что именно ты увидел в этом матче/рынке. "
         "Такие решения стоит искать и повторять в будущем."
     )
-
     return "\n".join(lines)
 
 
-# ------------------ ОШИБКА НЕДЕЛИ ------------------
-
-
 def build_worst_bet_insight(session: Session, user_id: int) -> str:
-    """
-    Инсайт: самая слабая ставка за 7 дней (ошибка недели).
-    """
     bets, period_start, now = _get_last_7d_bets(session, user_id)
     bets_with_profit = [b for b in bets if b.profit is not None]
 
@@ -1211,7 +859,6 @@ def build_worst_bet_insight(session: Session, user_id: int) -> str:
             lines.append("Ставка: " + " | ".join(parts))
 
     lines.append(f"Результат по прибыли: {pnl_worst}")
-
     lines.append("")
     lines.append(
         "Важно не просто зафиксировать минус, а понять причину:\n"
@@ -1220,17 +867,13 @@ def build_worst_bet_insight(session: Session, user_id: int) -> str:
         "• заиграл слишком большой размер ставки?\n"
         "Такие моменты — лучший материал для роста."
     )
-
     return "\n".join(lines)
 
 
-# ------------------ КАТЕГОРИЯ РЫНКА ------------------
+# ===================== КАТЕГОРИИ РЫНКОВ =====================
 
 
 def _get_market_category(outcome: str | None) -> str:
-    """
-    Грубое определение типа рынка по строке исхода.
-    """
     out = (outcome or "").upper()
     if any(k in out for k in ("ТБ", "ТМ", "ТОТАЛ")):
         return "тоталы"
@@ -1241,16 +884,8 @@ def _get_market_category(outcome: str | None) -> str:
     return "другое"
 
 
-# ------------------ АНАЛИТИКА РЫНКОВ ПОЛЬЗОВАТЕЛЯ ------------------
-
-
 def build_user_market_insights(session: Session, user_id: int) -> str:
-    """
-    Разбор рынков (тоталы, исходы, форы, другое) за всё время:
-    считает количество ставок, winrate, ROI и PnL по каждому типу
-    и даёт простой вывод — какие рынки сильные, а какие сливают банк.
-    """
-    from .bets_db import get_all_bets  # уже есть в импортах сверху, здесь для автономности
+    from .bets_db import get_all_bets
 
     bets = get_all_bets(session, user_id) or []
     if not bets:
@@ -1260,9 +895,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
         )
 
     def detect_market(b) -> str:
-        """
-        Грубая, но рабочая классификация рынка по тексту.
-        """
         text_parts = [
             (getattr(b, "outcome", "") or ""),
             (getattr(b, "event", "") or ""),
@@ -1278,7 +910,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
             return "исходы"
         return "другое"
 
-    # Агрегация по рынкам
     from collections import defaultdict
 
     agg = defaultdict(lambda: {
@@ -1309,12 +940,10 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
         if profit is not None:
             a["pnl"] += float(profit)
 
-    # Формируем основной блок
     lines: list[str] = []
     lines.append("📊 Разбор по типам рынков (за всё время):")
 
     market_rows = []
-
     for market, a in agg.items():
         bets_count = a["bets"]
         settled = a["settled"]
@@ -1335,7 +964,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
             }
         )
 
-    # Сортируем по количеству ставок, чтобы сначала показать самые частые рынки
     market_rows.sort(key=lambda r: r["bets"], reverse=True)
 
     for row in market_rows:
@@ -1345,7 +973,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
             f"PnL {row['pnl']:+.0f}"
         )
 
-    # Если выборка совсем маленькая — мягкий дисклеймер
     total_settled = sum(r["bets"] for r in market_rows)
     if total_settled < 5:
         lines.append(
@@ -1353,8 +980,6 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
             "тем точнее я смогу подсветить сильные и слабые зоны."
         )
 
-    # Вывод: сильные и слабые рынки
-    # Сильные = ROI > 0 и ставок ≥ 2
     strong = [r for r in market_rows if r["roi"] > 0 and r["bets"] >= 2]
     weak = [r for r in market_rows if r["roi"] < 0 and r["bets"] >= 2]
 
@@ -1390,19 +1015,10 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
     return "\n".join(lines)
 
 
-
-# ------------------ БАНК И РЕКОМЕНДАЦИИ ПО РАЗМЕРУ СТАВКИ ------------------
+# ===================== БАНК и РАЗМЕР СТАВКИ =====================
 
 
 def _calc_recommended_stake_range(bank: float) -> tuple[float, float, float, float]:
-    """
-    Возвращает (low_pct, high_pct, low_amt, high_amt).
-    Простая модель:
-    - банк ≤ 30k → 1–2%
-    - 30k–100k  → 1–3%
-    - 100k–300k → 1–4%
-    - >300k     → 1–5%
-    """
     if bank <= 30_000:
         low_pct, high_pct = 0.01, 0.02
     elif bank <= 100_000:
@@ -1434,10 +1050,6 @@ def _build_bank_status_text(bank: float) -> str:
 
 
 def _build_bank_hint_for_stake(bank: float, stake: float | None) -> list[str]:
-    """
-    Строим подсказку по размеру ставки относительно банка.
-    Возвращаем список строк, которые можно добавить к ответу.
-    """
     if bank <= 0:
         return []
 
@@ -1468,16 +1080,10 @@ def _build_bank_hint_for_stake(bank: float, stake: float | None) -> list[str]:
     return lines
 
 
-# ------------------ ОЦЕНКА КОНКРЕТНОЙ СТАВКИ ------------------
+# ===================== ОЦЕНКА КОНКРЕТНОЙ СТАВКИ =====================
 
 
 def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str:
-    """
-    Разбираем ставку из текста, смотрим:
-    - банк и размер ставки относительно него;
-    - исторический результат пользователя по этому типу рынка.
-    Даём чек-лист, без 'ставь / не ставь'.
-    """
     stake, odds = _parse_stake_and_odds(raw_text)
     outcome, event = _parse_outcome_and_event(raw_text)
 
@@ -1570,140 +1176,15 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
     )
 
     return "\n".join(lines)
-    
-def build_value_analysis(raw_text: str) -> str:
-    """
-    Value-разбор кэфа:
-    - парсим кэф
-    - парсим твою оценку вероятности (например '60%' или 'вероятность 60')
-    - считаем:
-        * имплайд-вероятность
-        * 'справедливый' кэф по твоей оценке
-        * edge (разница в п.п.)
-        * ожидаемое матожидание (EV)
-    """
-    text = raw_text.lower()
 
-    # 1) Пытаемся вытащить кэф через общий парсер
-    _, odds = _parse_stake_and_odds(raw_text)
 
-    # 1.1) Если не получилось — пробуем сами достать число как кэф
-    if odds is None:
-        num_matches = re.findall(r"(\d+([\.,]\d+)?)", text)
-        for m in num_matches:
-            try:
-                val = float(m[0].replace(",", "."))
-            except ValueError:
-                continue
-            # разумный диапазон кэфа
-            if 1.01 <= val <= 20.0:
-                odds = val
-                break
-
-    lines: list[str] = []
-    lines.append("🎯 Value-разбор ставки:")
-
-    if odds is None:
-        lines.append("")
-        lines.append(
-            "Я не смог вытащить коэффициент из текста.\n"
-            "Напиши что-то вроде: 'value ставка по 1.85 при вероятности 60%'."
-        )
-        return "\n".join(lines)
-
-    # 2) Имплайд-вероятность по кэфу
-    implied_prob = 100.0 / odds
-
-    lines.append("")
-    lines.append(f"Коэффициент: {odds:.2f}")
-    lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
-
-    # 3) Парсим пользовательскую вероятность
-    user_prob: float | None = None
-
-    # вариант: '60%' / '60 %'
-    m_pct = re.search(r"(\d+([\.,]\d+)?)\s*%", text)
-    if m_pct:
-        try:
-            user_prob = float(m_pct.group(1).replace(",", "."))
-        except ValueError:
-            user_prob = None
-
-    # вариант: 'вероятн 60', 'оценка 55', 'шанс 62'
-    if user_prob is None:
-        m_prob = re.search(
-            r"(вероятн|оценк|шанс)[^\d]{0,10}(\d+([\.,]\d+)?)",
-            text,
-        )
-        if m_prob:
-            try:
-                user_prob = float(m_prob.group(2).replace(",", "."))
-            except ValueError:
-                user_prob = None
-
-    # ограничим адекватный диапазон
-    if user_prob is not None and not (0 < user_prob < 100):
-        user_prob = None
-
-    # Если пользователь не дал свою вероятность — даём лёгкий чек и просим её
-    if user_prob is None:
-        lines.append("")
-        lines.append(
-            "Ты не указал свою оценку вероятности.\n"
-            "Чтобы я посчитал value, добавь, например: 'при вероятности 60%' или 'шанс 55%'."
-        )
-        lines.append("")
-        lines.append(
-            "Пример запроса:\n"
-            "• 'value 1.85 при вероятности 60%'\n"
-            "• 'value ставка по 2.10, шанс 48%'"
-        )
-        return "\n".join(lines)
-
-    # 4) 'Справедливый' кэф по твоей оценке
-    fair_odds_by_user = 100.0 / user_prob
-
-    # edge в п.п. и EV
-    edge_pp = user_prob - implied_prob  # +edge = value
-    ev = odds * (user_prob / 100.0) - 1.0  # матожидание на 1 ед. ставки
-
-    lines.append("")
-    lines.append(f"Твоя оценка вероятности: ≈ {user_prob:.1f}%")
-    lines.append(f"'Справедливый' кэф по твоей оценке: ≈ {fair_odds_by_user:.2f}")
-    lines.append(f"Edge (разница): ≈ {edge_pp:.1f} п.п.")
-
-    lines.append("")
-    sign_ev = "+" if ev >= 0 else ""
-    lines.append(f"Ожидаемое матожидание (EV) на 1 единицу ставки: {sign_ev}{ev:.3f}")
-    if ev > 0:
-        lines.append(
-            "Это позитивное матожидание: при такой оценке вероятности ставка выглядит плюс-EV на дистанции."
-        )
-    elif ev < 0:
-        lines.append(
-            "Это отрицательное матожидание: при такой оценке вероятности ставка в минус-EV, "
-            "рынок даёт хуже, чем твой 'справедливый' кэф."
-        )
-    else:
-        lines.append(
-            "Теоретически нулевое матожидание — линия примерно совпадает с твоей оценкой."
-        )
-
-    lines.append("")
-    lines.append(
-        "Важно: я не говорю 'ставь/не ставь'. Value-разбор — это чек-лист:\n"
-        "• рынок → даёт имплайд-вероятность;\n"
-        "• ты → даёшь свою оценку;\n"
-        "• разница показывает, насколько линия лучше/хуже твоей модели."
-    )
-
-    return "\n".join(lines)
+# ===================== VALUE-РАЗБОР КЭФА =====================
 
 
 def build_value_analysis(raw_text: str) -> str:
     """
     Value-разбор кэфа:
-    - парсим кэф напрямую из текста (первое число, похожее на коэффициент)
+    - парсим кэф (первое число 1.01–20.0, которое не похоже на %)
     - парсим твою оценку вероятности ('60%' / 'шанс 60' / 'вероятность 55')
     - считаем:
         * имплайд-вероятность по рынку
@@ -1714,7 +1195,6 @@ def build_value_analysis(raw_text: str) -> str:
     text = raw_text.strip()
     lowered = text.lower()
 
-    # 1) Парсим коэффициент: первое число 1.01–20.0, которое не похоже на %
     odds: float | None = None
     for m in re.finditer(r"(\d+([\.,]\d+)?)", text):
         num_str = m.group(1)
@@ -1723,7 +1203,6 @@ def build_value_analysis(raw_text: str) -> str:
         except ValueError:
             continue
 
-        # если сразу после числа стоит %, считаем, что это вероятность, а не кэф
         end_pos = m.end(1)
         if end_pos < len(text) and text[end_pos] == "%":
             continue
@@ -1743,16 +1222,12 @@ def build_value_analysis(raw_text: str) -> str:
         )
         return "\n".join(lines)
 
-    # 2) Имплайд-вероятность по кэфу
     implied_prob = 100.0 / odds
-
     lines.append("")
     lines.append(f"Коэффициент: {odds:.2f}")
     lines.append(f"Имплайд-вероятность по рынку: ≈ {implied_prob:.1f}%")
 
-    # 3) Парсим пользовательскую оценку вероятности
     user_prob: float | None = None
-
     m_pct = re.search(r"(\d+([\.,]\d+)?)\s*%", lowered)
     if m_pct:
         try:
@@ -1788,7 +1263,6 @@ def build_value_analysis(raw_text: str) -> str:
         )
         return "\n".join(lines)
 
-    # 4) Считаем 'справедливый' кэф, edge и EV
     fair_odds_by_user = 100.0 / user_prob
     edge_pp = user_prob - implied_prob
     ev = odds * (user_prob / 100.0) - 1.0
@@ -1797,7 +1271,6 @@ def build_value_analysis(raw_text: str) -> str:
     lines.append(f"Твоя оценка вероятности: ≈ {user_prob:.1f}%")
     lines.append(f"'Справедливый' кэф по твоей оценке: ≈ {fair_odds_by_user:.2f}")
     lines.append(f"Edge (разница): ≈ {edge_pp:.1f} п.п.")
-
     lines.append("")
     sign_ev = "+" if ev >= 0 else ""
     lines.append(f"Ожидаемое матожидание (EV) на 1 единицу ставки: {sign_ev}{ev:.3f}")
@@ -1822,97 +1295,13 @@ def build_value_analysis(raw_text: str) -> str:
         "• ты → даёшь свою оценку;\n"
         "• разница показывает, насколько линия лучше/хуже твоей модели."
     )
-
     return "\n".join(lines)
 
 
-def _build_quick_bet_comment(
-    stake: float | None,
-    odds: float | None,
-    outcome: str | None,
-) -> list[str]:
-    """
-    Короткий человеческий комментарий к только что сохранённой ставке.
-    Без сложной статистики, просто чек-лист по кэфу и типу рынка.
-    """
-    lines: list[str] = []
-    lines.append("")
-    lines.append("🧠 Быстрый комментарий по ставке:")
-
-    # --- Разбор коэффициента ---
-    if odds is not None:
-        if odds < 1.30:
-            lines.append(
-                "• Очень низкий коэффициент. Такие ставки кажутся «надёжными», "
-                "но маржа бука и редкие минусы могут съедать банк."
-            )
-        elif odds < 1.70:
-            lines.append(
-                "• Умеренный коэффициент — ставка ближе к фавориту, риск пониже, "
-                "но и потенциал прибыли ограничен."
-            )
-        elif odds <= 2.50:
-            lines.append(
-                "• Рабочий диапазон коэффициентов — хороший баланс между риском и наградой."
-            )
-        else:
-            lines.append(
-                "• Высокий коэффициент — повышенный риск. Важно, чтобы у ставки была "
-                "реальная аргументация, а не просто охота за большими кэфами."
-            )
-
-    # --- Разбор типа рынка ---
-    if outcome:
-        cat = _get_market_category(outcome)
-        if cat == "тоталы":
-            lines.append(
-                "• Это ставка на тотал. Смотри на темп игры, качество атаки и спецбригады, "
-                "а не только на ощущение «будет весёлый матч»."
-            )
-        elif cat == "форы":
-            lines.append(
-                "• Это ставка на фору. Важны частота побед/поражений с разницей в счёте "
-                "и глубина состава, а не только статус фаворита."
-            )
-        elif cat == "1X2":
-            lines.append(
-                "• Это исход 1X2. Рынок тут обычно довольно точный, так что важно искать "
-                "недооценённые стороны, а не просто любимую команду."
-            )
-        else:
-            lines.append(
-                "• Это менее стандартный рынок. Следи, чтобы таких ставок не становилось "
-                "слишком много без понятной стратегии."
-            )
-
-    # Если вообще ничего не распознали
-    if not (stake or odds or outcome):
-        lines.append(
-            "• Я сохранил ставку. Чем подробнее будешь указывать событие, исход и коэффициент, "
-            "тем точнее смогу помогать дальше."
-        )
-
-    lines.append("")
-    lines.append(
-        "Это не команда «ставить / не ставить», а короткий чек-лист, чтобы ты сам оценил идею ставки."
-    )
-    return lines
-
-
-
-
-# ------------------ ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ------------------
+# ===================== ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ =====================
 
 
 def build_user_profile(session: Session, user_id: int) -> str:
-    """
-    Личный кабинет / профиль игрока:
-    - банк
-    - общая статистика
-    - результат за 7 дней
-    - сильный и слабый рынок
-    - персональный совет
-    """
     stats = get_user_stats(session, user_id)
     bank = get_user_bank(session, user_id)
     bets = get_all_bets(session, user_id)
@@ -1920,7 +1309,6 @@ def build_user_profile(session: Session, user_id: int) -> str:
     lines: list[str] = []
     lines.append("👤 Твой профиль игрока:")
 
-    # Блок банка
     lines.append("")
     if bank is not None:
         lines.append(_build_bank_status_text(bank))
@@ -1930,7 +1318,6 @@ def build_user_profile(session: Session, user_id: int) -> str:
             "Задай, например: 'мой банк 100000', и я начну отслеживать риск и просадку."
         )
 
-    # Общая статистика
     lines.append("")
     lines.append("📊 Общая статистика:")
     if stats.total_bets == 0:
@@ -1947,14 +1334,11 @@ def build_user_profile(session: Session, user_id: int) -> str:
             lines.append(f"PnL за всё время: {sign_pnl}{stats.pnl:.0f}")
             lines.append(f"Общий объём ставок: {stats.total_stake:.0f}")
 
-    # Результат за 7 дней
     bets_7d, period_start, now = _get_last_7d_bets(session, user_id)
     lines.append("")
     lines.append("⏱ Результат за последние 7 дней:")
     if not bets_7d:
-        lines.append(
-            "За последние 7 дней у тебя не было записанных ставок."
-        )
+        lines.append("За последние 7 дней у тебя не было записанных ставок.")
     else:
         settled_7d = [b for b in bets_7d if b.result in ("win", "lose")]
         pnl_7d = sum(b.profit or 0.0 for b in settled_7d)
@@ -1967,7 +1351,6 @@ def build_user_profile(session: Session, user_id: int) -> str:
             winrate_7d = len(wins_7d) / len(settled_7d) * 100.0
             lines.append(f"Winrate за период: {winrate_7d:.1f}%")
 
-    # Сильный / слабый рынок
     lines.append("")
     lines.append("🎯 Твои рынки:")
 
@@ -2044,13 +1427,11 @@ def build_user_profile(session: Session, user_id: int) -> str:
                 "Выборка по рынкам пока небольшая. Чем больше сыграешь, тем точнее я покажу сильные и слабые зоны."
             )
 
-    # Персональный совет
     lines.append("")
     lines.append("🧠 Совет по твоей игре:")
 
     advice_parts: list[str] = []
 
-    # по 7д результату
     if bets_7d and settled_all:
         pnl_7d = sum(
             b.profit or 0.0
@@ -2065,15 +1446,12 @@ def build_user_profile(session: Session, user_id: int) -> str:
                 "Последние 7 дней у тебя в плюсе — важно не завышать ставки из-за серии успехов."
             )
 
-    # по банку
     if bank is None:
         advice_parts.append(
             "Сейчас ты играешь без фиксированного банка. Чтобы контролировать риск, "
             "установи банк и держись безопасного процента от него (обычно 1–5%)."
         )
 
-
-    # по рынкам
     if settled_all and best_cat:
         cat, d = best_cat
         advice_parts.append(
@@ -2105,83 +1483,12 @@ def build_user_profile(session: Session, user_id: int) -> str:
     )
 
     return "\n".join(lines)
-def _build_tournament_motivation_hint(
-    team1_name: str,
-    team2_name: str,
-    odds_1: float,
-    odds_x: float,
-    odds_2: float,
-) -> list[str]:
-    """
-    Хинт по 'турнирной логике' и мотивации на основе линии 1X2.
-    Это приближение: мы не знаем реальную таблицу, но видим силу/разрыв по кэфам.
-    """
-    lines: list[str] = []
 
-    # Определяем фаворита и андердога по кэфам
-    fav_side = None
-    fav_odds = None
-    dog_side = None
-    dog_odds = None
 
-    if odds_1 < odds_2:
-        fav_side, fav_odds = "1", odds_1
-        dog_side, dog_odds = "2", odds_2
-        fav_name, dog_name = team1_name, team2_name
-    else:
-        fav_side, fav_odds = "2", odds_2
-        dog_side, dog_odds = "1", odds_1
-        fav_name, dog_name = team2_name, team1_name
+# ===================== ЭКСПРЕССЫ =====================
 
-    # Базовый комментарий только если фаворит выраженный
-    # Например, фаворит ≤ 1.55 и андердог ≥ 3.50
-    if fav_odds <= 1.55 and dog_odds >= 3.50:
-        lines.append("")
-        lines.append("🧠 Турнирная логика и мотивация:")
 
-        lines.append(
-            f"По линии видно, что {fav_name} — явный фаворит ({fav_side} за {fav_odds:.2f}), "
-            f"а {dog_name} — андердог ({dog_side} за {dog_odds:.2f})."
-        )
-
-        # Риск "расслабленного" матча против слабого
-        lines.append(
-            "В таких матчах топ-команды часто играют аккуратнее по ходу сезона: "
-            "могут экономить силы, давать больше времени молодым и не 'давить' весь матч."
-        )
-
-        # Ничья / ОТ
-        if odds_x <= 4.20:
-            lines.append(
-                "Кэф на ничью не зашкаливает — рынок допускает сценарий, когда фаворит "
-                "спокойно доводит игру до равного счёта и решает всё в ОТ/буллитах."
-            )
-        else:
-            lines.append(
-                "Кэф на ничью высокий, но всё равно в матчах 'топ vs аутсайдер' нередко видим "
-                "равную концовку, если фаворит не включает максимум."
-            )
-
-        # Что такие матчи значат для ставок
-        lines.append(
-            "Для ставок это значит, что чистая победа фаворита в основное время по низкому кэфу "
-            "несёт дополнительный риск: команда может 'не дожимать' аутсайдера."
-        )
-        lines.append(
-            "Чаще в таких расстановках рассматривают:\n"
-            "• аккуратные форы на аутсайдера (+1.5 / +2.5),\n"
-            "• ничью или игру через ОТ/буллиты,\n"
-            "• тоталы с учётом возможного низкого темпа (если нет явного 'безумного' хоккея)."
-        )
-
-    return lines
 def build_express_evaluation(raw_text: str) -> str:
-    """
-    Простейший разбор экспресса:
-    - вытаскиваем все числа-подобные коэффициенты из текста;
-    - фильтруем только те, что похожи на кэфы (1.01–15.0);
-    - считаем общий кэф, имплайд-вероятность и даём комментарий по рискам.
-    """
     text = raw_text.replace(",", ".")
     matches = re.findall(r"(\d+(\.\d+)?)", text)
 
@@ -2192,8 +1499,6 @@ def build_express_evaluation(raw_text: str) -> str:
             val = float(num_str)
         except ValueError:
             continue
-
-        # считаем кэфами только вменяемый диапазон
         if 1.01 <= val <= 15.0:
             odds_list.append(val)
 
@@ -2214,14 +1519,11 @@ def build_express_evaluation(raw_text: str) -> str:
         )
         return "\n".join(lines)
 
-    # считаем общий коэффициент
     total_odds = 1.0
     for o in odds_list:
         total_odds *= o
 
     implied_prob = 100.0 / total_odds
-
-    # чуть-чуть аналитики
     n = len(odds_list)
     avg_leg_odds = total_odds ** (1.0 / n)
 
@@ -2233,9 +1535,8 @@ def build_express_evaluation(raw_text: str) -> str:
     lines.append("")
     lines.append(f"Количество событий в экспрессе: {n}")
     lines.append(f"Средний кэф на одно плечо: ≈ {avg_leg_odds:.2f}")
-
     lines.append("")
-    # Комментарий по рискам
+
     if n <= 2:
         lines.append(
             "• Небольшой экспресс. Риск выше, чем в ординаре, но ещё в разумных пределах, "
@@ -2268,128 +1569,10 @@ def build_express_evaluation(raw_text: str) -> str:
     return "\n".join(lines)
 
 
-def build_khl_match_analysis(ev) -> str:
-    """
-    Базовый и максимально устойчивый разбор матча КХЛ.
+# ===================== ДЕМО КХЛ / HELP =====================
 
-    Специально без вызовов формы/модели, чтобы:
-    - не ловить 500-ки;
-    - всегда отдавать хотя бы разбор линии 1X2.
-    """
-
-    team1_name = getattr(ev, "team1", "Команда 1")
-    team2_name = getattr(ev, "team2", "Команда 2")
-    event_id = getattr(ev, "id", "—")
-
-    # --- 1. Находим рынок 1X2 ---
-    market_1x2 = None
-    for m in getattr(ev, "markets", []) or []:
-        name = (getattr(m, "name", "") or "").upper()
-        if name in ("1X2", "1X", "3WAY", "3-WAY"):
-            market_1x2 = m
-            break
-
-    if not market_1x2:
-        return (
-            f"📊 Разбор матча КХЛ:\n"
-            f"{team1_name} — {team2_name} (id: {event_id})\n\n"
-            "Я не нашёл рынок 1X2 по этому матчу. "
-            "Попробуй другой матч или позже — возможно, линия ещё не выставлена."
-        )
-
-    # --- 2. Собираем коэффициенты 1 / X / 2 ---
-    odds_map: dict[str, float] = {}
-    for o in getattr(market_1x2, "outcomes", []) or []:
-        key = (getattr(o, "name", "") or "").strip()
-        price = getattr(o, "price", None)
-        if not key or price is None:
-            continue
-        try:
-            odds_map[key] = float(price)
-        except (TypeError, ValueError):
-            continue
-
-    def _pick_odds(*names: str):
-        for n in names:
-            if n in odds_map:
-                return odds_map[n]
-        return None
-
-    odds_1 = _pick_odds("1", "HOME")
-    odds_x = _pick_odds("X", "DRAW")
-    odds_2 = _pick_odds("2", "AWAY")
-
-    if odds_1 is None or odds_x is None or odds_2 is None:
-        lines = [
-            f"📊 Разбор матча КХЛ:",
-            f"{team1_name} — {team2_name} (id: {event_id})",
-            "",
-            "Не удалось корректно прочитать все три коэффициента 1X2.",
-            "Показываю только то, что найдено:",
-        ]
-        for k, v in odds_map.items():
-            lines.append(f"• {k}: кэф {v:.2f}")
-        lines.append("")
-        lines.append(
-            "Можно прогонять найденные коэффициенты через 'value 1.85' "
-            "— я переведу кэф в вероятность."
-        )
-        return "\n".join(lines)
-
-    # --- 3. Имплайд-вероятности ---
-    imp_1 = 100.0 / odds_1
-    imp_x = 100.0 / odds_x
-    imp_2 = 100.0 / odds_2
-    imp_sum = imp_1 + imp_x + imp_2
-    margin = imp_sum - 100.0
-
-    if imp_sum > 0:
-        fair_1 = imp_1 / imp_sum * 100.0
-        fair_x = imp_x / imp_sum * 100.0
-        fair_2 = imp_2 / imp_sum * 100.0
-    else:
-        fair_1 = fair_x = fair_2 = 0.0
-
-    lines: list[str] = []
-    lines.append("📊 Разбор матча КХЛ:")
-    lines.append(f"{team1_name} — {team2_name} (id: {event_id})")
-    lines.append("")
-    lines.append("Линия 1X2 (коэффициенты и имплайд-вероятности):")
-    lines.append(f"• 1: кэф {odds_1:.2f}, импл. вероятность ≈ {imp_1:.1f}%")
-    lines.append(f"• X: кэф {odds_x:.2f}, импл. вероятность ≈ {imp_x:.1f}%")
-    lines.append(f"• 2: кэф {odds_2:.2f}, импл. вероятность ≈ {imp_2:.1f}%")
-    lines.append("")
-    lines.append(f"Маржа букмекера ≈ {margin:.1f} п.п.")
-    lines.append("")
-    lines.append("Оценка 'честных' вероятностей (без маржи):")
-    lines.append(f"• 1: ≈ {fair_1:.1f}%")
-    lines.append(f"• X: ≈ {fair_x:.1f}%")
-    lines.append(f"• 2: ≈ {fair_2:.1f}%")
-    lines.append("")
-    lines.append(
-        "Используй это как чек-лист, а не прогноз:\n"
-        "• выбери исход (1/X/2),\n"
-        "• прогоняй кэф через команды вида 'value 2.10'."
-    )
-
-    # --- 4. Турнирная логика и мотивация (твоя идея про «топ / середняк / дно») ---
-    try:
-        ctx = build_match_context_notes(team1_name, team2_name, league="KHL")
-    except Exception:
-        ctx = ""
-
-    if ctx:
-        lines.append("")
-        lines.append("📌 Турнирный контекст и мотивация:")
-        lines.append(ctx)
-
-    return "\n".join(lines)
 
 def build_khl_today_matches_demo() -> str:
-    """
-    Демо-версия списка матчей КХЛ на сегодня.
-    Пока без реального парсинга — статический пример с одним матчем.
-    """
     lines: list[str] = []
     lines.append("🏒 Матчи КХЛ на сегодня (демо-режим):")
     lines.append("")
@@ -2408,6 +1591,7 @@ def build_khl_today_matches_demo() -> str:
         "и аналитику по форме команд."
     )
     return "\n".join(lines)
+
 
 def build_help_text() -> str:
     return (
