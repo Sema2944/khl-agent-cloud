@@ -2819,12 +2819,20 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
         return build_monthly_report(session, user_id)
 
-    # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
+        # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
     if m_an:
         event_id_str = m_an.group(2)
+
+        # 9.0) Демо-матч для id 123456 — всегда доступен, даже без API
+        if event_id_str == "123456":
+            demo_ev = get_demo_event(123456)
+            if demo_ev is not None:
+                return build_khl_match_analysis(demo_ev)
+
+        # 9.1) Пытаемся найти матч среди сегодняшних игр КХЛ (Fonbet)
         try:
             events = await get_today_khl_events()
         except Exception:
@@ -2847,7 +2855,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
 
         try:
-            # сейчас build_khl_match_analysis у нас sync, если сделаешь async — можно будет await
             return build_khl_match_analysis(ev)
         except Exception:
             logger.exception("Ошибка внутри build_khl_match_analysis")
@@ -2856,6 +2863,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Я это поправлю, а пока можно пользоваться общими командами: "
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
+
 
              # 10) ОЦЕНКА СТАВКИ
     if (
@@ -2936,9 +2944,69 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_value_analysis(original_text)
 
-           # 11) МАТЧИ КХЛ НА СЕГОДНЯ (демо-режим, несколько матчей)
+               # 11) МАТЧИ КХЛ НА СЕГОДНЯ (реальные данные + демо-фолбэк)
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
-        return build_khl_today_matches_demo()
+        try:
+            events = await get_today_khl_events()
+        except Exception:
+            logger.exception("Ошибка get_today_khl_events()")
+            return (
+                "Не смог получить реальные матчи КХЛ (ошибка парсера или API Fonbet).\n\n"
+                + build_khl_today_matches_demo()
+            )
+
+        if not events:
+            return (
+                "На сегодня я не нашёл матчей КХЛ в линии Fonbet.\n\n"
+                + build_khl_today_matches_demo()
+            )
+
+        lines: list[str] = []
+        lines.append("Матчи КХЛ на сегодня:")
+
+        for ev in events:
+            start_time = getattr(ev, "start_time", None)
+            time_str = (
+                start_time.strftime("%H:%M")
+                if isinstance(start_time, datetime)
+                else "??:??"
+            )
+
+            line = f"{ev.id}: {time_str} {ev.team1} — {ev.team2}"
+
+            # Пытаемся показать линию 1X2, если есть
+            market_1x2 = None
+            for m in getattr(ev, "markets", []) or []:
+                name = (getattr(m, "name", "") or "").upper()
+                if name in ("1X2", "3WAY", "3-WAY"):
+                    market_1x2 = m
+                    break
+
+            if market_1x2:
+                odds_map: dict[str, float] = {}
+                for o in getattr(market_1x2, "outcomes", []) or []:
+                    k = (getattr(o, "name", "") or "").strip()
+                    price = getattr(o, "price", None)
+                    if not k or price is None:
+                        continue
+                    try:
+                        odds_map[k] = float(price)
+                    except (TypeError, ValueError):
+                        continue
+
+                o1 = odds_map.get("1")
+                ox = odds_map.get("X")
+                o2 = odds_map.get("2")
+                if o1 and ox and o2:
+                    line += f" | 1X2: {o1:.2f} / {ox:.2f} / {o2:.2f}"
+
+            lines.append(line)
+
+        lines.append("")
+        lines.append("Чтобы получить разбор линии по конкретному матчу, напиши: 'анализ матча <id>'.")
+
+        return "\n".join(lines)
+
 
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
     if "экспресс" in text:
