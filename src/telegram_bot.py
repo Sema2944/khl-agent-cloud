@@ -384,6 +384,4 @@ def main() -> None:
     # Все текстовые сообщения (кроме команд) — в агент / спец-обработчики
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Блокирующий запуск polling в этом потоке,
-    # без установки signal handlers (stop_signals=None)
     app.run_polling(stop_signals=None)
