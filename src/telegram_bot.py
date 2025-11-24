@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 def build_main_keyboard() -> ReplyKeyboardMarkup:
     """
     Главная клавиатура с основными кнопками.
-    Тексты кнопок совпадают с командами, которые понимает run_agent.
+    Тексты кнопок совпадают с командами, которые понимает /agent.
     """
     keyboard = [
         ["профиль", "мои ставки"],
@@ -173,9 +173,15 @@ def _format_bet_for_user(b: dict) -> str:
     if outcome:
         lines.append(f"Исход: {outcome}")
     if stake is not None:
-        lines.append(f"Сумма: {stake:.0f}")
+        try:
+            lines.append(f"Сумма: {float(stake):.0f}")
+        except Exception:
+            lines.append(f"Сумма: {stake}")
     if odds is not None:
-        lines.append(f"Коэффициент: {odds:.2f}")
+        try:
+            lines.append(f"Коэффициент: {float(odds):.2f}")
+        except Exception:
+            lines.append(f"Коэффициент: {odds}")
 
     if result:
         # человекочитаемый результат
@@ -189,8 +195,12 @@ def _format_bet_for_user(b: dict) -> str:
             human = result
         res_line = f"Результат: {human}"
         if profit is not None:
-            sign = "+" if profit >= 0 else ""
-            res_line += f", PnL: {sign}{profit:.0f}"
+            try:
+                p = float(profit)
+                sign = "+" if p >= 0 else ""
+                res_line += f", PnL: {sign}{p:.0f}"
+            except Exception:
+                res_line += f", PnL: {profit}"
         lines.append(res_line)
 
     return "\n".join(lines)
@@ -359,7 +369,7 @@ def main() -> None:
     Точка входа бота.
 
     ВАЖНО:
-    - бот запускается в отдельном потоке (из FastAPI),
+    - бот запускается в отдельном потоке (из FastAPI или воркера),
     - поэтому мы создаём свой asyncio event loop,
     - и избегаем установки signal handlers (stop_signals=None),
       иначе Python ругается `set_wakeup_fd only works in main thread`.
@@ -384,4 +394,10 @@ def main() -> None:
     # Все текстовые сообщения (кроме команд) — в агент / спец-обработчики
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Блокирующий запуск polling в этом потоке,
+    # без установки signal handlers (stop_signals=None)
     app.run_polling(stop_signals=None)
+
+
+if __name__ == "__main__":
+    main()
