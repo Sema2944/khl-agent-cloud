@@ -1,8 +1,3 @@
-# src/service.py
-from .winline_client import format_khl_today_text, get_khl_events_today
-from .hockey_logic import khl_today_text_from_winline
-from .hockey_logic import build_match_context_notes
-from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
 import logging
 import os
 import re
@@ -24,10 +19,11 @@ from .bets_db import (
     get_all_bets,
 )
 
+# Winline + хоккейная логика
 from .winline_client import get_winline_khl_events
 from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
 
-)
+# Форма КХЛ (как и было)
 from .khl_form_client import (
     get_team_form,
     TeamForm,
@@ -36,6 +32,7 @@ from .khl_form_client import (
 import inspect
 
 logger = logging.getLogger(__name__)
+
 
 
 # ===================== ПРЕМИУМ =====================
@@ -1636,20 +1633,12 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     Простейший if/else-агент.
     """
-    original_text = message or ""
+        original_text = message or ""
     text = original_text.lower().strip()
 
-    # ===================== КХЛ СЕГОДНЯ (Winline) =====================
-    if "кхл сегодня" in norm:
-        try:
-            # Реальная линия КХЛ из Winline
-            reply_text = await khl_today_text_from_winline()
-            return reply_text
-        except Exception as e:
-            logger.exception("Ошибка при получении КХЛ-линии из Winline: %s", e)
-            # Фолбэк — старый демо-ответ
-            return build_khl_today_matches_demo(error_source="winline")
-
+    # 0) ЯВНОЕ МЕНЮ / HELP
+    if text == "меню" or text == "/start" or "что ты умеешь" in text:
+        ...
 
     # 0) ЯВНОЕ МЕНЮ / HELP
     if text == "меню" or text == "/start" or "что ты умеешь" in text:
@@ -2142,19 +2131,26 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return build_value_analysis(original_text)
         
 
-             # 11) КХЛ сегодня — линия из Winline
+            # 11) КХЛ сегодня — линия из Winline
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
-            return await khl_today_text_from_winline()
+            reply = await khl_today_text_from_winline()
+
+            # На всякий случай проверим, что функция не вернула пустоту
+            if not reply or not reply.strip():
+                raise ValueError("Пустой ответ от khl_today_text_from_winline")
+
+            return reply
+
         except Exception:
             logger.exception("Ошибка khl_today_text_from_winline()")
             return (
-                "❌ Не получилось получить линию КХЛ из Winline.\n"
-                "Это может быть временная проблема сервиса. Попробуй чуть позже."
+                "Не удалось получить линию КХЛ из Winline (возможно, временная проблема сервиса).\n\n"
+                + build_khl_today_matches_demo()
             )
 
-              
 
+    
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
     if "экспресс" in text:
         return build_express_evaluation(original_text)
