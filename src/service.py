@@ -1,5 +1,5 @@
 # src/service.py
-
+from .hockey_logic import khl_today_text_from_winline
 from .hockey_logic import build_match_context_notes
 import logging
 import os
@@ -1637,7 +1637,12 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     original_text = message or ""
     text = original_text.lower().strip()
-    
+        # пример: norm = text.strip().lower()
+    if "кхл сегодня" in norm:
+        # Реальная линия КХЛ из Winline
+        reply_text = await khl_today_text_from_winline()
+        return reply_text
+
     # 0) ЯВНОЕ МЕНЮ / HELP
     if text == "меню" or text == "/start" or "что ты умеешь" in text:
         return build_help_text()
