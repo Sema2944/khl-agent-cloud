@@ -22,10 +22,9 @@ from .bets_db import (
     get_all_bets,
 )
 
-from .khl_client import (
-    get_today_khl_events,
-    build_khl_today_matches_demo,
-    get_demo_event,
+from .winline_client import get_winline_khl_events
+from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
+
 )
 from .khl_form_client import (
     get_team_form,
@@ -1637,11 +1636,19 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     original_text = message or ""
     text = original_text.lower().strip()
-        # пример: norm = text.strip().lower()
+    norm = text  # нормализованный текст, чтобы поиском по нему работать
+
+    # ===================== КХЛ СЕГОДНЯ (Winline) =====================
     if "кхл сегодня" in norm:
-        # Реальная линия КХЛ из Winline
-        reply_text = await khl_today_text_from_winline()
-        return reply_text
+        try:
+            # Реальная линия КХЛ из Winline
+            reply_text = await khl_today_text_from_winline()
+            return reply_text
+        except Exception as e:
+            logger.exception("Ошибка при получении КХЛ-линии из Winline: %s", e)
+            # Фолбэк — старый демо-ответ
+            return build_khl_today_matches_demo(error_source="winline")
+
 
     # 0) ЯВНОЕ МЕНЮ / HELP
     if text == "меню" or text == "/start" or "что ты умеешь" in text:
@@ -2133,68 +2140,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     ):
         return build_value_analysis(original_text)
 
-               # 11) МАТЧИ КХЛ НА СЕГОДНЯ (реальные данные + демо-фолбэк)
-    if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
-        try:
-            events = await get_today_khl_events()
-        except Exception:
-            logger.exception("Ошибка get_today_khl_events()")
-            return (
-                "Не смог получить реальные матчи КХЛ (ошибка парсера или API Fonbet).\n\n"
-                + build_khl_today_matches_demo()
-            )
-
-        if not events:
-            return (
-                "На сегодня я не нашёл матчей КХЛ в линии Fonbet.\n\n"
-                + build_khl_today_matches_demo()
-            )
-
-        lines: list[str] = []
-        lines.append("Матчи КХЛ на сегодня:")
-
-        for ev in events:
-            start_time = getattr(ev, "start_time", None)
-            time_str = (
-                start_time.strftime("%H:%M")
-                if isinstance(start_time, datetime)
-                else "??:??"
-            )
-
-            line = f"{ev.id}: {time_str} {ev.team1} — {ev.team2}"
-
-            # Пытаемся показать линию 1X2, если есть
-            market_1x2 = None
-            for m in getattr(ev, "markets", []) or []:
-                name = (getattr(m, "name", "") or "").upper()
-                if name in ("1X2", "3WAY", "3-WAY"):
-                    market_1x2 = m
-                    break
-
-            if market_1x2:
-                odds_map: dict[str, float] = {}
-                for o in getattr(market_1x2, "outcomes", []) or []:
-                    k = (getattr(o, "name", "") or "").strip()
-                    price = getattr(o, "price", None)
-                    if not k or price is None:
-                        continue
-                    try:
-                        odds_map[k] = float(price)
-                    except (TypeError, ValueError):
-                        continue
-
-                o1 = odds_map.get("1")
-                ox = odds_map.get("X")
-                o2 = odds_map.get("2")
-                if o1 and ox and o2:
-                    line += f" | 1X2: {o1:.2f} / {ox:.2f} / {o2:.2f}"
-
-            lines.append(line)
-
-        lines.append("")
-        lines.append("Чтобы получить разбор линии по конкретному матчу, напиши: 'анализ матча <id>'.")
-
-        return "\n".join(lines)
+              
 
 
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
