@@ -1,7 +1,12 @@
+# src/service.py
+from __future__ import annotations
+
 import logging
 import os
 import re
+import inspect
 from datetime import datetime, timedelta
+from typing import List
 
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
@@ -18,20 +23,15 @@ from .bets_db import (
     change_user_bank,
     get_all_bets,
 )
-
 from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
-
 from .khl_form_client import (
     get_team_form,
     TeamForm,
     TeamAdvancedForm,
 )
-
-import inspect
+from .winline_client import get_khl_events_today  # для анализа матча по id
 
 logger = logging.getLogger(__name__)
-
-
 
 
 # ===================== ПРЕМИУМ =====================
@@ -44,7 +44,6 @@ def is_premium(session: Session, user_id: int) -> bool:
     user = session.get(User, user_id)
     if not user or not getattr(user, "premium_until", None):
         return False
-    # сравниваем с UTC, чтобы не завязываться на локальное время
     return user.premium_until > datetime.utcnow()
 
 
@@ -146,9 +145,8 @@ def build_weekly_report(session: Session, user_id: int) -> str:
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
     Отчёт за последние 30 дней по ставкам пользователя.
-    Берём все ставки пользователя и фильтруем по дате created_at.
     """
-    from .bets_db import get_all_bets  # автономность
+    from .bets_db import get_all_bets  # локальный импорт
 
     today = datetime.utcnow()
     period_start = today - timedelta(days=30)
@@ -156,7 +154,8 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     bets_all = get_all_bets(session, user_id) or []
 
     bets = [
-        b for b in bets_all
+        b
+        for b in bets_all
         if getattr(b, "created_at", None) is not None
         and b.created_at >= period_start
     ]
@@ -176,20 +175,17 @@ def build_monthly_report(session: Session, user_id: int) -> str:
     pushes_count = len(pushes)
 
     total_stake = sum(
-        float(b.stake) for b in bets
-        if getattr(b, "stake", None) is not None
+        float(b.stake) for b in bets if getattr(b, "stake", None) is not None
     )
     total_pnl = sum(
-        float(b.profit) for b in bets
-        if getattr(b, "profit", None) is not None
+        float(b.profit) for b in bets if getattr(b, "profit", None) is not None
     )
 
     winrate = (len(wins) / settled_count * 100.0) if settled_count > 0 else 0.0
     roi = (total_pnl / total_stake * 100.0) if total_stake > 0 else 0.0
 
     bets_with_profit = [
-        b for b in bets
-        if getattr(b, "profit", None) is not None
+        b for b in bets if getattr(b, "profit", None) is not None
     ]
     best_bet = max(bets_with_profit, key=lambda b: b.profit) if bets_with_profit else None
     worst_bet = min(bets_with_profit, key=lambda b: b.profit) if bets_with_profit else None
@@ -281,12 +277,7 @@ def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
 def build_khl_match_analysis(ev) -> str:
     """
     Базовый и максимально устойчивый разбор матча КХЛ.
-
-    Без жёсткой завязки на внешние данные, чтобы:
-    - не ловить 500-ки;
-    - всегда отдавать хотя бы разбор линии 1X2.
     """
-
     team1_name = getattr(ev, "team1", "Команда 1")
     team2_name = getattr(ev, "team2", "Команда 2")
     event_id = getattr(ev, "id", "—")
@@ -422,12 +413,6 @@ class AgentResponse(BaseModel):
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """
-    Старт FastAPI:
-    - инициализация базы
-    - настройка логов
-    БЕЗ запуска Telegram-бота (бот можно крутить в отдельном worker-е).
-    """
     logging.basicConfig(level=logging.INFO)
     init_db()
     logger.info("FastAPI сервис запущен (бот работает в отдельном Worker).")
@@ -446,10 +431,6 @@ async def agent_query(
     payload: AgentQuery,
     session: Session = Depends(get_session),
 ) -> AgentResponse:
-    """
-    Главная точка входа для AI-агента.
-    Telegram-бот (и любые клиенты) шлют сюда user_id + текст.
-    """
     reply_text = await run_agent(
         user_id=payload.user_id,
         message=payload.message,
@@ -531,7 +512,6 @@ async def api_settle_bet(
 def _parse_stake_and_odds(raw_text: str) -> tuple[float | None, float | None]:
     """
     Выделяем сумму и коэффициент из произвольной строки.
-
     Особый кейс:
     - 'ставка на матч 123456 2000'
       → матч 123456 (ID), ставка 2000.
@@ -625,7 +605,6 @@ def _parse_outcome_and_event(raw_text: str) -> tuple[str | None, str | None]:
     Пытаемся вытащить:
     - outcome: П1/П2/Х/1X/X2/12, тотал, фора и т.п.
     - event: текст о матче/командах (после 'на ...')
-
     Спец-кейс:
     - 'ставка на матч 123456 2000'
       → event = 'матч 123456'
@@ -746,7 +725,6 @@ def _extract_first_number(text: str) -> float | None:
 def _get_last_7d_bets(session: Session, user_id: int):
     """
     Достаём все ставки пользователя за последние 7 дней.
-    Возвращаем: (ставки, начало периода, конец периода).
     """
     from .bets_db import Bet
 
@@ -909,13 +887,15 @@ def build_user_market_insights(session: Session, user_id: int) -> str:
 
     from collections import defaultdict
 
-    agg = defaultdict(lambda: {
-        "bets": 0,
-        "settled": 0,
-        "wins": 0,
-        "pnl": 0.0,
-        "stake_sum": 0.0,
-    })
+    agg = defaultdict(
+        lambda: {
+            "bets": 0,
+            "settled": 0,
+            "wins": 0,
+            "pnl": 0.0,
+            "stake_sum": 0.0,
+        }
+    )
 
     for b in bets:
         market = detect_market(b)
@@ -1179,16 +1159,6 @@ def build_stake_evaluation(session: Session, user_id: int, raw_text: str) -> str
 
 
 def build_value_analysis(raw_text: str) -> str:
-    """
-    Value-разбор кэфа:
-    - парсим кэф (первое число 1.01–20.0, которое не похоже на %)
-    - парсим твою оценку вероятности ('60%' / 'шанс 60' / 'вероятность 55')
-    - считаем:
-        * имплайд-вероятность по рынку
-        * 'справедливый' кэф по твоей оценке
-        * edge (разница в п.п.)
-        * ожидаемое матожидание (EV)
-    """
     text = raw_text.strip()
     lowered = text.lower()
 
@@ -1602,7 +1572,7 @@ def build_help_text() -> str:
         "• Оценивать конкретную ставку как коуч: 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
         "• Делать value-разбор кэфа: 'value 1.85 при вероятности 60%'\n"
         "• Разбирать экспресс: 'экспресс 1.85 1.70 2.10'\n"
-        "• Показывать демо по КХЛ: 'КХЛ сегодня', 'анализ матча 123456'\n"
+        "• Показывать КХЛ: 'КХЛ сегодня', 'анализ матча <id>'\n"
         "• Собирать твой профиль: 'профиль'\n\n"
         "Попробуй, например:\n"
         "• 'мой банк 100000'\n"
@@ -1612,7 +1582,6 @@ def build_help_text() -> str:
         "• 'оценка ставки 1000 на СКА тотал больше 5.5 за 1.9'\n"
         "• 'value 1.85 при вероятности 60%'\n"
         "• 'экспресс 1.85 1.70 2.10'\n"
-        "• 'экспресс по 1.9, 1.7 и 2.3'\n"
         "• 'мои ставки'\n"
         "• 'Покажи мою статистику'\n"
         "• 'отчёт за неделю'\n"
@@ -1627,24 +1596,21 @@ def build_help_text() -> str:
     )
 
 
+# ===================== ГЛАВНЫЙ АГЕНТ =====================
+
 
 async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     Простейший if/else-агент.
     """
-    original_text = message or ""       
+    original_text = message or ""
     text = original_text.lower().strip()
 
-    # 0) ЯВНОЕ МЕНЮ / HELP
-    if text == "меню" or text == "/start" or "что ты умеешь" in text:
-        ...
-
-    # 0) ЯВНОЕ МЕНЮ / HELP
-    if text == "меню" or text == "/start" or "что ты умеешь" in text:
-        return build_help_text()
-
-    # 0) ГЛАВНОЕ МЕНЮ / СТАРТ
-    if text in {"/start", "start", "меню", "главное меню", "help", "/help"}:
+    # 0) ЯВНОЕ МЕНЮ / HELP / СТАРТ
+    if (
+        text in {"/start", "start", "меню", "главное меню", "help", "/help"}
+        or "что ты умеешь" in text
+    ):
         return (
             "Я хоккейный AI-помощник для ставок 🏒\n\n"
             "Что я умею уже сейчас:\n"
@@ -1657,9 +1623,9 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'состояние банка' — показать банк и рекомендуемый % ставки\n"
             "  • 'пополнить банк 20000' / 'уменьшить банк 5000'\n"
             "  • при расчёте ставки win/lose банк обновляется автоматически\n\n"
-            "📊 *Аналитика матчей*\n"
-            "  • 'КХЛ сегодня' — матчи и линия 1X2\n"
-            "  • 'анализ матча 123456' — демо-разбор линии по матчу СКА — ЦСКА\n\n"
+            "📊 *Аналитика матчей КХЛ*\n"
+            "  • 'КХЛ сегодня' — матчи и линия 1X2 из Winline\n"
+            "  • 'анализ матча <id>' — разбор линии 1X2 по выбранному матчу\n\n"
             "📈 *Отчёты и инсайты по тебе*\n"
             "  • 'отчёт за неделю' — сводка по последним 7 дням\n"
             "  • 'отчёт за месяц' — сводка за 30 дней\n"
@@ -1676,12 +1642,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             "  • 'активировать премиум' — включить демо-премиум на 30 дней\n"
         )
 
-    # 0.1) АКТИВИРОВАТЬ ПРЕМИУМ (ручной триггер)
+    # 0.1) АКТИВИРОВАТЬ ПРЕМИУМ
     if "активировать премиум" in text:
         user = session.get(User, user_id)
         if user is None:
             user = User(id=user_id, bank=None)
-        # даём 30 дней
         user.premium_until = datetime.utcnow() + timedelta(days=30)
         session.add(user)
         session.commit()
@@ -1698,7 +1663,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     if "премиум" in text or "premium" in text:
         if is_premium(session, user_id):
             user = session.get(User, user_id)
-            until_str = user.premium_until.strftime("%d.%m.%Y") if user and user.premium_until else "неизвестно"
+            until_str = (
+                user.premium_until.strftime("%d.%m.%Y")
+                if user and user.premium_until
+                else "неизвестно"
+            )
             return (
                 "💎 У тебя уже активен премиум.\n"
                 f"Действует до: {until_str}.\n\n"
@@ -1720,7 +1689,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Напиши: *активировать премиум*."
             )
 
-    # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ + АВТО-ОБНОВЛЕНИЕ БАНКА
+    # 1) ОТМЕТИТЬ РЕЗУЛЬТАТ СТАВКИ
     m_res = re.search(
         r"ставка\s+(\d+)\s+(выиграл[аи]?|проиграл[аи]?|выигрыш|проигрыш|возврат|refund|push|win|lose|loss)",
         text,
@@ -1773,10 +1742,13 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or "мой аккаунт" in text
     ):
         base_profile = build_user_profile(session, user_id)
-        # достраиваем блок про премиум
         if is_premium(session, user_id):
             user = session.get(User, user_id)
-            until_str = user.premium_until.strftime("%d.%m.%Y") if user and user.premium_until else "неизвестно"
+            until_str = (
+                user.premium_until.strftime("%d.%m.%Y")
+                if user and user.premium_until
+                else "неизвестно"
+            )
             premium_block = f"\n\n💎 Premium: активен до {until_str}."
         else:
             premium_block = (
@@ -1936,17 +1908,15 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(text_lines)
 
-       # 8) ОТЧЁТ ЗА НЕДЕЛЮ
+    # 8) ОТЧЁТ ЗА НЕДЕЛЮ
     if (
         "отчёт за неделю" in text
         or "отчет за неделю" in text
         or ("отч" in text and "недел" in text)
     ):
         if not is_premium(session, user_id):
-            # лёгкий, но честный paywall с более умным поведением
             stats = get_user_stats(session, user_id)
 
-            # 0) Совсем пустой профиль
             if stats.total_bets == 0:
                 return (
                     "✨ Недельный отчёт\n\n"
@@ -1958,7 +1928,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                     "Напиши: 'премиум' или 'активировать премиум'."
                 )
 
-            # 1) Ставки есть, но ещё не рассчитаны
             if stats.settled_bets == 0 and stats.pushes == 0:
                 return (
                     "✨ Недельный отчёт\n\n"
@@ -1971,7 +1940,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                     "Напиши: 'премиум' или 'активировать премиум'."
                 )
 
-            # 2) Есть рассчитанные ставки → краткий срез + апселл премиума
             return (
                 "✨ Краткий отчёт за неделю:\n"
                 f"Всего ставок: {stats.total_bets}\n"
@@ -1982,9 +1950,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "Напиши: 'премиум' или 'активировать премиум'."
             )
 
-        # Премиум-ветка — подробный отчёт
         return build_weekly_report(session, user_id)
-
 
     # 8.1) ОТЧЁТ ЗА МЕСЯЦ
     if (
@@ -2004,35 +1970,28 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
             )
         return build_monthly_report(session, user_id)
 
-        # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
+    # 9) АНАЛИЗ МАТЧА КХЛ ПО ID
     m_an = re.search(r"(анализ|разбор)\s+матча\s+(\d+)", text)
     if not m_an:
         m_an = re.search(r"(анализ|разбор)\s+(\d+)", text)
     if m_an:
         event_id_str = m_an.group(2)
 
-        # 9.0) Демо-матч для id 123456 — всегда доступен, даже без API
-        if event_id_str == "123456":
-            demo_ev = get_demo_event(123456)
-            if demo_ev is not None:
-                return build_khl_match_analysis(demo_ev)
-
-        # 9.1) Пытаемся найти матч среди сегодняшних игр КХЛ (Fonbet)
         try:
-            events = await get_today_khl_events()
+            event_id = int(event_id_str)
+        except ValueError:
+            return "Не понял id матча. Используй формат: 'анализ матча 123456'."
+
+        try:
+            events = await get_khl_events_today()
         except Exception:
             logger.exception("Ошибка при получении матчей КХЛ (для анализа матча)")
             return (
-                "Не смог получить матчи КХЛ для анализа (ошибка парсера или API).\n"
+                "Не смог получить матчи КХЛ для анализа (ошибка парсера или API Winline).\n"
                 "Попробуй ещё раз чуть позже или сначала запроси 'КХЛ сегодня'."
             )
 
-        ev = None
-        for e in events:
-            if str(getattr(e, "id", "")) == event_id_str:
-                ev = e
-                break
-
+        ev = next((e for e in events if getattr(e, "id", None) == event_id), None)
         if ev is None:
             return (
                 f"Я не нашёл матч с id {event_id_str} среди сегодняшних игр КХЛ.\n"
@@ -2049,8 +2008,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "'КХЛ сегодня', 'value 1.85', 'ставка 1000 на ...' и т.д."
             )
 
-
-             # 10) ОЦЕНКА СТАВКИ
+    # 10) ОЦЕНКА СТАВКИ
     if (
         "оценка ставки" in text
         or ("что скажешь" in text and "ставк" in text)
@@ -2060,20 +2018,17 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         detailed_result: str | None = None
         value_result: str | None = None
 
-        # 1) Пытаемся сделать полноценный разбор ставки (по истории / профилю)
         try:
             detailed_result = build_stake_evaluation(session, user_id, original_text)
         except Exception:
             logger.exception("Ошибка в build_stake_evaluation")
 
-        # 2) Параллельно считаем value-разбор по кэфу и вероятности из текста
         try:
             value_result = build_value_analysis(original_text)
         except Exception:
             logger.exception("Ошибка в build_value_analysis")
             value_result = None
 
-        # 3) Если вообще ничего не получилось — честно говорим об этом
         if not detailed_result and not value_result:
             return (
                 "Я не смог разобрать эту ставку.\n"
@@ -2083,7 +2038,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 "• или добавь вероятность: 'оценка ставки 1000 на СКА по 1.85, шанс 60%'"
             )
 
-        # 4) Премиум-пользователь: отдаём всё, что есть, без урезаний
         if is_premium(session, user_id):
             parts: list[str] = []
 
@@ -2091,25 +2045,25 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
                 parts.append(detailed_result)
 
             if value_result:
-                # Добавляем пустую строку-разделитель между блоками
                 parts.append("")
                 parts.append(value_result)
 
             return "\n".join(parts)
 
-        # 5) Без премиума: короткий preview + value-разбор + апселл
         preview_lines: list[str] = []
 
         if detailed_result:
-            # Берём первый смысловой блок из подробного разбора
             preview_lines.append(detailed_result.split("\n\n")[0])
 
         if value_result:
             preview_lines.append("")
             preview_lines.append(value_result)
 
-        preview_text = "\n".join(preview_lines) if preview_lines else (
-            value_result or "Я разобрал ставку, но не смог корректно собрать текст ответа."
+        preview_text = (
+            "\n".join(preview_lines)
+            if preview_lines
+            else value_result
+            or "Я разобрал ставку, но не смог корректно собрать текст ответа."
         )
 
         return (
@@ -2128,9 +2082,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or ("проверка" in text and "коэф" in text)
     ):
         return build_value_analysis(original_text)
-        
 
-               # 11) КХЛ сегодня — линия из Winline
+    # 11) КХЛ сегодня — линия из Winline
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             reply = await khl_today_text_from_winline()
@@ -2143,13 +2096,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         except Exception:
             logger.exception("Ошибка khl_today_text_from_winline()")
             return (
-                "❌ Не получилось получить линию КХЛ из Winline.\n"
-                "Это может быть временная проблема сервиса. Попробуй чуть позже."
+                "Не удалось получить линию КХЛ из Winline (возможно, временная проблема сервиса).\n\n"
+                + build_khl_today_matches_demo()
             )
 
-
-
-    # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
+    # 12) РАЗБОР ЭКСПРЕССА
     if "экспресс" in text:
         return build_express_evaluation(original_text)
 
@@ -2233,10 +2184,8 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         bank = get_user_bank(session, user_id)
         if bank is not None:
-            # Если банк уже задан — даём умный хинт про нагрузку на банк
             resp_lines.extend(_build_bank_hint_for_stake(bank, stake))
         else:
-            # Если банк не задан — мягкий онбординг
             resp_lines.append(
                 "\n💰 Банк пока не задан.\n"
                 "Чтобы я мог считать нагрузку на банк и подсказывать размер ставки, "
@@ -2245,27 +2194,19 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
 
         return "\n".join(resp_lines)
 
-            # 15) ЗАГЛУШКИ
+    # 15) ПРОЧИЕ ЗАГЛУШКИ
     if "аналити" in text and "матч" in text:
         return (
             "Раздел аналитики матчей расширяется.\n"
             "Уже сейчас можно:\n"
-            "• запросить 'КХЛ сегодня' и увидеть демо-матч и линию 1X2\n"
-            "• написать 'анализ матча 123456' для разбора линии по матчу СКА — ЦСКА."
+            "• запросить 'КХЛ сегодня' и увидеть матчи КХЛ по линии Winline\n"
+            "• написать 'анализ матча <id>' для разбора линии 1X2 по конкретному матчу."
         )
 
     if "live" in text or "лайв" in text or "жив" in text:
         return (
             "Live-инсайты пока в разработке.\n"
             "План: анализ темпа, xG по ходу матча и подсказки по тоталам."
-        )
-
-    if "премиум" in text or "premium" in text:
-        # сюда обычно не дойдём, потому что обработали выше,
-        # но оставим на всякий случай:
-        return (
-            "Премиум-режим даёт расширенные отчёты и аналитику по тебе.\n"
-            "Напиши: 'активировать премиум'."
         )
 
     # 16) HELP ПО УМОЛЧАНИЮ
