@@ -2,6 +2,7 @@
 from .winline_client import format_khl_today_text, get_khl_events_today
 from .hockey_logic import khl_today_text_from_winline
 from .hockey_logic import build_match_context_notes
+from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
 import logging
 import os
 import re
@@ -1637,7 +1638,6 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     original_text = message or ""
     text = original_text.lower().strip()
-    norm = text  # нормализованный текст, чтобы поиском по нему работать
 
     # ===================== КХЛ СЕГОДНЯ (Winline) =====================
     if "кхл сегодня" in norm:
@@ -2142,17 +2142,17 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return build_value_analysis(original_text)
         
 
-     # 11) МАТЧИ КХЛ НА СЕГОДНЯ (линия из Winline)
-    if "кхл сегодня" in text or ("кхл" in text and "сегодня" in text):
+             # 11) КХЛ сегодня — линия из Winline
+    if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
-            # тут уже подключаем Winline
             return await khl_today_text_from_winline()
         except Exception:
             logger.exception("Ошибка khl_today_text_from_winline()")
             return (
-                "Не получилось получить линию КХЛ из Winline.\n"
-                "Попробуй ещё раз позже."
+                "❌ Не получилось получить линию КХЛ из Winline.\n"
+                "Это может быть временная проблема сервиса. Попробуй чуть позже."
             )
+
               
 
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
