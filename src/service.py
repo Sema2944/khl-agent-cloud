@@ -1,4 +1,5 @@
 # src/service.py
+from .winline_client import format_khl_today_text, get_khl_events_today
 from .hockey_logic import khl_today_text_from_winline
 from .hockey_logic import build_match_context_notes
 import logging
@@ -2139,9 +2140,20 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         or ("проверка" in text and "коэф" in text)
     ):
         return build_value_analysis(original_text)
+        
 
+     # 11) МАТЧИ КХЛ НА СЕГОДНЯ (линия из Winline)
+    if "кхл сегодня" in text or ("кхл" in text and "сегодня" in text):
+        try:
+            # тут уже подключаем Winline
+            return await khl_today_text_from_winline()
+        except Exception:
+            logger.exception("Ошибка khl_today_text_from_winline()")
+            return (
+                "Не получилось получить линию КХЛ из Winline.\n"
+                "Попробуй ещё раз позже."
+            )
               
-
 
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
     if "экспресс" in text:
