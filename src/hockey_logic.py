@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import logging
 
 LeagueName = Literal["KHL", "NHL", "OTHER"]
 
