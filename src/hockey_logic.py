@@ -162,13 +162,19 @@ def build_match_context_notes(
         "а полный фокус включают против команд из своего круга."
     )
 
-    return "\n".join(lines)
- async def khl_today_text_from_winline() -> str:
+   # ------------------------------------------
+# KHL TODAY (WINLINE)
+# ------------------------------------------
+
+from .winline_client import get_khl_events_today
+
+
+async def khl_today_text_from_winline() -> str:
     """
     Строит текст для команды 'КХЛ сегодня' на основе реальной линии Winline.
     """
     try:
-        events = await get_khl_events_for_today()
+        events = await get_khl_events_today()
     except Exception as e:
         logging.exception("Ошибка при запросе линии Winline: %s", e)
         return (
@@ -193,7 +199,7 @@ def build_match_context_notes(
 
     for idx, e in enumerate(events, start=1):
         lines.append(f"{idx}) {e.team1} — {e.team2} (id: {e.id})")
-        # Ищем маркет 1X2 / победа в матче
+
         main_market = None
         for m in e.markets:
             name_upper = (m.name or "").upper()
@@ -208,7 +214,7 @@ def build_match_context_notes(
         else:
             lines.append("   Линия 1X2 недоступна или не распознана.")
 
-        lines.append("")  # пустая строка между матчами
+        lines.append("")
 
     lines.append(
         "Выбери матч и запомни id (например, из скобок),\n"
