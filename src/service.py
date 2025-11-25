@@ -1541,8 +1541,7 @@ def build_express_evaluation(raw_text: str) -> str:
 
 def build_khl_today_matches_demo() -> str:
     lines: list[str] = []
-    lines.append("🏒 Матчи КХЛ на сегодня (демо-режим):")
-    lines.append("")
+    lines.append("🏒 Пример формата матчей КХЛ:\n")
     lines.append("1) СКА — ЦСКА (id: 123456)")
     lines.append("   Линия 1X2 (пример):")
     lines.append("   • 1 — 1.85")
@@ -1552,11 +1551,6 @@ def build_khl_today_matches_demo() -> str:
     lines.append("Как использовать:")
     lines.append("• выбери матч и запомни id (например, 123456)")
     lines.append("• попроси: 'анализ матча 123456' — я разберу линию 1X2 по нему")
-    lines.append("")
-    lines.append(
-        "Это демо-режим: позже сюда добавим реальные матчи, парсинг линии "
-        "и аналитику по форме команд."
-    )
     return "\n".join(lines)
 
 
