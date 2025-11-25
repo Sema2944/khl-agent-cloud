@@ -19,19 +19,18 @@ from .bets_db import (
     get_all_bets,
 )
 
-# Winline + хоккейная логика
-from .winline_client import get_winline_khl_events
 from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
 
-# Форма КХЛ (как и было)
 from .khl_form_client import (
     get_team_form,
     TeamForm,
     TeamAdvancedForm,
 )
+
 import inspect
 
 logger = logging.getLogger(__name__)
+
 
 
 
@@ -2131,12 +2130,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return build_value_analysis(original_text)
         
 
-                # 11) КХЛ сегодня — линия из Winline
+               # 11) КХЛ сегодня — линия из Winline
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             reply = await khl_today_text_from_winline()
 
-            # На всякий случай проверим, что функция не вернула пустоту
             if not reply or not reply.strip():
                 raise ValueError("Пустой ответ от khl_today_text_from_winline")
 
@@ -2145,14 +2143,12 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         except Exception:
             logger.exception("Ошибка khl_today_text_from_winline()")
             return (
-                "Не удалось получить линию КХЛ из Winline "
-                "(возможно, временная проблема сервиса).\n\n"
-                + build_khl_today_matches_demo()
+                "❌ Не получилось получить линию КХЛ из Winline.\n"
+                "Это может быть временная проблема сервиса. Попробуй чуть позже."
             )
 
 
 
-    
     # 12) РАЗБОР ЭКСПРЕССА ПО КЭФАМ
     if "экспресс" in text:
         return build_express_evaluation(original_text)
