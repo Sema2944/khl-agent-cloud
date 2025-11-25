@@ -2131,7 +2131,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         return build_value_analysis(original_text)
         
 
-            # 11) КХЛ сегодня — линия из Winline
+                # 11) КХЛ сегодня — линия из Winline
     if "кхл" in text and ("сегодня" in text or "на сегодня" in text):
         try:
             reply = await khl_today_text_from_winline()
@@ -2145,9 +2145,11 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
         except Exception:
             logger.exception("Ошибка khl_today_text_from_winline()")
             return (
-                "Не удалось получить линию КХЛ из Winline (возможно, временная проблема сервиса).\n\n"
+                "Не удалось получить линию КХЛ из Winline "
+                "(возможно, временная проблема сервиса).\n\n"
                 + build_khl_today_matches_demo()
             )
+
 
 
     
