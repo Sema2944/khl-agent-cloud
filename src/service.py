@@ -1632,7 +1632,7 @@ async def run_agent(user_id: int, message: str, session: Session) -> str:
     """
     Простейший if/else-агент.
     """
-        original_text = message or ""
+    original_text = message or ""       
     text = original_text.lower().strip()
 
     # 0) ЯВНОЕ МЕНЮ / HELP
