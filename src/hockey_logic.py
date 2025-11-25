@@ -163,3 +163,56 @@ def build_match_context_notes(
     )
 
     return "\n".join(lines)
+ async def khl_today_text_from_winline() -> str:
+    """
+    Строит текст для команды 'КХЛ сегодня' на основе реальной линии Winline.
+    """
+    try:
+        events = await get_khl_events_for_today()
+    except Exception as e:
+        logging.exception("Ошибка при запросе линии Winline: %s", e)
+        return (
+            "Не смог получить реальные матчи КХЛ (ошибка парсера или API Winline).\n\n"
+            "🏒 Матчи КХЛ на сегодня (демо-режим):\n\n"
+            "1) СКА — ЦСКА (id: 123456)\n"
+            "   Линия 1X2 (пример):\n"
+            "   • 1 — 1.85\n"
+            "   • X — 3.90\n"
+            "   • 2 — 2.10\n\n"
+            "Позже сюда добавим реальные матчи, парсинг линии и аналитику по форме команд."
+        )
+
+    if not events:
+        return (
+            "Похоже, на сегодня в Winline нет матчей КХЛ, либо парсер не нашёл их в линии.\n\n"
+            "Попробуй позже — когда линия обновится."
+        )
+
+    lines: list[str] = []
+    lines.append("🏒 Матчи КХЛ на сегодня (по линии Winline):\n")
+
+    for idx, e in enumerate(events, start=1):
+        lines.append(f"{idx}) {e.team1} — {e.team2} (id: {e.id})")
+        # Ищем маркет 1X2 / победа в матче
+        main_market = None
+        for m in e.markets:
+            name_upper = (m.name or "").upper()
+            if "1X2" in name_upper or "ИСХОД" in name_upper or "ПОБЕДА В МАТЧЕ" in name_upper:
+                main_market = m
+                break
+
+        if main_market:
+            lines.append(f"   Линия {main_market.name}:")
+            for o in main_market.outcomes:
+                lines.append(f"   • {o.name} — {o.price}")
+        else:
+            lines.append("   Линия 1X2 недоступна или не распознана.")
+
+        lines.append("")  # пустая строка между матчами
+
+    lines.append(
+        "Выбери матч и запомни id (например, из скобок),\n"
+        "а затем попроси: 'анализ матча <id>' — я разберу его подробнее."
+    )
+
+    return "\n".join(lines)
