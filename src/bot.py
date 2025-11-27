@@ -8,10 +8,10 @@ from aiogram.filters import Command
 from api_sport_client import ApiSportClient
 
 # 🔹 1) ВСТАВЬ ТОКЕН ОТ BotFather
-TELEGRAM_BOT_TOKEN = "ТОКЕН_ТВОЕГО_БТА"
+TELEGRAM_BOT_TOKEN = "8258369679:AAGWLAZAPulq-mrz9KXs5cxw8Na1jIfd3_g"
 
 # 🔹 2) ВСТАВЬ API-ключ из https://app.api-sport.ru/dashboard
-API_SPORT_KEY = "ТВОЙ_API_SPORT_KEY"
+API_SPORT_KEY = "95169de3-6577-4d35-acf9-395edfc18f98"
 
 # 🔹 3) ВСТАВЬ ID турнира КХЛ (я помогу найти)
 KHL_TOURNAMENT_ID = 1234  # ← заменим позже
