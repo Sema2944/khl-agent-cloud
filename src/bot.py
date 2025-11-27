@@ -14,7 +14,7 @@ TELEGRAM_BOT_TOKEN = "8258369679:AAGWLAZAPulq-mrz9KXs5cxw8Na1jIfd3_g"
 API_SPORT_KEY = "95169de3-6577-4d35-acf9-395edfc18f98"
 
 # 🔹 3) ВСТАВЬ ID турнира КХЛ (я помогу найти)
-KHL_TOURNAMENT_ID = 1234  # ← заменим позже
+KHL_TOURNAMENT_ID = 268
 
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
