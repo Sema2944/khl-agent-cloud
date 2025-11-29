@@ -1,5 +1,6 @@
 # bot.py
 import asyncio
+import os
 from datetime import date
 
 from aiogram import Bot, Dispatcher, types
