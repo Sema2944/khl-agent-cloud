@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from api_sport_client import ApiSportClient
 
 # 🔹 1) ВСТАВЬ ТОКЕН ОТ BotFather
-TELEGRAM_BOT_TOKEN = os.getenv"8258369679:AAGgD5mjO-SbQPoY91K1s-CZ5ELGAWx059g"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 # 🔹 2) ВСТАВЬ API-ключ из https://app.api-sport.ru/dashboard
