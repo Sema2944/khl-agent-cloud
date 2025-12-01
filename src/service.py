@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import inspect
 from datetime import datetime, timedelta
@@ -22,23 +23,18 @@ from .bets_db import (
     get_all_bets,
 )
 from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
-from .khl_form_client import get_team_form, TeamForm, TeamAdvancedForm
-from .winline_client import get_khl_events_today
+from .khl_form_client import (
+    get_team_form,
+    TeamForm,
+    TeamAdvancedForm,
+)
+from .winline_client import get_khl_events_today  # для анализа матча по id
 
 logger = logging.getLogger(__name__)
 
-# ===================== FASTAPI ПРИЛОЖЕНИЕ =====================
-
-app = FastAPI(title="KHL AI Betting Agent API")
-
-
-# Healthcheck для Render: ОБЯЗАТЕЛЬНО GET + HEAD
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return {"status": "ok", "service": "khl-agent-api"}
-
 
 # ===================== ПРЕМИУМ =====================
+
 
 def is_premium(session: Session, user_id: int) -> bool:
     """
@@ -51,6 +47,7 @@ def is_premium(session: Session, user_id: int) -> bool:
 
 
 # ===================== ОТЧЁТ ЗА НЕДЕЛЮ =====================
+
 
 def build_weekly_report(session: Session, user_id: int) -> str:
     """
@@ -142,6 +139,7 @@ def build_weekly_report(session: Session, user_id: int) -> str:
 
 
 # ===================== ОТЧЁТ ЗА МЕСЯЦ =====================
+
 
 def build_monthly_report(session: Session, user_id: int) -> str:
     """
@@ -254,6 +252,7 @@ def build_monthly_report(session: Session, user_id: int) -> str:
 
 # ===================== SAFE-ХЕЛПЕРЫ ДЛЯ ФОРМЫ =====================
 
+
 async def get_team_form_safe(team_name: str) -> TeamForm | None:
     try:
         if inspect.iscoroutinefunction(get_team_form):
@@ -272,6 +271,7 @@ def get_team_advanced_form_safe(team_name: str) -> TeamAdvancedForm | None:
 
 
 # ===================== РАЗБОР МАТЧА КХЛ =====================
+
 
 def build_khl_match_analysis(ev) -> str:
     """
@@ -395,18 +395,20 @@ def build_khl_match_analysis(ev) -> str:
     return "\n".join(lines)
 
 
-# ===================== МОДЕЛИ ДЛЯ API =====================
+# ===================== FASTAPI ПРИЛОЖЕНИЕ =====================
+
+
+app = FastAPI(title="KHL AI Betting Agent API")
+
 
 class AgentQuery(BaseModel):
     user_id: int
-    message: str  # ВАЖНО: поле называется message, как в telegram_bot.py
+    message: str
 
 
 class AgentResponse(BaseModel):
     reply: str
 
-
-# ===================== СТАРТ СЕРВИСА =====================
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -415,15 +417,20 @@ def on_startup() -> None:
     logger.info("FastAPI сервис запущен (бот работает в отдельном Worker).")
 
 
+# ВАЖНО: healthcheck для Render — должен отвечать и на GET, и на HEAD
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return {"status": "ok", "service": "khl-agent-api"}
+
+
 # ===================== API-ЭНДПОИНТЫ ДЛЯ АГЕНТА =====================
+
 
 @app.post("/agent/query", response_model=AgentResponse)
 async def agent_query(
     payload: AgentQuery,
     session: Session = Depends(get_session),
 ) -> AgentResponse:
-    from .service import run_agent  # если run_agent в этом же файле, можно убрать импорт и просто вызывать
-
     reply_text = await run_agent(
         user_id=payload.user_id,
         message=payload.message,
@@ -457,3 +464,12 @@ async def agent_last_bets(
         )
 
     return {"bets": out}
+
+# ДАЛЬШЕ — ВЕСЬ ТВОЙ ОСТАЛЬНЫЙ КОД (всё, что уже было ниже в старом service.py):
+# парсинг ставок, отчёты, build_user_profile, build_value_analysis, build_express_evaluation
+# и в самом конце — функция run_agent(...)
+# Я его здесь не дублирую повторно, чтобы ответ не раздувать,
+# но в файле у тебя он уже есть — просто НЕ удаляй его.
+
+# ===================== ГЛАВНЫЙ АГЕНТ =====================
+# (здесь должен быть твой run_agent(...) без изменений)
