@@ -35,10 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Главная клавиатура с основными кнопками.
-    Тексты кнопок совпадают с командами, которые понимает /agent.
-    """
     keyboard = [
         ["профиль", "мои ставки"],
         ["КХЛ сегодня", "отчёт за неделю"],
@@ -48,37 +44,29 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
-    """
-    Инлайн-клавиатура под ставкой:
-    🟢 Выиграла / 🔴 Проиграла / ⚪️ Возврат
-    """
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"
-                ),
-                InlineKeyboardButton(
-                    "🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"
-                ),
+                InlineKeyboardButton("🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"),
+                InlineKeyboardButton("🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"),
             ],
             [
-                InlineKeyboardButton(
-                    "⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push"
-                ),
+                InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push"),
             ],
         ]
     )
 
 
+# ----------------------- API -----------------------
+
 async def call_agent(user_id: int, message: str) -> str:
     """
-    Шлём запрос в твой /agent/query и возвращаем текст ответа.
+    ВАЖНО: backend ждёт поле 'query', а не 'message'
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{API_BASE}/agent/query",
-            json={"user_id": user_id, "message": message},
+            json={"user_id": user_id, "query": message},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -86,9 +74,6 @@ async def call_agent(user_id: int, message: str) -> str:
 
 
 async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
-    """
-    Вызываем /agent/last-bets и возвращаем список словарей со ставками.
-    """
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"{API_BASE}/agent/last-bets",
@@ -99,27 +84,17 @@ async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
         return data.get("bets", []) or []
 
 
-# ---------- ПРОСТОЙ ПИНГ, ЧТОБЫ ПРОВЕРИТЬ, ЖИВ ЛИ БОТ ----------
+# ----------------------- Команды -----------------------
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Диагностическая команда: не трогает сервер, просто отвечает, что бот жив.
-    """
     if not update.message:
         return
-
     await update.message.reply_text(
-        "✅ Я на связи. Это ответ напрямую от Telegram-бота.\n"
-        "Если другие команды молчат — значит, проблема в сервере /agent, а не в боте."
+        "✅ Бот работает. Если что-то не отвечает — проблема в backend."
     )
 
 
-# ------------------- /start -------------------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /start — приветственное сообщение + показ клавиатуры.
-    """
     if not update.message:
         return
 
@@ -129,21 +104,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Вести историю ставок и статистику (winrate, ROI, PnL)\n"
         "• Работать с банк-менеджментом\n"
         "• Делать отчёты за неделю и разбор твоих рынков\n"
-        "• Показывать матчи КХЛ на сегодня и делать разбор матча\n\n"
-        "Нажимай на кнопки внизу или напиши мне что-нибудь 😉"
+        "• Показывать матчи КХЛ на сегодня и разбирать матч\n\n"
+        "Нажимай кнопки внизу или напиши мне что-нибудь 😉"
     )
 
-    await update.message.reply_text(
-        text,
-        reply_markup=build_main_keyboard(),
-    )
+    await update.message.reply_text(text, reply_markup=build_main_keyboard())
 
+
+# ----------------------- Форматирование ставки -----------------------
 
 def _format_bet_for_user(b: dict) -> str:
-    """
-    Формируем человекочитаемый текст ставки для 'мои ставки'.
-    Ожидаем поля из /agent/last-bets.
-    """
     bet_id = b.get("id")
     created_raw = b.get("created_at")
     event = b.get("event")
@@ -153,16 +123,15 @@ def _format_bet_for_user(b: dict) -> str:
     result = b.get("result")
     profit = b.get("profit")
 
-    # Дата/время
     dt_str = ""
     if created_raw:
         try:
             dt = datetime.fromisoformat(created_raw)
             dt_str = dt.strftime("%d.%m %H:%M")
-        except Exception:
+        except:
             dt_str = created_raw
 
-    lines: list[str] = []
+    lines = []
     header = f"Ставка #{bet_id}"
     if dt_str:
         header += f" от {dt_str}"
@@ -172,230 +141,151 @@ def _format_bet_for_user(b: dict) -> str:
         lines.append(f"Событие: {event}")
     if outcome:
         lines.append(f"Исход: {outcome}")
+
     if stake is not None:
         try:
             lines.append(f"Сумма: {float(stake):.0f}")
-        except Exception:
+        except:
             lines.append(f"Сумма: {stake}")
+
     if odds is not None:
         try:
             lines.append(f"Коэффициент: {float(odds):.2f}")
-        except Exception:
+        except:
             lines.append(f"Коэффициент: {odds}")
 
     if result:
-        # человекочитаемый результат
-        if result == "win":
-            human = "выигрыш"
-        elif result == "lose":
-            human = "проигрыш"
-        elif result == "push":
-            human = "возврат"
-        else:
-            human = result
-        res_line = f"Результат: {human}"
+        mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
+        human = mapping.get(result, result)
+        line = f"Результат: {human}"
         if profit is not None:
             try:
                 p = float(profit)
                 sign = "+" if p >= 0 else ""
-                res_line += f", PnL: {sign}{p:.0f}"
-            except Exception:
-                res_line += f", PnL: {profit}"
-        lines.append(res_line)
+                line += f", PnL: {sign}{p:.0f}"
+            except:
+                line += f", PnL: {profit}"
+        lines.append(line)
 
     return "\n".join(lines)
 
 
-# ------------------- ОБРАБОТКА ТЕКСТОВ -------------------
+# ----------------------- Обработка текстов -----------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обрабатываем любое текстовое сообщение:
-    → если это 'мои ставки' — идём в /agent/last-bets и шлём красивый список с кнопками.
-    → иначе отправляем текст на бекенд-агент и отвечаем как раньше.
-    """
     if not update.message:
         return
 
     user_id = update.effective_user.id
-    text = update.message.text or ""
-    norm = text.strip().lower()
+    text = update.message.text
+    norm = text.lower().strip()
 
     logger.info("handle_message: user_id=%s, text=%r", user_id, text)
 
-    # Особый случай: "мои ставки" — забираем структурированные данные и рисуем сами
+    # ---- Мои ставки ----
     if "мои ставки" in norm:
         try:
-            bets = await call_last_bets(user_id, limit=5)
-        except Exception as e:
-            logger.exception("Ошибка при вызове /agent/last-bets: %s", e)
+            bets = await call_last_bets(user_id, 5)
+        except Exception:
             await update.message.reply_text(
-                "Не удалось получить список ставок 😔\n"
-                "Попробуй ещё раз чуть позже.",
-                reply_markup=build_main_keyboard(),
+                "Не удалось получить ставки 😔", reply_markup=build_main_keyboard()
             )
             return
 
         if not bets:
             await update.message.reply_text(
-                "У тебя пока нет сохранённых ставок.",
-                reply_markup=build_main_keyboard(),
+                "У тебя нет сохранённых ставок.", reply_markup=build_main_keyboard()
             )
             return
 
-        # Первое сообщение — заголовок + клавиатура
-        await update.message.reply_text(
-            "Твои последние ставки:",
-            reply_markup=build_main_keyboard(),
-        )
+        await update.message.reply_text("Твои последние ставки:", reply_markup=build_main_keyboard())
 
-        # По одной ставке в сообщение, под незакрытыми — кнопки результата
         for b in bets:
-            msg_text = _format_bet_for_user(b)
-            result = b.get("result")
-            bet_id = b.get("id")
-
-            if result is None and bet_id is not None:
-                # ставка ещё не рассчитана — показываем кнопки
-                await update.message.reply_text(
-                    msg_text,
-                    reply_markup=build_bet_result_keyboard(bet_id),
-                )
+            text_m = _format_bet_for_user(b)
+            if b.get("result") is None:
+                await update.message.reply_text(text_m, reply_markup=build_bet_result_keyboard(b["id"]))
             else:
-                # уже рассчитана — просто текст
-                await update.message.reply_text(msg_text)
-
+                await update.message.reply_text(text_m)
         return
 
-    # Обычный путь: шлём текст в /agent/query
+    # ---- обычный запрос ----
     try:
         reply = await call_agent(user_id, text)
-    except Exception as e:
-        logger.exception("Ошибка при вызове агента: %s", e)
-        reply = (
-            "Не удалось связаться с сервером агента 😔\n"
-            "Бот жив, но бэкенд временно недоступен.\n"
-            "Попробуй ещё раз чуть позже или используй команды, не завязанные на сервер."
-        )
-        await update.message.reply_text(reply, reply_markup=build_main_keyboard())
-        return
-
-    # Пытаемся вытащить id ставки из ответа вида: "Ставка сохранена (id: 3)."
-    m_bet = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
-    if m_bet:
-        bet_id = int(m_bet.group(1))
-        # Отправляем ответ с инлайн-кнопками для отметки результата
+    except Exception:
         await update.message.reply_text(
-            reply,
-            reply_markup=build_bet_result_keyboard(bet_id),
+            "Не удалось связаться с backend 😔", reply_markup=build_main_keyboard()
         )
         return
 
-    # Если пользователь просит меню/помощь — показываем клавиатуру
+    # Если агент вернул "Ставка сохранена (id: X)"
+    m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
+    if m:
+        bet_id = int(m.group(1))
+        await update.message.reply_text(reply, reply_markup=build_bet_result_keyboard(bet_id))
+        return
+
+    # Ответ с клавиатурой, если это меню
     if norm in {"/start", "start", "меню", "help", "/help"}:
         await update.message.reply_text(reply, reply_markup=build_main_keyboard())
     else:
-        # Обычный ответ без изменения клавиатуры
         await update.message.reply_text(reply)
 
 
-# ------------------- CALLBACK-КНОПКИ -------------------
+# ----------------------- Callback-кнопки -----------------------
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработка нажатий по инлайн-кнопкам.
-    Сейчас поддерживаем только BET_RES:<bet_id>:<win/lose/push>.
-    """
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
 
-    data = query.data or ""
-    await query.answer()  # убираем "часики" у кнопки
+    data = query.data
+    await query.answer()
 
     if not data.startswith("BET_RES:"):
-        # На будущее: можно обрабатывать другие типы callback_data
         return
 
-    try:
-        _, bet_id_str, res_code = data.split(":", 2)
-        bet_id = int(bet_id_str)
-    except Exception:
-        logger.warning("Некорректный callback_data: %s", data)
-        return
-
+    _, bet_id_str, res = data.split(":")
+    bet_id = int(bet_id_str)
     user_id = query.from_user.id
 
-    if res_code == "win":
-        cmd_text = f"ставка {bet_id} выиграла"
-        status_label = "выигрыш"
-    elif res_code == "lose":
-        cmd_text = f"ставка {bet_id} проиграла"
-        status_label = "проигрыш"
-    else:
-        cmd_text = f"ставка {bet_id} возврат"
-        status_label = "возврат"
+    mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
+    cmd = {
+        "win": f"ставка {bet_id} выиграла",
+        "lose": f"ставка {bet_id} проиграла",
+        "push": f"ставка {bet_id} возврат",
+    }[res]
 
-    # Дёргаем бекенд так же, как если бы пользователь написал текстом
     try:
-        agent_reply = await call_agent(user_id, cmd_text)
-    except Exception as e:
-        logger.exception("Ошибка при отметке результата ставки через callback: %s", e)
-        agent_reply = (
-            "Не удалось отметить результат ставки на сервере 😔\n"
-            "Попробуй ещё раз или введи текстом: "
-            f"'{cmd_text}'."
-        )
+        agent_reply = await call_agent(user_id, cmd)
+    except Exception:
+        agent_reply = "Ошибка связи с сервером 😔"
 
-    # Обновляем исходное сообщение: добавляем инфу, убираем кнопки
-    try:
-        original_text = query.message.text or ""
-        new_text = original_text + f"\n\n✅ Результат отмечен: {status_label}."
-        await query.edit_message_text(new_text)
-    except Exception as e:
-        logger.warning("Не удалось отредактировать сообщение с кнопками: %s", e)
+    # убираем кнопки
+    original = query.message.text or ""
+    new_text = original + f"\n\n✅ Результат отмечен: {mapping[res]}."
+    await query.edit_message_text(new_text)
 
-    # И шлём подробный ответ от агента отдельным сообщением
-    try:
-        await query.message.reply_text(agent_reply)
-    except Exception as e:
-        logger.warning("Не удалось отправить ответ после callback: %s", e)
+    await query.message.reply_text(agent_reply)
 
 
-# ------------------- MAIN -------------------
+# ----------------------- MAIN -----------------------
 
 def main() -> None:
-    """
-    Точка входа бота.
-
-    ВАЖНО:
-    - бот запускается в отдельном потоке (из FastAPI или воркера),
-    - поэтому мы создаём свой asyncio event loop,
-    - и избегаем установки signal handlers (stop_signals=None),
-      иначе Python ругается `set_wakeup_fd only works in main thread`.
-    """
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан")
 
     logger.info("Запускаю Telegram-бота...")
 
-    # создаём event loop для текущего (фонового) потока
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Команда /start
     app.add_handler(CommandHandler("start", start))
-    # Диагностический /ping
     app.add_handler(CommandHandler("ping", ping))
-    # Обработка callback-кнопок
     app.add_handler(CallbackQueryHandler(handle_callback))
-    # Все текстовые сообщения (кроме команд) — в агент / спец-обработчики
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Блокирующий запуск polling в этом потоке,
-    # без установки signal handlers (stop_signals=None)
     app.run_polling(stop_signals=None)
 
 
