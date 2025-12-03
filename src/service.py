@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
 from typing import List
 
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from .db import init_db, get_session
+from .db import init_db, get_session, User
 from .bets_db import (
     get_user_stats,
     add_bet,
@@ -50,8 +49,7 @@ def root():
 
 class QueryRequest(BaseModel):
     user_id: int
-    # ВАЖНО: поле называется message, как в telegram_bot.call_agent
-    message: str
+    message: str   # важно: ИМЕННО message – под это шлёт телеграм-бот
 
 
 class QueryResponse(BaseModel):
@@ -68,12 +66,11 @@ class BetCreate(BaseModel):
 class BetSettle(BaseModel):
     user_id: int
     bet_id: int
-    # "win" | "lose" | "push"
-    result: str
+    result: str  # "win", "lose", "push"
 
 
 # ------------------------------------------------------------
-# ИНИЦИАЛИЗАЦИЯ БД
+# Инициализация БД
 # ------------------------------------------------------------
 
 @app.on_event("startup")
@@ -83,25 +80,47 @@ def on_startup():
 
 
 # ------------------------------------------------------------
-# ЭНДПОИНТЫ АГЕНТА
+# Эндпоинты агента
 # ------------------------------------------------------------
 
 @app.post("/agent/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
-    """Запрос от telegram-бота к LLM-агенту."""
-    from .parsing import run_dialog_agent
+    """
+    Главная точка входа для Telegram-бота.
 
-    reply = await run_dialog_agent(
-        user_id=req.user_id,
-        message=req.message,
-    )
+    Здесь максимально аккуратно оборачиваем импорт и вызов run_dialog_agent,
+    чтобы не было 500 и чтобы видеть понятный текст ошибки.
+    """
+    logger.info("/agent/query: user_id=%s, message=%r", req.user_id, req.message)
+
+    # 1) Пытаемся импортировать агент
+    try:
+        from .parsing import run_dialog_agent
+    except Exception as e:
+        logger.exception("Не удалось импортировать run_dialog_agent")
+        return QueryResponse(
+            reply=f"⚠️ Ошибка сервера (импорт агента): {type(e).__name__}: {e}"
+        )
+
+    # 2) Пытаемся вызвать агента
+    try:
+        reply = await run_dialog_agent(
+            user_id=req.user_id,
+            message=req.message,
+        )
+    except Exception as e:
+        logger.exception("Ошибка внутри run_dialog_agent")
+        return QueryResponse(
+            reply=f"⚠️ Внутренняя ошибка агента: {type(e).__name__}: {e}"
+        )
+
+    # 3) Всё ок — отдаём нормальный ответ
     return QueryResponse(reply=reply)
 
 
 @app.get("/agent/last-bets")
 def api_last_bets(user_id: int, limit: int = 5):
-    """Последние ставки пользователя."""
-    bets = get_last_bets(user_id=user_id, limit=limit)
+    bets = get_last_bets(user_id, limit)
     return {"bets": bets}
 
 
@@ -124,7 +143,8 @@ def api_settle_bet(data: BetSettle):
 
 @app.get("/agent/stats")
 def api_user_stats(user_id: int):
-    return get_user_stats(user_id)
+    stats = get_user_stats(user_id)
+    return stats
 
 
 @app.get("/agent/bank")
@@ -151,7 +171,7 @@ def api_all_bets(user_id: int):
 
 
 # ------------------------------------------------------------
-# КХЛ-эндпоинты
+# KHL-эндпоинты
 # ------------------------------------------------------------
 
 @app.get("/khl/today")
