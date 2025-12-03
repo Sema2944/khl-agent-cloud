@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import List
 
 from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from .db import init_db, get_session, User
+from .db import init_db, get_session
 from .bets_db import (
     get_user_stats,
     add_bet,
@@ -48,9 +49,8 @@ def root():
 # ------------------------------------------------------------
 
 class QueryRequest(BaseModel):
-    # ВАЖНО: поле называется message,
-    # потому что телеграм-бот шлёт {"user_id": ..., "message": "..."}
     user_id: int
+    # ВАЖНО: поле называется message, как в telegram_bot.call_agent
     message: str
 
 
@@ -68,7 +68,7 @@ class BetCreate(BaseModel):
 class BetSettle(BaseModel):
     user_id: int
     bet_id: int
-    # ожидаем строки вида "win", "lose", "push"
+    # "win" | "lose" | "push"
     result: str
 
 
@@ -83,20 +83,12 @@ def on_startup():
 
 
 # ------------------------------------------------------------
-# /agent/query — главный диалоговый эндпоинт
+# ЭНДПОИНТЫ АГЕНТА
 # ------------------------------------------------------------
 
 @app.post("/agent/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
-    """
-    Запрос от Telegram-бота к LLM-агенту.
-
-    Телеграм-бекенд шлёт JSON:
-    {
-        "user_id": 5027679117,
-        "message": "профиль"
-    }
-    """
+    """Запрос от telegram-бота к LLM-агенту."""
     from .parsing import run_dialog_agent
 
     reply = await run_dialog_agent(
@@ -106,37 +98,16 @@ async def query(req: QueryRequest):
     return QueryResponse(reply=reply)
 
 
-# ------------------------------------------------------------
-# /agent/last-bets — последние ставки
-# ------------------------------------------------------------
-
 @app.get("/agent/last-bets")
-def api_last_bets(
-    user_id: int,
-    limit: int = 5,
-    session: Session = Depends(get_session),
-):
-    """
-    Возвращает последние ставки пользователя.
-
-    ВАЖНО: get_last_bets ожидает первым аргументом session,
-    поэтому передаём именно (session, user_id, limit).
-    """
-    bets = get_last_bets(session, user_id, limit)
+def api_last_bets(user_id: int, limit: int = 5):
+    """Последние ставки пользователя."""
+    bets = get_last_bets(user_id=user_id, limit=limit)
     return {"bets": bets}
 
 
-# ------------------------------------------------------------
-# Ставки: добавить / рассчитать / статистика / банк
-# ------------------------------------------------------------
-
 @app.post("/agent/add-bet")
-def api_add_bet(
-    bet: BetCreate,
-    session: Session = Depends(get_session),
-):
+def api_add_bet(bet: BetCreate):
     bet_id = add_bet(
-        session,
         user_id=bet.user_id,
         market=bet.market,
         odds=bet.odds,
@@ -146,62 +117,41 @@ def api_add_bet(
 
 
 @app.post("/agent/settle-bet")
-def api_settle_bet(
-    data: BetSettle,
-    session: Session = Depends(get_session),
-):
-    settle_bet(session, data.user_id, data.bet_id, data.result)
+def api_settle_bet(data: BetSettle):
+    settle_bet(data.user_id, data.bet_id, data.result)
     return {"status": "ok"}
 
 
 @app.get("/agent/stats")
-def api_user_stats(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    stats = get_user_stats(session, user_id)
-    return stats
+def api_user_stats(user_id: int):
+    return get_user_stats(user_id)
 
 
 @app.get("/agent/bank")
-def api_user_bank(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    return get_user_bank(session, user_id)
+def api_user_bank(user_id: int):
+    return get_user_bank(user_id)
 
 
 @app.post("/agent/bank/set")
-def api_set_user_bank(
-    user_id: int,
-    amount: float,
-    session: Session = Depends(get_session),
-):
-    set_user_bank(session, user_id, amount)
+def api_set_user_bank(user_id: int, amount: float):
+    set_user_bank(user_id, amount)
     return {"status": "ok"}
 
 
 @app.post("/agent/bank/change")
-def api_change_user_bank(
-    user_id: int,
-    amount: float,
-    session: Session = Depends(get_session),
-):
-    change_user_bank(session, user_id, amount)
+def api_change_user_bank(user_id: int, amount: float):
+    change_user_bank(user_id, amount)
     return {"status": "ok"}
 
 
 @app.get("/agent/all-bets")
-def api_all_bets(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    bets = get_all_bets(session, user_id)
+def api_all_bets(user_id: int):
+    bets = get_all_bets(user_id)
     return {"bets": bets}
 
 
 # ------------------------------------------------------------
-# KHL-эндпоинты
+# КХЛ-эндпоинты
 # ------------------------------------------------------------
 
 @app.get("/khl/today")
