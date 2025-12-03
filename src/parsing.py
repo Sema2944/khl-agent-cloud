@@ -1,103 +1,66 @@
+# src/parsing.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+import os
+import logging
+from typing import Any
 
-import httpx
+from openai import AsyncOpenAI
 
+logger = logging.getLogger(__name__)
 
-BASE_URL = "https://cf.winlinesports.com/v3"
+# Клиент OpenAI. Ключ берём из переменной окружения OPENAI_API_KEY
+client = AsyncOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
+# Модель можно переопределить через переменную окружения OPENAI_MODEL
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-@dataclass
-class Outcome:
-    name: str
-    price: float
+SYSTEM_PROMPT = """
+Ты — AI-агент для ставок на хоккей (КХЛ).
+Общайся по-русски, дружелюбно и по делу.
 
+У тебя есть бэкенд с базой ставок и статистикой, 
+но сейчас ты обращаешься к нему косвенно — через текстовые команды, которые понимает сервер.
 
-@dataclass
-class Market:
-    name: str
-    outcomes: List[Outcome]
+Если пользователь пишет:
+- "профиль" — расскажи, что ты можешь показать его статистику, банк, историю ставок.
+- "мои ставки" — объясни, что можно добавлять и размечать ставки.
+- "КХЛ сегодня" — расскажи, что можешь подсказать по матчам сегодняшнего дня.
+- Любой другой текст — просто помоги по теме ставок/хоккея/банка.
 
+Если чего-то сделать технически нельзя, честно говори об этом.
+Не придумывай данные о реальных матчах и ставках, которых у тебя нет.
+"""
 
-@dataclass
-class Event:
-    id: int
-    team1: str
-    team2: str
-    league: Optional[str]
-    sport: Optional[str]
-    markets: List[Market]
-
-
-async def _fetch_events_raw() -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(f"{BASE_URL}/events/list", params={"lang": "ru"})
-        r.raise_for_status()
-        return r.json()
-
-
-async def _fetch_markets_raw(event_id: int) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(
-            f"{BASE_URL}/events/{event_id}/markets",
-            params={"lang": "ru"},
-        )
-        r.raise_for_status()
-        return r.json()
-
-
-async def get_khl_events_for_today() -> List[Event]:
+async def run_dialog_agent(user_id: int, message: str) -> str:
     """
-    Тянем все события, фильтруем leagueName == 'KHL',
-    для каждого подгружаем маркеты и приводим к Event.
-    СЕЙЧАС ЭТА ФУНКЦИЯ НАМ НЕ НУЖНА, НО ПУСТЬ ЛЕЖИТ ПРАВИЛЬНОЙ.
+    Главная функция диалогового агента, которую импортирует service.py.
+
+    Сейчас это простая обёртка над LLM без инструментов.
+    Позже сюда можно вернуть сложную логику с tools / базой.
     """
-    data = await _fetch_events_raw()
-    events_raw = data.get("data", [])
+    logger.info("run_dialog_agent: user_id=%s, message=%r", user_id, message)
 
-    khl_events: List[Event] = []
+    # Мини-костыль: если совсем пустая строка
+    if not message.strip():
+        return "Напиши мне что-нибудь про ставки или КХЛ 🙂"
 
-    for e in events_raw:
-        if e.get("leagueName") != "KHL":
-            continue
-
-        event_id = e["id"]
-        team1 = e.get("team1", {}).get("name", "")
-        team2 = e.get("team2", {}).get("name", "")
-        league = e.get("leagueName")
-        sport = e.get("sport")
-
-        markets_resp = await _fetch_markets_raw(event_id)
-        markets_list: List[Market] = []
-
-        for m in markets_resp.get("markets", []):
-            name = m.get("name", "")
-            outcomes: List[Outcome] = []
-            for o in m.get("outcomes", []):
-                price = o.get("price")
-                if price is None:
-                    continue
-                outcomes.append(
-                    Outcome(
-                        name=o.get("name", ""),
-                        price=float(price),
-                    )
-                )
-
-            if outcomes:
-                markets_list.append(Market(name=name, outcomes=outcomes))
-
-        khl_events.append(
-            Event(
-                id=event_id,
-                team1=team1,
-                team2=team2,
-                league=league,
-                sport=sport,
-                markets=markets_list,
-            )
+    try:
+        resp = await client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"[user_id: {user_id}] {message}",
+                },
+            ],
+            temperature=0.3,
         )
-
-    return khl_events
+        content = resp.choices[0].message.content
+        return content or "Я слегка потерялся, попробуй сформулировать вопрос иначе 🙂"
+    except Exception as e:
+        logger.exception("Ошибка при вызове OpenAI")
+        return f"⚠️ Ошибка LLM: {type(e).__name__}: {e}"
