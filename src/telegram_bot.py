@@ -20,39 +20,68 @@ from telegram.ext import (
     filters,
 )
 
-# Логгер
+# --------------------------------------------------------------------------------------
+# ЛОГГЕР
+# --------------------------------------------------------------------------------------
+
 logger = logging.getLogger(__name__)
 
-# Токен бота
+# --------------------------------------------------------------------------------------
+# КОНФИГ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# --------------------------------------------------------------------------------------
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Берём API_BASE только из переменной окружения
-API_BASE = os.getenv("API_BASE")
+# Берём API_BASE только из переменной окружения и обрезаем пробелы/переводы строк
+API_BASE = (os.getenv("API_BASE") or "").strip()
 if not API_BASE:
-    # Если переменная не задана — останавливаем воркер
     raise RuntimeError("API_BASE environment variable is not set!")
 
-logger.info("Using backend API_BASE=%s", API_BASE)
+logger.info("Using backend API_BASE=%r", API_BASE)
+
+
+# --------------------------------------------------------------------------------------
+# КЛАВИАТУРЫ
+# --------------------------------------------------------------------------------------
+
+def build_main_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        ["профиль", "мои ставки"],
+        ["КХЛ сегодня", "отчёт за неделю"],
+        ["разбор моих рынков", "состояние банка"],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
 
 def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"),
-                InlineKeyboardButton("🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"),
+                InlineKeyboardButton(
+                    "🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"
+                ),
+                InlineKeyboardButton(
+                    "🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"
+                ),
             ],
             [
-                InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push"),
+                InlineKeyboardButton(
+                    "⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push"
+                ),
             ],
         ]
     )
 
 
-# ----------------------- API -----------------------
+# --------------------------------------------------------------------------------------
+# ВЗАИМОДЕЙСТВИЕ С BACKEND API
+# --------------------------------------------------------------------------------------
 
 async def call_agent(user_id: int, message: str) -> str:
     """
     ВАЖНО: backend ждёт поле 'query', а не 'message'
+    POST {API_BASE}/agent/query
+    body: {"user_id": ..., "query": "..."}
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
@@ -65,6 +94,9 @@ async def call_agent(user_id: int, message: str) -> str:
 
 
 async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
+    """
+    GET {API_BASE}/agent/last-bets?user_id=...&limit=...
+    """
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"{API_BASE}/agent/last-bets",
@@ -75,7 +107,9 @@ async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
         return data.get("bets", []) or []
 
 
-# ----------------------- Команды -----------------------
+# --------------------------------------------------------------------------------------
+# КОМАНДЫ
+# --------------------------------------------------------------------------------------
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
@@ -102,7 +136,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=build_main_keyboard())
 
 
-# ----------------------- Форматирование ставки -----------------------
+# --------------------------------------------------------------------------------------
+# ФОРМАТИРОВАНИЕ СТАВОК
+# --------------------------------------------------------------------------------------
 
 def _format_bet_for_user(b: dict) -> str:
     bet_id = b.get("id")
@@ -119,10 +155,10 @@ def _format_bet_for_user(b: dict) -> str:
         try:
             dt = datetime.fromisoformat(created_raw)
             dt_str = dt.strftime("%d.%m %H:%M")
-        except:
+        except Exception:
             dt_str = created_raw
 
-    lines = []
+    lines: list[str] = []
     header = f"Ставка #{bet_id}"
     if dt_str:
         header += f" от {dt_str}"
@@ -136,13 +172,13 @@ def _format_bet_for_user(b: dict) -> str:
     if stake is not None:
         try:
             lines.append(f"Сумма: {float(stake):.0f}")
-        except:
+        except Exception:
             lines.append(f"Сумма: {stake}")
 
     if odds is not None:
         try:
             lines.append(f"Коэффициент: {float(odds):.2f}")
-        except:
+        except Exception:
             lines.append(f"Коэффициент: {odds}")
 
     if result:
@@ -154,21 +190,23 @@ def _format_bet_for_user(b: dict) -> str:
                 p = float(profit)
                 sign = "+" if p >= 0 else ""
                 line += f", PnL: {sign}{p:.0f}"
-            except:
+            except Exception:
                 line += f", PnL: {profit}"
         lines.append(line)
 
     return "\n".join(lines)
 
 
-# ----------------------- Обработка текстов -----------------------
+# --------------------------------------------------------------------------------------
+# ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ
+# --------------------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text or ""
     norm = text.lower().strip()
 
     logger.info("handle_message: user_id=%s, text=%r", user_id, text)
@@ -177,7 +215,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if "мои ставки" in norm:
         try:
             bets = await call_last_bets(user_id, 5)
-        except Exception:
+        except Exception as e:
+            logger.exception("call_last_bets failed: %s", e)
             await update.message.reply_text(
                 "Не удалось получить ставки 😔", reply_markup=build_main_keyboard()
             )
@@ -189,30 +228,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-        await update.message.reply_text("Твои последние ставки:", reply_markup=build_main_keyboard())
+        await update.message.reply_text(
+            "Твои последние ставки:", reply_markup=build_main_keyboard()
+        )
 
         for b in bets:
             text_m = _format_bet_for_user(b)
-            if b.get("result") is None:
-                await update.message.reply_text(text_m, reply_markup=build_bet_result_keyboard(b["id"]))
+            if b.get("result") is None and b.get("id") is not None:
+                await update.message.reply_text(
+                    text_m, reply_markup=build_bet_result_keyboard(int(b["id"]))
+                )
             else:
                 await update.message.reply_text(text_m)
         return
 
-    # ---- обычный запрос ----
+    # ---- Обычный запрос к агенту ----
     try:
         reply = await call_agent(user_id, text)
-    except Exception:
+    except Exception as e:
+        logger.exception("call_agent failed: %s", e)
         await update.message.reply_text(
             "Не удалось связаться с backend 😔", reply_markup=build_main_keyboard()
         )
         return
 
-    # Если агент вернул "Ставка сохранена (id: X)"
+    # Если агент вернул "Ставка сохранена (id: X)" — показываем кнопки результата
     m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
     if m:
         bet_id = int(m.group(1))
-        await update.message.reply_text(reply, reply_markup=build_bet_result_keyboard(bet_id))
+        await update.message.reply_text(
+            reply, reply_markup=build_bet_result_keyboard(bet_id)
+        )
         return
 
     # Ответ с клавиатурой, если это меню
@@ -222,14 +268,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(reply)
 
 
-# ----------------------- Callback-кнопки -----------------------
+# --------------------------------------------------------------------------------------
+# CALLBACK-КНОПКИ
+# --------------------------------------------------------------------------------------
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
 
-    data = query.data
+    data = query.data or ""
     await query.answer()
 
     if not data.startswith("BET_RES:"):
@@ -248,7 +296,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         agent_reply = await call_agent(user_id, cmd)
-    except Exception:
+    except Exception as e:
+        logger.exception("call_agent for bet result failed: %s", e)
         agent_reply = "Ошибка связи с сервером 😔"
 
     # убираем кнопки
@@ -259,7 +308,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(agent_reply)
 
 
-# ----------------------- MAIN -----------------------
+# --------------------------------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------------------------------
 
 def main() -> None:
     if not BOT_TOKEN:
