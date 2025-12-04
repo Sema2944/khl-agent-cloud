@@ -1,37 +1,18 @@
-# src/telegram_bot.py
-
 import os
 import logging
-import asyncio
-import re
-from datetime import datetime
-
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
 import httpx
 
-
-API_BASE = os.getenv("API_BASE", "https://khl-agent-api.onrender.com")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+# Логгер
 logger = logging.getLogger(__name__)
+
+# Берём API_BASE только из переменной окружения
+API_BASE = os.getenv("API_BASE")
+if not API_BASE:
+    # Если переменная не задана — останавливаем воркер
+    raise RuntimeError("API_BASE environment variable is not set!")
+
+logger.info("Using backend API_BASE=%s", API_BASE)
+
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
