@@ -1,9 +1,30 @@
 import os
 import logging
+import asyncio
+import re
+from datetime import datetime
+
 import httpx
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 # Логгер
 logger = logging.getLogger(__name__)
+
+# Токен бота
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Берём API_BASE только из переменной окружения
 API_BASE = os.getenv("API_BASE")
@@ -12,17 +33,6 @@ if not API_BASE:
     raise RuntimeError("API_BASE environment variable is not set!")
 
 logger.info("Using backend API_BASE=%s", API_BASE)
-
-
-
-def build_main_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        ["профиль", "мои ставки"],
-        ["КХЛ сегодня", "отчёт за неделю"],
-        ["разбор моих рынков", "состояние банка"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-
 
 def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
