@@ -25,10 +25,6 @@ logger = logging.getLogger(__name__)
 def db_session() -> Session:
     """
     Аккуратно забираем Session из get_session(), который написан как fastapi-зависимость.
-
-    Пример использования:
-    with db_session() as session:
-        bets_db.get_user_bank(session, user_id)
     """
     gen = get_session()
     session = next(gen)
@@ -75,11 +71,9 @@ def _parse_bank_set(message: str) -> Optional[float]:
     - "банк 50k"
     - "установи банк 200 000"
     """
-    # вытащим все числа
     nums = re.findall(r"(\d+[ \d]*)", message.replace("\u00a0", " "))
     if not nums:
         return None
-    # берём первое число, убираем пробелы
     num = nums[0].replace(" ", "")
     try:
         return float(num)
@@ -129,19 +123,12 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
 
 async def run_dialog_agent(user_id: int, message: str) -> str:
     """
-    Главная функция «мозга» бота.
-
-    Здесь:
-    - матчим простые интенты (профиль, отчёт, банк, КХЛ сегодня и т.п.)
-    - работаем с bets_db через локальный Session
-    - дальше (позже) сюда же воткнём вызовы LLM для сложной аналитики
+    Главная функция «мозга» бота (MVP без LLM).
     """
     text_raw = message or ""
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
-
-    # ---------------- БАЗОВЫЕ ИНТЕНТЫ ПО КЛЮЧЕВЫМ СЛОВАМ ----------------
 
     # 1) Профиль
     if "профиль" in norm:
@@ -162,7 +149,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             )
         return f"Текущий банк: *{bank:,.0f}*".replace(",", " ")
 
-    # 3) Установка банка (мой банк 100000, банк 50к и т.п.)
+    # 3) Установка банка
     if "банк" in norm:
         new_bank = _parse_bank_set(norm)
         if new_bank is not None:
@@ -190,7 +177,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             logger.exception("khl_today_text_from_winline failed: %s", e)
             return "Не удалось получить линию КХЛ на сегодня 😔 Попробуй чуть позже."
 
-    # 6) Разбор моих рынков (MVP-заглушка)
+    # 6) Разбор моих рынков
     if "разбор моих рынков" in norm:
         with db_session() as session:
             bets = bets_db.get_all_bets(session, user_id)
@@ -201,7 +188,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
                 "Начни фиксировать ставки — и я смогу показать, где ты зарабатываешь, а где сливаешь."
             )
 
-        # Простейший разбор: считаем PnL по исходам (outcome)
         by_outcome: dict[str, float] = {}
         for b in bets:
             if not b.outcome:
@@ -223,7 +209,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         lines.append("_Это упрощённый разбор. В полной версии будет больше аналитики._")
         return "\n".join(lines)
 
-    # 7) Обработка команд вида «ставка {id} выиграла/проиграла/возврат»
+    # 7) "ставка {id} выиграла/проиграла/возврат"
     m_res = re.match(r"ставка\s+(\d+)\s+(.+)", norm)
     if m_res:
         bet_id = int(m_res.group(1))
@@ -242,34 +228,17 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         sign = "+" if pnl >= 0 else ""
         return f"Ставка #{bet.id} отмечена как *{human}*, PnL: *{sign}{pnl:.0f}*."
 
-    # --------------------------------------------------------------------
-    # 8) Создание новой ставки (MVP-режим)
-    # --------------------------------------------------------------------
-    # На этом шаге можно сделать:
-    # - либо сложный парсер текста,
-    # - либо использовать LLM для извлечения структуры.
-    #
-    # Для MVP сделаем простую команду:
-    #   "ставка: <событие>; исход=<...>; сумма=<...>; кэф=<...>"
-    # или
-    #   "ставка <событие>; исход=<...>; сумма=<...>; кэф=<...>"
-    #
-    # Всё, что не похоже на это — пока не сохраняем как ставку.
-    # --------------------------------------------------------------------
-
+    # 8) Создание новой ставки (очень простой формат)
     if norm.startswith("ставка"):
-        # убираем слово "ставка" и двоеточия
         body = text_raw.split("ставка", 1)[1]
         body = body.lstrip(" :")
 
-        # парсим через разделитель ';'
         parts = [p.strip() for p in body.split(";") if p.strip()]
         event = None
         outcome = None
         stake = None
         odds = None
 
-        # первая часть, если не содержит "исход/сумма/кэф" — считаем событием
         if parts:
             first = parts[0].lower()
             if not any(key in first for key in ("исход", "сумма", "кэф", "коэф", "коэф.")):
@@ -311,15 +280,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
-    # --------------------------------------------------------------------
-    # 9) Дальше — LLM / дефолтный ответ
-    # --------------------------------------------------------------------
-    # На этом месте в будущем:
-    # - собираем контекст по КХЛ/НХЛ
-    # - дергаем LLM (OpenAI) для аналитики
-    # Пока — дружелюбный MVP-ответ.
-    # --------------------------------------------------------------------
-
+    # 9) Дефолтный ответ (пока без LLM)
     help_text = (
         "Пока я в MVP-версии и понимаю такие команды:\n\n"
         "• `профиль` — показать статистику и банк\n"
