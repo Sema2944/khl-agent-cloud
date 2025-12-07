@@ -1,257 +1,336 @@
-# src/service.py
+# src/parsing.py
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+import re
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime, timedelta
+from typing import Optional, List
 
-from fastapi import FastAPI, Depends
-from pydantic import BaseModel
 from sqlmodel import Session
 
-from .db import init_db, get_session
-from .bets_db import (
-    get_user_stats as db_get_user_stats,
-    add_bet as db_add_bet,
-    get_last_bets as db_get_last_bets,
-    settle_bet as db_settle_bet,
-    get_user_bank as db_get_user_bank,
-    set_user_bank as db_set_user_bank,
-    change_user_bank as db_change_user_bank,
-    get_all_bets as db_get_all_bets,
-)
-from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
-from .khl_form_client import (
-    get_team_form,
-    TeamForm,
-    TeamAdvancedForm,
-)
-from .winline_client import get_khl_events_today
+from .db import get_session
+from . import bets_db
+from .hockey_logic import khl_today_text_from_winline
 
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# FASTAPI ПРИЛОЖЕНИЕ
-# ------------------------------------------------------------
-app = FastAPI(title="KHL AI Betting Agent API")
-
 
 # ------------------------------------------------------------
-# HEALTH-CHECK ДЛЯ RENDER
-# ------------------------------------------------------------
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return {"status": "ok", "service": "khl-agent-api"}
-
-
-# ------------------------------------------------------------
-# Pydantic-модели
+# УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI
 # ------------------------------------------------------------
 
-class QueryRequest(BaseModel):
-    user_id: int
-    message: str   # важно: ИМЕННО message — под это шлёт Telegram-бот
-
-
-class QueryResponse(BaseModel):
-    reply: str
-
-
-class BetCreate(BaseModel):
-    user_id: int
-    raw_text: str
-    stake: Optional[float] = None
-    odds: Optional[float] = None
-    event: Optional[str] = None
-    outcome: Optional[str] = None
-
-
-class BetSettle(BaseModel):
-    user_id: int
-    bet_id: int
-    result: str  # "win", "lose", "push" (или русские аналоги, см. bets_db.settle_bet)
-
-
-# ------------------------------------------------------------
-# ИНИЦИАЛИЗАЦИЯ БД
-# ------------------------------------------------------------
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    logger.info("FastAPI сервис запущен (бот работает в отдельном процессе).")
-
-
-# ------------------------------------------------------------
-# ЭНДПОИНТ АГЕНТА (LLM)
-# ------------------------------------------------------------
-
-@app.post("/agent/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
+@contextmanager
+def db_session() -> Session:
     """
-    Главная точка входа для Telegram-бота.
+    Аккуратно забираем Session из get_session(), который написан как fastapi-зависимость.
 
-    Здесь аккуратно оборачиваем импорт и вызов run_dialog_agent,
-    чтобы не было 500 и чтобы видеть понятный текст ошибки.
+    Пример использования:
+    with db_session() as session:
+        bets_db.get_user_bank(session, user_id)
     """
-    logger.info("/agent/query: user_id=%s, message=%r", req.user_id, req.message)
-
-    # 1) Пытаемся импортировать агент
+    gen = get_session()
+    session = next(gen)
     try:
-        from .parsing import run_dialog_agent
-    except Exception as e:
-        logger.exception("Не удалось импортировать run_dialog_agent")
-        return QueryResponse(
-            reply=f"⚠️ Ошибка сервера (импорт агента): {type(e).__name__}: {e}"
-        )
-
-    # 2) Пытаемся вызвать агента
-    try:
-        reply = await run_dialog_agent(
-            user_id=req.user_id,
-            message=req.message,
-        )
-    except Exception as e:
-        logger.exception("Ошибка внутри run_dialog_agent")
-        return QueryResponse(
-            reply=f"⚠️ Внутренняя ошибка агента: {type(e).__name__}: {e}"
-        )
-
-    # 3) Всё ок — отдаём нормальный ответ
-    return QueryResponse(reply=reply)
+        yield session
+    finally:
+        gen.close()
 
 
 # ------------------------------------------------------------
-# ЭНДПОИНТЫ РАБОТЫ СО СТАВКАМИ / БАНКОМ
+# ВСПОМОГАТЕЛЬНОЕ ФОРМАТИРОВАНИЕ
 # ------------------------------------------------------------
 
-@app.get("/agent/last-bets")
-def api_last_bets(
-    user_id: int,
-    limit: int = 5,
-    session: Session = Depends(get_session),
-):
-    bets = db_get_last_bets(session, user_id, limit)
-    # Преобразуем Bet в dict, FastAPI сам умеет, но явно приведём
-    return {"bets": [b.dict() for b in bets]}
+def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str:
+    lines: list[str] = []
+
+    lines.append("📊 *Твой профиль*")
+
+    if bank is None:
+        lines.append("Банк: _ещё не задан_")
+        lines.append("Совет: задай банк командой вроде: `мой банк 100000`")
+    else:
+        lines.append(f"Банк: *{bank:,.0f}*".replace(",", " "))
+
+    lines.append("")
+    lines.append(f"Всего ставок: *{stats.total_bets}*")
+    lines.append(f"Рассчитано ставок (без возвратов): *{stats.settled_bets}*")
+    lines.append(f"Возвратов: *{stats.pushes}*")
+    lines.append(f"Winrate: *{stats.winrate:.1f}%*")
+    lines.append(f"ROI: *{stats.roi:.1f}%*")
+    lines.append(f"PnL: *{stats.pnl:+.0f}*")
+    lines.append(f"Объём ставок: *{stats.total_stake:.0f}*")
+
+    lines.append("")
+    lines.append("Это упрощённая статистика по всем твоим ставкам.")
+
+    return "\n".join(lines)
 
 
-@app.post("/agent/add-bet")
-def api_add_bet(
-    bet: BetCreate,
-    session: Session = Depends(get_session),
-):
-    new_bet = db_add_bet(
-        session=session,
-        user_id=bet.user_id,
-        raw_text=bet.raw_text,
-        stake=bet.stake,
-        odds=bet.odds,
-        event=bet.event,
-        outcome=bet.outcome,
+def _parse_bank_set(message: str) -> Optional[float]:
+    """
+    Поймать команды вроде:
+    - "мой банк 100000"
+    - "банк 50k"
+    - "установи банк 200 000"
+    """
+    # вытащим все числа
+    nums = re.findall(r"(\d+[ \d]*)", message.replace("\u00a0", " "))
+    if not nums:
+        return None
+    # берём первое число, убираем пробелы
+    num = nums[0].replace(" ", "")
+    try:
+        return float(num)
+    except ValueError:
+        return None
+
+
+def _format_week_report(bets: List[bets_db.Bet]) -> str:
+    """
+    Очень простой недельный отчёт: считаем PnL, winrate по последним 7 дням.
+    """
+    if not bets:
+        return (
+            "За последнюю неделю у тебя не было сохранённых ставок.\n"
+            "Начни добавлять ставки, и я смогу делать отчёты по рынкам и результатам."
+        )
+
+    wins = [b for b in bets if b.result == "win"]
+    loses = [b for b in bets if b.result == "lose"]
+    pushes = [b for b in bets if b.result == "push"]
+    non_push = wins + loses
+
+    settled = len(non_push)
+    pnl = sum(b.profit or 0.0 for b in non_push)
+    total_stake = sum(b.stake or 0.0 for b in non_push)
+    winrate = (len(wins) / settled * 100.0) if settled > 0 else 0.0
+    roi = (pnl / total_stake * 100.0) if total_stake > 0 else 0.0
+
+    lines: list[str] = []
+    lines.append("📆 *Отчёт за последние 7 дней*")
+    lines.append(f"Всего ставок: *{len(bets)}*")
+    lines.append(f"Рассчитано (без возвратов): *{settled}*")
+    lines.append(f"Возвратов: *{len(pushes)}*")
+    lines.append(f"Winrate: *{winrate:.1f}%*")
+    lines.append(f"ROI: *{roi:.1f}%*")
+    lines.append(f"PnL: *{pnl:+.0f}*")
+    lines.append(f"Объём ставок: *{total_stake:.0f}*")
+    lines.append("")
+    lines.append("_Это базовый отчёт MVP. Позже я буду давать разбор по лигам и рынкам._")
+
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------
+# ОСНОВНАЯ ЛОГИКА АГЕНТА
+# ------------------------------------------------------------
+
+async def run_dialog_agent(user_id: int, message: str) -> str:
+    """
+    Главная функция «мозга» бота.
+
+    Здесь:
+    - матчим простые интенты (профиль, отчёт, банк, КХЛ сегодня и т.п.)
+    - работаем с bets_db через локальный Session
+    - дальше (позже) сюда же воткнём вызовы LLM для сложной аналитики
+    """
+    text_raw = message or ""
+    norm = text_raw.lower().strip()
+
+    logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
+
+    # ---------------- БАЗОВЫЕ ИНТЕНТЫ ПО КЛЮЧЕВЫМ СЛОВАМ ----------------
+
+    # 1) Профиль
+    if "профиль" in norm:
+        with db_session() as session:
+            bank = bets_db.get_user_bank(session, user_id)
+            stats = bets_db.get_user_stats(session, user_id)
+        return _format_profile_text(bank, stats)
+
+    # 2) Состояние банка
+    if "состояние банка" in norm or (("банк" in norm) and ("мой" in norm or "мне" in norm) and not re.search(r"\d", norm)):
+        with db_session() as session:
+            bank = bets_db.get_user_bank(session, user_id)
+        if bank is None:
+            return (
+                "У тебя пока не задан банк.\n\n"
+                "Можешь установить его командой вроде:\n"
+                "`мой банк 100000`"
+            )
+        return f"Текущий банк: *{bank:,.0f}*".replace(",", " ")
+
+    # 3) Установка банка (мой банк 100000, банк 50к и т.п.)
+    if "банк" in norm:
+        new_bank = _parse_bank_set(norm)
+        if new_bank is not None:
+            with db_session() as session:
+                user = bets_db.set_user_bank(session, user_id, new_bank)
+            return f"Банк установлен: *{user.bank:,.0f}*".replace(",", " ")
+
+    # 4) Отчёт за неделю
+    if "отчёт за неделю" in norm or "отчет за неделю" in norm:
+        now = datetime.utcnow()
+        week_ago = now - timedelta(days=7)
+        with db_session() as session:
+            all_bets = bets_db.get_all_bets(session, user_id)
+        last_week_bets = [b for b in all_bets if b.created_at >= week_ago]
+        return _format_week_report(last_week_bets)
+
+    # 5) КХЛ сегодня
+    if "кхл сегодня" in norm or "кхл на сегодня" in norm:
+        try:
+            text = await khl_today_text_from_winline()
+            if not text:
+                return "Пока не вижу линию КХЛ на сегодня. Попробуй чуть позже."
+            return text
+        except Exception as e:
+            logger.exception("khl_today_text_from_winline failed: %s", e)
+            return "Не удалось получить линию КХЛ на сегодня 😔 Попробуй чуть позже."
+
+    # 6) Разбор моих рынков (MVP-заглушка)
+    if "разбор моих рынков" in norm:
+        with db_session() as session:
+            bets = bets_db.get_all_bets(session, user_id)
+
+        if not bets:
+            return (
+                "У тебя пока нет сохранённых ставок, чтобы разобрать рынки.\n"
+                "Начни фиксировать ставки — и я смогу показать, где ты зарабатываешь, а где сливаешь."
+            )
+
+        # Простейший разбор: считаем PnL по исходам (outcome)
+        by_outcome: dict[str, float] = {}
+        for b in bets:
+            if not b.outcome:
+                continue
+            by_outcome.setdefault(b.outcome, 0.0)
+            by_outcome[b.outcome] += float(b.profit or 0.0)
+
+        if not by_outcome:
+            return (
+                "Ставки есть, но по ним пока мало структурированных данных.\n"
+                "В следующих версиях я буду делать полноценный разбор по рынкам, лигам и типам ставок."
+            )
+
+        lines = ["📊 *Разбор твоих рынков (MVP)*", ""]
+        for outcome, pnl in sorted(by_outcome.items(), key=lambda x: -x[1]):
+            lines.append(f"• {outcome}: *{pnl:+.0f}*")
+
+        lines.append("")
+        lines.append("_Это упрощённый разбор. В полной версии будет больше аналитики._")
+        return "\n".join(lines)
+
+    # 7) Обработка команд вида «ставка {id} выиграла/проиграла/возврат»
+    m_res = re.match(r"ставка\s+(\d+)\s+(.+)", norm)
+    if m_res:
+        bet_id = int(m_res.group(1))
+        result_text = m_res.group(2).strip()
+
+        with db_session() as session:
+            bet = bets_db.settle_bet(session, user_id, bet_id, result_text)
+
+        if bet is None:
+            return "Не удалось найти ставку или понять результат 😔"
+
+        human = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}.get(
+            bet.result or "", bet.result
+        )
+        pnl = bet.profit if bet.profit is not None else 0.0
+        sign = "+" if pnl >= 0 else ""
+        return f"Ставка #{bet.id} отмечена как *{human}*, PnL: *{sign}{pnl:.0f}*."
+
+    # --------------------------------------------------------------------
+    # 8) Создание новой ставки (MVP-режим)
+    # --------------------------------------------------------------------
+    # На этом шаге можно сделать:
+    # - либо сложный парсер текста,
+    # - либо использовать LLM для извлечения структуры.
+    #
+    # Для MVP сделаем простую команду:
+    #   "ставка: <событие>; исход=<...>; сумма=<...>; кэф=<...>"
+    # или
+    #   "ставка <событие>; исход=<...>; сумма=<...>; кэф=<...>"
+    #
+    # Всё, что не похоже на это — пока не сохраняем как ставку.
+    # --------------------------------------------------------------------
+
+    if norm.startswith("ставка"):
+        # убираем слово "ставка" и двоеточия
+        body = text_raw.split("ставка", 1)[1]
+        body = body.lstrip(" :")
+
+        # парсим через разделитель ';'
+        parts = [p.strip() for p in body.split(";") if p.strip()]
+        event = None
+        outcome = None
+        stake = None
+        odds = None
+
+        # первая часть, если не содержит "исход/сумма/кэф" — считаем событием
+        if parts:
+            first = parts[0].lower()
+            if not any(key in first for key in ("исход", "сумма", "кэф", "коэф", "коэф.")):
+                event = parts[0]
+
+        for p in parts:
+            pl = p.lower()
+            if pl.startswith("исход"):
+                outcome = p.split("=", 1)[-1].strip()
+            elif pl.startswith("сумма") or pl.startswith("stake"):
+                val = p.split("=", 1)[-1]
+                val = re.sub(r"[^\d.,]", "", val).replace(",", ".")
+                try:
+                    stake = float(val)
+                except ValueError:
+                    pass
+            elif pl.startswith("кэф") or pl.startswith("коэф") or pl.startswith("коэффициент"):
+                val = p.split("=", 1)[-1]
+                val = re.sub(r"[^\d.,]", "", val).replace(",", ".")
+                try:
+                    odds = float(val)
+                except ValueError:
+                    pass
+
+        with db_session() as session:
+            bet = bets_db.add_bet(
+                session=session,
+                user_id=user_id,
+                raw_text=text_raw,
+                stake=stake,
+                odds=odds,
+                event=event,
+                outcome=outcome,
+            )
+
+        return (
+            f"Ставка сохранена (id: {bet.id}).\n\n"
+            "Когда узнаешь результат, нажми кнопку под ставкой или напиши:\n"
+            f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
+        )
+
+    # --------------------------------------------------------------------
+    # 9) Дальше — LLM / дефолтный ответ
+    # --------------------------------------------------------------------
+    # На этом месте в будущем:
+    # - собираем контекст по КХЛ/НХЛ
+    # - дергаем LLM (OpenAI) для аналитики
+    # Пока — дружелюбный MVP-ответ.
+    # --------------------------------------------------------------------
+
+    help_text = (
+        "Пока я в MVP-версии и понимаю такие команды:\n\n"
+        "• `профиль` — показать статистику и банк\n"
+        "• `состояние банка` — показать текущий банк\n"
+        "• `мой банк 100000` — установить банк\n"
+        "• `КХЛ сегодня` — показать матчи и линию на сегодня\n"
+        "• `отчёт за неделю` — краткий отчёт по ставкам\n"
+        "• `разбор моих рынков` — базовый разбор рынков\n"
+        "• `ставка: <событие>; исход=...; сумма=...; кэф=...` — сохранить ставку\n\n"
+        "Позже я смогу делать полноценную аналитику матчей и рынков с помощью нейросети. "
+        "Пока можешь протестировать эти команды 🙂"
     )
-    return {"bet_id": new_bet.id}
 
-
-@app.post("/agent/settle-bet")
-def api_settle_bet(
-    data: BetSettle,
-    session: Session = Depends(get_session),
-):
-    bet = db_settle_bet(session, data.user_id, data.bet_id, data.result)
-    if bet is None:
-        return {"status": "error", "error": "Bet not found or invalid result"}
-    return {"status": "ok", "profit": bet.profit}
-
-
-@app.get("/agent/stats")
-def api_user_stats(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    stats = db_get_user_stats(session, user_id)
-    # dataclass → dict
-    return {
-        "total_bets": stats.total_bets,
-        "settled_bets": stats.settled_bets,
-        "pushes": stats.pushes,
-        "winrate": stats.winrate,
-        "roi": stats.roi,
-        "pnl": stats.pnl,
-        "total_stake": stats.total_stake,
-    }
-
-
-@app.get("/agent/bank")
-def api_user_bank(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    bank = db_get_user_bank(session, user_id)
-    return {"bank": bank}
-
-
-@app.post("/agent/bank/set")
-def api_set_user_bank(
-    user_id: int,
-    amount: float,
-    session: Session = Depends(get_session),
-):
-    user = db_set_user_bank(session, user_id, amount)
-    return {"status": "ok", "bank": user.bank}
-
-
-@app.post("/agent/bank/change")
-def api_change_user_bank(
-    user_id: int,
-    amount: float,
-    session: Session = Depends(get_session),
-):
-    user = db_change_user_bank(session, user_id, amount)
-    return {"status": "ok", "bank": user.bank}
-
-
-@app.get("/agent/all-bets")
-def api_all_bets(
-    user_id: int,
-    session: Session = Depends(get_session),
-):
-    bets = db_get_all_bets(session, user_id)
-    return {"bets": [b.dict() for b in bets]}
-
-
-# ------------------------------------------------------------
-# KHL-ЭНДПОИНТЫ (можно использовать как API для фронта/бота)
-# ------------------------------------------------------------
-
-@app.get("/khl/today")
-async def api_khl_today():
-    """
-    Текстовый обзор матчей КХЛ на сегодня.
-    """
-    text = await khl_today_text_from_winline()
-    return {"text": text}
-
-
-@app.get("/khl/match-context/{event_id}")
-async def api_match_context(event_id: int):
-    """
-    Собираем контекст по конкретному матчу:
-    – команды, форма, рынки и т.п.
-    """
-    events = await get_khl_events_today()
-    event = next((e for e in events if e["id"] == event_id), None)
-
-    if not event:
-        return {"error": "Match not found"}
-
-    ctx = await build_match_context_notes(event)
-    return ctx
-
-
-@app.get("/khl/team-form/{team}")
-async def api_team_form(team: str):
-    """
-    Форма команды (базовая/расширенная).
-    """
-    form: TeamForm | TeamAdvancedForm = await get_team_form(team)
-    return form.dict()
+    return help_text
