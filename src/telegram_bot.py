@@ -79,14 +79,14 @@ def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
 
 async def call_agent(user_id: int, message: str) -> str:
     """
-    ВАЖНО: backend ждёт поле 'query', а не 'message'
+    Новый API backend:
     POST {API_BASE}/agent/query
-    body: {"user_id": ..., "query": "..."}
+    body: {"user_id": ..., "message": "..."}
     """
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             f"{API_BASE}/agent/query",
-            json={"user_id": user_id, "query": message},
+            json={"user_id": user_id, "message": message},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -104,6 +104,7 @@ async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
+        # backend возвращает {"bets": [ {...}, {...} ]}
         return data.get("bets", []) or []
 
 
