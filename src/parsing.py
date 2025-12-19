@@ -1,14 +1,31 @@
 from contextlib import contextmanager
+from collections.abc import Generator, Iterator
 from sqlmodel import Session
 
 from .db import get_session
 
+
 @contextmanager
-def db_session() -> Session:
+def db_session() -> Iterator[Session]:
     """
-    Берём Session через общий dependency get_session() (который теперь yield-генератор).
+    Берём Session через общий dependency get_session() (который yield-генератор).
+    Закрываем генератор => срабатывает finally в get_session() => session.close().
     """
     gen = get_session()
+
+    # get_session() должен быть генератором (yield Session)
+    if not isinstance(gen, Generator):
+        # на всякий случай (если где-то осталась старая версия get_session)
+        session = gen  # type: ignore[assignment]
+        try:
+            yield session
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+        return
+
     session = next(gen)
     try:
         yield session
@@ -17,6 +34,7 @@ def db_session() -> Session:
             gen.close()
         except Exception:
             pass
+
 
 # ------------------------------------------------------------
 # УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI
