@@ -1,39 +1,19 @@
+# src/parsing.py
+from __future__ import annotations
+
+import logging
+import re
 from contextlib import contextmanager
-from collections.abc import Generator, Iterator
+from datetime import datetime, timedelta
+from typing import Optional, List
+
 from sqlmodel import Session
 
 from .db import get_session
+from . import bets_db
+from .hockey_logic import khl_today_text_from_winline
 
-
-@contextmanager
-def db_session() -> Iterator[Session]:
-    """
-    Берём Session через общий dependency get_session() (который yield-генератор).
-    Закрываем генератор => срабатывает finally в get_session() => session.close().
-    """
-    gen = get_session()
-
-    # get_session() должен быть генератором (yield Session)
-    if not isinstance(gen, Generator):
-        # на всякий случай (если где-то осталась старая версия get_session)
-        session = gen  # type: ignore[assignment]
-        try:
-            yield session
-        finally:
-            try:
-                session.close()
-            except Exception:
-                pass
-        return
-
-    session = next(gen)
-    try:
-        yield session
-    finally:
-        try:
-            gen.close()
-        except Exception:
-            pass
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------
@@ -43,14 +23,17 @@ def db_session() -> Iterator[Session]:
 @contextmanager
 def db_session() -> Session:
     """
-    Аккуратно забираем Session из get_session(), который написан как fastapi-зависимость.
+    Берём Session через общий dependency get_session() (yield-генератор).
     """
     gen = get_session()
     session = next(gen)
     try:
         yield session
     finally:
-        gen.close()
+        try:
+            gen.close()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------
@@ -87,8 +70,7 @@ def _parse_bank_set(message: str) -> Optional[float]:
     """
     Поймать команды вроде:
     - "мой банк 100000"
-    - "банк 50k"
-    - "установи банк 200 000"
+    - "банк 200 000"
     """
     nums = re.findall(r"(\d+[ \d]*)", message.replace("\u00a0", " "))
     if not nums:
@@ -131,7 +113,7 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
     lines.append(f"PnL: *{pnl:+.0f}*")
     lines.append(f"Объём ставок: *{total_stake:.0f}*")
     lines.append("")
-    lines.append("_Это базовый отчёт MVP. Позже я буду давать разбор по лигам и рынкам._")
+    lines.append("_Это базовый отчёт MVP. Позже будет разбор по лигам и рынкам._")
 
     return "\n".join(lines)
 
@@ -217,7 +199,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         if not by_outcome:
             return (
                 "Ставки есть, но по ним пока мало структурированных данных.\n"
-                "В следующих версиях я буду делать полноценный разбор по рынкам, лигам и типам ставок."
+                "В следующих версиях будет полноценный разбор по рынкам, лигам и типам ставок."
             )
 
         lines = ["📊 *Разбор твоих рынков (MVP)*", ""]
@@ -300,17 +282,14 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         )
 
     # 9) Дефолтный ответ (пока без LLM)
-    help_text = (
+    return (
         "Пока я в MVP-версии и понимаю такие команды:\n\n"
-        "• `профиль` — показать статистику и банк\n"
-        "• `состояние банка` — показать текущий банк\n"
+        "• `профиль` — статистика и банк\n"
+        "• `состояние банка` — текущий банк\n"
         "• `мой банк 100000` — установить банк\n"
-        "• `КХЛ сегодня` — показать матчи и линию на сегодня\n"
-        "• `отчёт за неделю` — краткий отчёт по ставкам\n"
+        "• `КХЛ сегодня` — матчи и линия на сегодня\n"
+        "• `отчёт за неделю` — отчёт по ставкам\n"
         "• `разбор моих рынков` — базовый разбор рынков\n"
         "• `ставка: <событие>; исход=...; сумма=...; кэф=...` — сохранить ставку\n\n"
-        "Позже я смогу делать полноценную аналитику матчей и рынков с помощью нейросети. "
-        "Пока можешь протестировать эти команды 🙂"
+        "Позже подключим нейросеть для полноценной аналитики 🙂"
     )
-
-    return help_text
