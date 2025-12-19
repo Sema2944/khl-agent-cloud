@@ -1,21 +1,22 @@
-# src/parsing.py
-from __future__ import annotations
-
-import logging
-import re
 from contextlib import contextmanager
-from dataclasses import asdict
-from datetime import datetime, timedelta
-from typing import Optional, List
-
 from sqlmodel import Session
 
 from .db import get_session
-from . import bets_db
-from .hockey_logic import khl_today_text_from_winline
 
-logger = logging.getLogger(__name__)
-
+@contextmanager
+def db_session() -> Session:
+    """
+    Берём Session через общий dependency get_session() (который теперь yield-генератор).
+    """
+    gen = get_session()
+    session = next(gen)
+    try:
+        yield session
+    finally:
+        try:
+            gen.close()
+        except Exception:
+            pass
 
 # ------------------------------------------------------------
 # УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI
