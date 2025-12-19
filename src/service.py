@@ -1,18 +1,14 @@
 # src/service.py
 from __future__ import annotations
-from fastapi.responses import Response
-from fastapi.responses import Response
-
-@app.get("/favicon.ico")
-def favicon():
-    return Response(status_code=204)
 
 import logging
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from pydantic import BaseModel
+from sqlmodel import Session
 
-from .db import init_db
+from .db import init_db, get_session
 from .bets_db import (
     get_user_stats,
     add_bet,
@@ -24,33 +20,36 @@ from .bets_db import (
     get_all_bets,
 )
 
-from .hockey_logic import khl_today_text_from_winline, build_match_context_notes
-from .khl_form_client import get_team_form, TeamForm, TeamAdvancedForm
-from .winline_client import get_khl_events_today
-
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# FASTAPI ПРИЛОЖЕНИЕ
-# ------------------------------------------------------------
 app = FastAPI(title="KHL AI Betting Agent API")
 
 
-# ------------------------------------------------------------
-# HEALTH-CHECK ДЛЯ RENDER
-# ------------------------------------------------------------
+# -----------------------------
+# Healthcheck (Render)
+# -----------------------------
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "service": "khl-agent-api"}
 
 
-# ------------------------------------------------------------
-# Pydantic-модели
-# ------------------------------------------------------------
+@app.get("/favicon.ico")
+def favicon():
+    # чтобы не было ошибок 404/NameError, но и не обязателен файл
+    return {}
 
+
+# -----------------------------
+# Pydantic модели
+# -----------------------------
 class QueryRequest(BaseModel):
     user_id: int
-    message: str   # важно: ИМЕННО message – под это шлёт телеграм-бот
+    # поддержим И message, И query (чтобы бот мог слать как угодно)
+    message: Optional[str] = None
+    query: Optional[str] = None
+
+    def text(self) -> str:
+        return (self.message or self.query or "").strip()
 
 
 class QueryResponse(BaseModel):
@@ -59,9 +58,11 @@ class QueryResponse(BaseModel):
 
 class BetCreate(BaseModel):
     user_id: int
-    market: str
-    odds: float
-    stake: float
+    raw_text: str
+    stake: Optional[float] = None
+    odds: Optional[float] = None
+    event: Optional[str] = None
+    outcome: Optional[str] = None
 
 
 class BetSettle(BaseModel):
@@ -70,30 +71,27 @@ class BetSettle(BaseModel):
     result: str  # "win", "lose", "push"
 
 
-# ------------------------------------------------------------
-# Инициализация БД
-# ------------------------------------------------------------
-
+# -----------------------------
+# Startup
+# -----------------------------
 @app.on_event("startup")
 def on_startup():
     init_db()
-    logger.info("FastAPI сервис запущен (бот работает в отдельном процессе).")
+    logger.info("FastAPI сервис запущен.")
 
 
-# ------------------------------------------------------------
-# Эндпоинты агента
-# ------------------------------------------------------------
-
+# -----------------------------
+# Agent endpoint
+# -----------------------------
 @app.post("/agent/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
-    """
-    Главная точка входа для Telegram-бота.
+    text = req.text()
+    logger.info("/agent/query: user_id=%s, text=%r", req.user_id, text)
 
-    Здесь максимально аккуратно оборачиваем импорт и вызов run_dialog_agent,
-    чтобы не было 500 и чтобы видеть понятный текст ошибки.
-    """
-    logger.info("/agent/query: user_id=%s, message=%r", req.user_id, req.message)
+    if not text:
+        return QueryResponse(reply="Пустой запрос 😕")
 
+    # импорт агента
     try:
         from .parsing import run_dialog_agent
     except Exception as e:
@@ -102,11 +100,9 @@ async def query(req: QueryRequest):
             reply=f"⚠️ Ошибка сервера (импорт агента): {type(e).__name__}: {e}"
         )
 
+    # вызов агента
     try:
-        reply = await run_dialog_agent(
-            user_id=req.user_id,
-            message=req.message,
-        )
+        reply = await run_dialog_agent(user_id=req.user_id, message=text)
     except Exception as e:
         logger.exception("Ошибка внутри run_dialog_agent")
         return QueryResponse(
@@ -116,150 +112,62 @@ async def query(req: QueryRequest):
     return QueryResponse(reply=reply)
 
 
+# -----------------------------
+# Bets API
+# -----------------------------
 @app.get("/agent/last-bets")
-def api_last_bets(user_id: int, limit: int = 5):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        bets = get_last_bets(session, user_id, limit)
-        # Преобразуем в dict’ы для JSON
-        return {"bets": [b.dict() for b in bets]}
-    finally:
-        gen.close()
+def api_last_bets(user_id: int, limit: int = 5, session: Session = Depends(get_session)):
+    bets = get_last_bets(session, user_id, limit)
+    # sqlmodel objects -> dict
+    return {"bets": [b.model_dump() for b in bets]}
 
 
 @app.post("/agent/add-bet")
-def api_add_bet(bet: BetCreate):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        db_bet = add_bet(
-            session=session,
-            user_id=bet.user_id,
-            raw_text="",          # в MVP сырое описание не передаём
-            stake=bet.stake,
-            odds=bet.odds,
-            event=bet.market,
-            outcome=None,
-        )
-        return {"bet_id": db_bet.id}
-    finally:
-        gen.close()
+def api_add_bet(bet: BetCreate, session: Session = Depends(get_session)):
+    b = add_bet(
+        session=session,
+        user_id=bet.user_id,
+        raw_text=bet.raw_text,
+        stake=bet.stake,
+        odds=bet.odds,
+        event=bet.event,
+        outcome=bet.outcome,
+    )
+    return {"bet_id": b.id}
 
 
 @app.post("/agent/settle-bet")
-def api_settle_bet(data: BetSettle):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        settle_bet(session, data.user_id, data.bet_id, data.result)
-        return {"status": "ok"}
-    finally:
-        gen.close()
+def api_settle_bet(data: BetSettle, session: Session = Depends(get_session)):
+    b = settle_bet(session, data.user_id, data.bet_id, data.result)
+    if b is None:
+        return {"status": "not_found_or_bad_result"}
+    return {"status": "ok", "bet": b.model_dump()}
 
 
 @app.get("/agent/stats")
-def api_user_stats(user_id: int):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        stats = get_user_stats(session, user_id)
-        return stats.__dict__
-    finally:
-        gen.close()
+def api_user_stats(user_id: int, session: Session = Depends(get_session)):
+    s = get_user_stats(session, user_id)
+    return s.__dict__
 
 
 @app.get("/agent/bank")
-def api_user_bank(user_id: int):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        bank = get_user_bank(session, user_id)
-        return {"bank": bank}
-    finally:
-        gen.close()
+def api_user_bank(user_id: int, session: Session = Depends(get_session)):
+    return {"bank": get_user_bank(session, user_id)}
 
 
 @app.post("/agent/bank/set")
-def api_set_user_bank(user_id: int, amount: float):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        set_user_bank(session, user_id, amount)
-        return {"status": "OK"}
-    finally:
-        gen.close()
+def api_set_user_bank(user_id: int, amount: float, session: Session = Depends(get_session)):
+    u = set_user_bank(session, user_id, amount)
+    return {"status": "ok", "bank": u.bank}
 
 
 @app.post("/agent/bank/change")
-def api_change_user_bank(user_id: int, amount: float):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        change_user_bank(session, user_id, amount)
-        return {"status": "OK"}
-    finally:
-        gen.close()
+def api_change_user_bank(user_id: int, amount: float, session: Session = Depends(get_session)):
+    u = change_user_bank(session, user_id, amount)
+    return {"status": "ok", "bank": u.bank}
 
 
 @app.get("/agent/all-bets")
-def api_all_bets(user_id: int):
-    from .db import get_session
-    from sqlmodel import Session
-
-    gen = get_session()
-    session: Session = next(gen)
-    try:
-        bets = get_all_bets(session, user_id)
-        return {"bets": [b.dict() for b in bets]}
-    finally:
-        gen.close()
-
-
-# ------------------------------------------------------------
-# KHL-эндпоинты
-# ------------------------------------------------------------
-
-@app.get("/khl/today")
-async def api_khl_today():
-    text = await khl_today_text_from_winline()
-    return {"text": text}
-
-
-@app.get("/khl/match-context/{event_id}")
-async def api_match_context(event_id: int):
-    events = await get_khl_events_today()
-    event = next((e for e in events if e["id"] == event_id), None)
-
-    if not event:
-        return {"error": "Match not found"}
-
-    ctx = await build_match_context_notes(event)
-    return ctx
-
-
-@app.get("/khl/team-form/{team}")
-async def api_team_form(team: str):
-    form: TeamForm | TeamAdvancedForm = await get_team_form(team)
-    return form.dict()
+def api_all_bets(user_id: int, session: Session = Depends(get_session)):
+    bets = get_all_bets(session, user_id)
+    return {"bets": [b.model_dump() for b in bets]}
