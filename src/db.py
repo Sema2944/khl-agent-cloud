@@ -1,36 +1,24 @@
 # src/db.py
-
 import os
-from datetime import datetime
+from typing import Generator
 
-from sqlmodel import SQLModel, create_engine, Session, Field
+from sqlmodel import SQLModel, create_engine, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bets.db")
 
 engine = create_engine(DATABASE_URL, echo=False)
 
 
-class User(SQLModel, table=True):
-    """
-    Простая модель пользователя.
-
-    id            — Telegram ID пользователя
-    bank          — текущий банк (может быть None, если ещё не задан)
-    premium_until — дата/время (UTC), до которой активен премиум, либо None
-    """
-    id: int = Field(primary_key=True)
-    bank: float | None = None
-    premium_until: datetime | None = None
-
-
 def init_db() -> None:
-    # импорт моделей, чтобы они зарегистрировались в metadata
-    from . import bets_db  # noqa: F401
+    # Важно: импортируем модели, чтобы они зарегистрировались в metadata
+    from .bets_db import User, Bet  # noqa: F401
     SQLModel.metadata.create_all(engine)
 
 
-def get_session() -> Session:
+def get_session() -> Generator[Session, None, None]:
     """
-    Функция, которую импортирует FastAPI (service.py).
+    FastAPI dependency:
+      with Depends(get_session) as session
     """
-    return Session(engine)
+    with Session(engine) as session:
+        yield session
