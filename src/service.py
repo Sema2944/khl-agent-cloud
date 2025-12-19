@@ -1,5 +1,11 @@
 # src/service.py
 from __future__ import annotations
+from fastapi.responses import Response
+from fastapi.responses import Response
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
 
 import logging
 
