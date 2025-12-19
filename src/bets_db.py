@@ -1,5 +1,4 @@
 # src/bets_db.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,22 +7,10 @@ from typing import List, Optional
 
 from sqlmodel import SQLModel, Field, Session, select
 
+from .db import User  # ✅ берём User из db.py, НЕ создаём второй раз
+
 
 # ---------- МОДЕЛИ В БД ----------
-
-
-class User(SQLModel, table=True):
-    """
-    Пользователь бота.
-
-    id — это тот же user_id, который приходит из Telegram/клиента.
-    bank — текущий банкролл (может быть None, если ещё не задан).
-    """
-    __tablename__ = "users"
-
-    id: int = Field(primary_key=True, index=True)
-    bank: Optional[float] = Field(default=None)
-
 
 class Bet(SQLModel, table=True):
     """
@@ -46,9 +33,7 @@ class Bet(SQLModel, table=True):
     outcome: Optional[str] = None          # исход (П1, тотал и т.п.)
 
     # результат
-    result: Optional[str] = Field(
-        default=None, index=True
-    )  # "win" / "lose" / "push" / None
+    result: Optional[str] = Field(default=None, index=True)  # "win" / "lose" / "push" / None
 
     # финансы
     profit: Optional[float] = None         # + / - в тех же единицах, что stake
@@ -57,31 +42,29 @@ class Bet(SQLModel, table=True):
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ СТРУКТУРЫ ----------
 
-
 @dataclass
 class UserStats:
-    total_bets: int        # всего ставок (в т.ч. нерасчитанных)
-    settled_bets: int      # рассчитанных (win/lose, без возвратов)
-    pushes: int            # количество возвратов
-    winrate: float         # % выигрышей по win/lose
-    roi: float             # ROI по win/lose
-    pnl: float             # общий плюс/минус (win/lose)
-    total_stake: float     # суммарный объём ставок (win/lose)
+    total_bets: int
+    settled_bets: int
+    pushes: int
+    winrate: float
+    roi: float
+    pnl: float
+    total_stake: float
 
 
 # ---------- ОПЕРАЦИИ С ПОЛЬЗОВАТЕЛЕМ / БАНКОМ ----------
 
-
 def get_or_create_user(session: Session, user_id: int) -> User:
     """
     Получаем пользователя по id.
-    Если его нет — создаём нового с пустым банком.
+    Если его нет — создаём нового.
     """
     statement = select(User).where(User.id == user_id)
     user: User | None = session.exec(statement).one_or_none()
 
     if user is None:
-        user = User(id=user_id, bank=None)
+        user = User(id=user_id)
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -90,18 +73,11 @@ def get_or_create_user(session: Session, user_id: int) -> User:
 
 
 def get_user_bank(session: Session, user_id: int) -> Optional[float]:
-    """
-    Возвращаем текущий банк пользователя (или None, если не задан).
-    """
     user = get_or_create_user(session, user_id)
     return user.bank
 
 
 def set_user_bank(session: Session, user_id: int, bank: float) -> User:
-    """
-    Жёстко устанавливаем банку новое значение.
-    Используем для команд типа 'мой банк 100000'.
-    """
     user = get_or_create_user(session, user_id)
     user.bank = float(bank)
     session.add(user)
@@ -111,14 +87,9 @@ def set_user_bank(session: Session, user_id: int, bank: float) -> User:
 
 
 def change_user_bank(session: Session, user_id: int, delta: float) -> User:
-    """
-    Изменяем банк на delta (может быть положительный или отрицательный).
-    Например: пополнить/уменьшить банк.
-    """
     user = get_or_create_user(session, user_id)
     current = float(user.bank or 0.0)
     new_value = current + float(delta)
-    # при желании можно не давать падать ниже 0
     if new_value < 0:
         new_value = 0.0
     user.bank = new_value
@@ -130,7 +101,6 @@ def change_user_bank(session: Session, user_id: int, delta: float) -> User:
 
 # ---------- ОПЕРАЦИИ СО СТАВКАМИ ----------
 
-
 def add_bet(
     session: Session,
     user_id: int,
@@ -140,10 +110,6 @@ def add_bet(
     event: Optional[str] = None,
     outcome: Optional[str] = None,
 ) -> Bet:
-    """
-    Сохраняем ставку в БД.
-    """
-    # гарантируем, что пользователь существует
     get_or_create_user(session, user_id)
 
     bet = Bet(
@@ -161,9 +127,6 @@ def add_bet(
 
 
 def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
-    """
-    Возвращаем последние N ставок пользователя.
-    """
     statement = (
         select(Bet)
         .where(Bet.user_id == user_id)
@@ -174,34 +137,13 @@ def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
 
 
 def get_all_bets(session: Session, user_id: int) -> List[Bet]:
-    """
-    Возвращаем все ставки пользователя.
-    (Может использоваться для глобальной аналитики рынков и т.п.)
-    """
     statement = select(Bet).where(Bet.user_id == user_id)
     return list(session.exec(statement))
 
 
-def settle_bet(
-    session: Session,
-    user_id: int,
-    bet_id: int,
-    result: str,
-) -> Optional[Bet]:
-    """
-    Отмечаем ставку рассчитанной: result = "win" / "lose" / "push".
-
-    Расчёт PnL:
-    - если есть stake и odds:
-        win  -> profit = stake * (odds - 1)
-        lose -> profit = -stake
-        push -> profit = 0
-    - если есть только stake:
-        win  -> profit = +stake
-        lose -> profit = -stake
-        push -> profit = 0
-    """
+def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
     result = result.lower().strip()
+
     if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
         norm_result = "win"
     elif result in ("lose", "loss", "проигрыш", "проиграл", "проиграла", "проиграли"):
@@ -209,7 +151,6 @@ def settle_bet(
     elif result in ("push", "refund", "возврат", "возврату", "возврата"):
         norm_result = "push"
     else:
-        # неизвестный результат
         return None
 
     statement = select(Bet).where(Bet.id == bet_id, Bet.user_id == user_id)
@@ -226,10 +167,8 @@ def settle_bet(
 
         if norm_result == "win":
             if odds is not None and odds > 1.01:
-                # классика: чистая прибыль = ставка * (кэф - 1)
                 bet.profit = stake * (odds - 1.0)
             else:
-                # если кэф неизвестен, считаем прибыль = ставка
                 bet.profit = stake
         elif norm_result == "lose":
             bet.profit = -stake
@@ -243,44 +182,21 @@ def settle_bet(
 
 
 def get_user_stats(session: Session, user_id: int) -> UserStats:
-    """
-    Реальная статистика по пользователю.
-
-    Винрейт и ROI считаем только по win/lose (без push),
-    но при этом учитываем количество возвратов отдельно.
-    """
     statement = select(Bet).where(Bet.user_id == user_id)
     bets = list(session.exec(statement))
 
     total = len(bets)
     if total == 0:
-        return UserStats(
-            total_bets=0,
-            settled_bets=0,
-            pushes=0,
-            winrate=0.0,
-            roi=0.0,
-            pnl=0.0,
-            total_stake=0.0,
-        )
+        return UserStats(0, 0, 0, 0.0, 0.0, 0.0, 0.0)
 
     wins = [b for b in bets if b.result == "win"]
     loses = [b for b in bets if b.result == "lose"]
-    non_push = wins + loses
     pushes = [b for b in bets if b.result == "push"]
+    non_push = wins + loses
 
     settled_count = len(non_push)
-
     if settled_count == 0:
-        return UserStats(
-            total_bets=total,
-            settled_bets=0,
-            pushes=len(pushes),
-            winrate=0.0,
-            roi=0.0,
-            pnl=0.0,
-            total_stake=0.0,
-        )
+        return UserStats(total, 0, len(pushes), 0.0, 0.0, 0.0, 0.0)
 
     winrate = len(wins) / settled_count * 100.0
     pnl = sum(b.profit or 0.0 for b in non_push)
