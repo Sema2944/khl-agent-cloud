@@ -11,19 +11,21 @@ from sqlmodel import Session
 
 from .db import get_session
 from . import bets_db
-from .hockey_logic import khl_today_text_from_winline
+
+# Линии (пока DEMO-провайдер, чтобы не зависеть от OddsAPI)
+from .lines.demo_provider import DemoProvider
 
 logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------
-# УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI
+# УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI (get_session теперь yield-генератор)
 # ------------------------------------------------------------
 
 @contextmanager
 def db_session() -> Session:
     """
-    Берём Session через общий dependency get_session() (yield-генератор).
+    Берём Session через общий dependency get_session() (yield-версия).
     """
     gen = get_session()
     session = next(gen)
@@ -70,7 +72,8 @@ def _parse_bank_set(message: str) -> Optional[float]:
     """
     Поймать команды вроде:
     - "мой банк 100000"
-    - "банк 200 000"
+    - "банк 50k" (пока без k)
+    - "установи банк 200 000"
     """
     nums = re.findall(r"(\d+[ \d]*)", message.replace("\u00a0", " "))
     if not nums:
@@ -113,7 +116,7 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
     lines.append(f"PnL: *{pnl:+.0f}*")
     lines.append(f"Объём ставок: *{total_stake:.0f}*")
     lines.append("")
-    lines.append("_Это базовый отчёт MVP. Позже будет разбор по лигам и рынкам._")
+    lines.append("_Это базовый отчёт MVP. Позже я буду давать разбор по лигам и рынкам._")
 
     return "\n".join(lines)
 
@@ -130,6 +133,20 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
+
+    # 0) Команда "меню/хелп"
+    if norm in {"/start", "start", "меню", "help", "/help"}:
+        return (
+            "Команды MVP:\n\n"
+            "• `профиль`\n"
+            "• `состояние банка`\n"
+            "• `мой банк 100000`\n"
+            "• `КХЛ сегодня`\n"
+            "• `линия <id>`\n"
+            "• `отчёт за неделю`\n"
+            "• `разбор моих рынков`\n"
+            "• `ставка: <событие>; исход=...; сумма=...; кэф=...`\n"
+        )
 
     # 1) Профиль
     if "профиль" in norm:
@@ -167,16 +184,53 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         last_week_bets = [b for b in all_bets if b.created_at >= week_ago]
         return _format_week_report(last_week_bets)
 
-    # 5) КХЛ сегодня
+    # 5) КХЛ сегодня (через DEMO provider, пока без OddsAPI)
     if "кхл сегодня" in norm or "кхл на сегодня" in norm:
-        try:
-            text = await khl_today_text_from_winline()
-            if not text:
-                return "Пока не вижу линию КХЛ на сегодня. Попробуй чуть позже."
-            return text
-        except Exception as e:
-            logger.exception("khl_today_text_from_winline failed: %s", e)
-            return "Не удалось получить линию КХЛ на сегодня 😔 Попробуй чуть позже."
+        provider = DemoProvider()
+        matches = await provider.list_matches(sport="hockey", league="KHL")
+        if not matches:
+            return "Матчей КХЛ на сегодня не найдено."
+
+        lines = ["🏒 Матчи КХЛ на сегодня:", ""]
+        for i, m in enumerate(matches, 1):
+            lines.append(f"{i}) {m.home} — {m.away} (id: {m.id})")
+        lines.append("")
+        lines.append("Чтобы получить линию, напиши: `линия <id>`")
+        return "\n".join(lines)
+
+    # 5.1) Линия по матчу: "линия <id>"
+    m_line = re.match(r"линия\s+(.+)$", norm)
+    if m_line:
+        match_id = m_line.group(1).strip()
+        provider = DemoProvider()
+        line = await provider.get_line(match_id)
+
+        out = [
+            f"📌 {line.match.league}: {line.match.home} — {line.match.away}",
+            f"Источник: {line.source}",
+            "",
+        ]
+
+        for mk in line.markets:
+            if mk.type == "moneyline":
+                out.append("1X2 / Moneyline:")
+                out.append(f"• 1: {mk.home}")
+                out.append(f"• X: {mk.draw}")
+                out.append(f"• 2: {mk.away}")
+                out.append("")
+            elif mk.type == "total":
+                out.append(f"Тотал {mk.value}:")
+                out.append(f"• Over: {mk.over}")
+                out.append(f"• Under: {mk.under}")
+                out.append("")
+            elif mk.type == "handicap":
+                out.append(f"Фора {mk.value}:")
+                out.append(f"• {line.match.home} ({mk.value}): {mk.home_handicap}")
+                out.append(f"• {line.match.away}: {mk.away_handicap}")
+                out.append("")
+
+        out.append("⚠️ Это аналитическая информация, не рекомендация.")
+        return "\n".join(out).strip()
 
     # 6) Разбор моих рынков
     if "разбор моих рынков" in norm:
@@ -199,7 +253,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         if not by_outcome:
             return (
                 "Ставки есть, но по ним пока мало структурированных данных.\n"
-                "В следующих версиях будет полноценный разбор по рынкам, лигам и типам ставок."
+                "В следующих версиях я буду делать полноценный разбор по рынкам, лигам и типам ставок."
             )
 
         lines = ["📊 *Разбор твоих рынков (MVP)*", ""]
@@ -281,15 +335,16 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
-    # 9) Дефолтный ответ (пока без LLM)
+    # 9) Дефолтный ответ
     return (
         "Пока я в MVP-версии и понимаю такие команды:\n\n"
         "• `профиль` — статистика и банк\n"
         "• `состояние банка` — текущий банк\n"
         "• `мой банк 100000` — установить банк\n"
-        "• `КХЛ сегодня` — матчи и линия на сегодня\n"
+        "• `КХЛ сегодня` — список матчей (пока демо)\n"
+        "• `линия <id>` — показать рынки по матчу (пока демо)\n"
         "• `отчёт за неделю` — отчёт по ставкам\n"
-        "• `разбор моих рынков` — базовый разбор рынков\n"
+        "• `разбор моих рынков` — базовый разбор\n"
         "• `ставка: <событие>; исход=...; сумма=...; кэф=...` — сохранить ставку\n\n"
-        "Позже подключим нейросеть для полноценной аналитики 🙂"
+        "Позже добавим реальные API линий и LLM-аналитику 🙂"
     )
