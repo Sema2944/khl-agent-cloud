@@ -1,5 +1,4 @@
 # scripts/run_telegram.py
-
 import runpy
 
 if __name__ == "__main__":
