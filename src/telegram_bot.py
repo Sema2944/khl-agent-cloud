@@ -1,6 +1,4 @@
 # src/telegram_bot.py
-from __future__ import annotations
-
 import os
 import logging
 import asyncio
@@ -23,30 +21,28 @@ from telegram.ext import (
     filters,
 )
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# -------------------- ENV --------------------
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 API_BASE = (os.getenv("API_BASE") or "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
 if not API_BASE:
-    raise RuntimeError("API_BASE is not set")
+    # НЕ валим процесс — бот всё равно должен отвечать
+    logger.warning("API_BASE is not set. Bot will work in 'no-backend' mode.")
 
-logger.info("Using backend API_BASE=%r", API_BASE)
-
-
-# -------------------- Keyboards --------------------
-
-def build_main_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
+MAIN_KB = ReplyKeyboardMarkup(
+    [
         ["профиль", "мои ставки"],
         ["КХЛ сегодня", "отчёт за неделю"],
         ["разбор моих рынков", "состояние банка"],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
 
 
 def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
@@ -56,43 +52,43 @@ def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"),
                 InlineKeyboardButton("🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"),
             ],
-            [
-                InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push"),
-            ],
+            [InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push")],
         ]
     )
 
 
-# -------------------- Backend API --------------------
+async def _safe_request(method: str, url: str, **kwargs) -> dict:
+    """
+    Единая функция запросов к backend:
+    - короткий timeout
+    - понятная ошибка
+    """
+    timeout = kwargs.pop("timeout", 10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.request(method, url, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
 
 async def call_agent(user_id: int, message: str) -> str:
-    """
-    POST {API_BASE}/agent/query
-    Body: {"user_id": ..., "message": "..."}  (service.py поддерживает message/query)
-    """
-    payload = {"user_id": int(user_id), "message": (message or "").strip()}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(f"{API_BASE}/agent/query", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("reply") or "Пустой ответ от сервера 😕"
+    if not API_BASE:
+        return "Backend не настроен (API_BASE пуст). Проверь переменные окружения на Render."
+
+    payload = {"user_id": user_id, "message": message}  # service.py поддерживает message/query
+    data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload)
+    return data.get("reply", "Пустой ответ от сервера 😕")
 
 
 async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
-    """
-    GET {API_BASE}/agent/last-bets?user_id=...&limit=...
-    """
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{API_BASE}/agent/last-bets",
-            params={"user_id": int(user_id), "limit": int(limit)},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("bets", []) or []
+    if not API_BASE:
+        return []
+    data = await _safe_request(
+        "GET",
+        f"{API_BASE}/agent/last-bets",
+        params={"user_id": user_id, "limit": limit},
+    )
+    return data.get("bets", []) or []
 
-
-# -------------------- Helpers --------------------
 
 def _format_bet_for_user(b: dict) -> str:
     bet_id = b.get("id")
@@ -113,7 +109,7 @@ def _format_bet_for_user(b: dict) -> str:
             dt_str = str(created_raw)
 
     lines: list[str] = []
-    header = f"Ставка #{bet_id}" if bet_id is not None else "Ставка"
+    header = f"Ставка #{bet_id}"
     if dt_str:
         header += f" от {dt_str}"
     lines.append(header)
@@ -151,59 +147,45 @@ def _format_bet_for_user(b: dict) -> str:
     return "\n".join(lines)
 
 
-# -------------------- Commands --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "✅ Я на связи.\n\nНажимай кнопки внизу или напиши запрос.",
+            reply_markup=MAIN_KB,
+        )
+
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text("✅ Бот работает.", reply_markup=build_main_keyboard())
+        await update.message.reply_text("✅ Бот жив. Если нет ответа на команды — проблема в backend.", reply_markup=MAIN_KB)
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    text = (
-        "Привет! Я AI-агент по хоккею 🏒\n\n"
-        "Доступные команды (MVP):\n"
-        "• профиль\n"
-        "• мои ставки\n"
-        "• КХЛ сегодня\n"
-        "• отчёт за неделю\n"
-        "• разбор моих рынков\n"
-        "• состояние банка\n\n"
-        "Также можешь писать:\n"
-        "• `мой банк 100000`\n"
-        "• `ставка: <событие>; исход=...; сумма=...; кэф=...`\n"
-    )
-    await update.message.reply_text(text, reply_markup=build_main_keyboard())
-
-
-# -------------------- Message handler --------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
     user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
+    text = update.message.text or ""
     norm = text.lower().strip()
+    logger.info("handle_message user_id=%s text=%r", user_id, text)
 
-    logger.info("handle_message: user_id=%s, text=%r", user_id, text)
+    # чтобы пользователь не думал что бот завис — сразу "печатает"
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # 1) Мои ставки — берём отдельным эндпоинтом (быстро)
+    # Мои ставки
     if "мои ставки" in norm:
         try:
             bets = await call_last_bets(user_id, 5)
-        except Exception:
-            logger.exception("call_last_bets failed")
-            await update.message.reply_text("Не удалось получить ставки 😔", reply_markup=build_main_keyboard())
+        except Exception as e:
+            logger.exception("call_last_bets failed: %s", e)
+            await update.message.reply_text("Backend недоступен 😔", reply_markup=MAIN_KB)
             return
 
         if not bets:
-            await update.message.reply_text("У тебя нет сохранённых ставок.", reply_markup=build_main_keyboard())
+            await update.message.reply_text("У тебя нет сохранённых ставок.", reply_markup=MAIN_KB)
             return
 
-        await update.message.reply_text("Твои последние ставки:", reply_markup=build_main_keyboard())
+        await update.message.reply_text("Твои последние ставки:", reply_markup=MAIN_KB)
         for b in bets:
             msg = _format_bet_for_user(b)
             if b.get("result") is None and b.get("id") is not None:
@@ -212,27 +194,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(msg)
         return
 
-    # 2) Всё остальное — через /agent/query (включая профиль, банк, отчёты, КХЛ сегодня)
+    # Остальное — в агент
     try:
         reply = await call_agent(user_id, text)
-    except Exception:
-        logger.exception("call_agent failed")
-        await update.message.reply_text("Не удалось связаться с backend 😔", reply_markup=build_main_keyboard())
+    except Exception as e:
+        logger.exception("call_agent failed: %s", e)
+        await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
         return
 
-    # 3) Если агент сохранил ставку — показываем кнопки результата
     m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
     if m:
         bet_id = int(m.group(1))
         await update.message.reply_text(reply, reply_markup=build_bet_result_keyboard(bet_id))
         return
 
-    await update.message.reply_text(reply, reply_markup=build_main_keyboard())
+    await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
-# -------------------- Callback buttons --------------------
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
@@ -248,47 +227,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = query.from_user.id
 
     mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
-    cmd = {
-        "win": f"ставка {bet_id} выиграла",
-        "lose": f"ставка {bet_id} проиграла",
-        "push": f"ставка {bet_id} возврат",
-    }[res]
+    cmd = {"win": f"ставка {bet_id} выиграла", "lose": f"ставка {bet_id} проиграла", "push": f"ставка {bet_id} возврат"}[res]
 
     try:
         agent_reply = await call_agent(user_id, cmd)
-    except Exception:
-        logger.exception("call_agent failed on settle")
-        agent_reply = "Ошибка связи с сервером 😔"
+    except Exception as e:
+        logger.exception("call_agent for callback failed: %s", e)
+        agent_reply = "Backend недоступен 😔"
 
-    # убираем кнопки
     original = query.message.text or ""
     new_text = original + f"\n\n✅ Результат отмечен: {mapping[res]}."
     await query.edit_message_text(new_text)
+    await query.message.reply_text(agent_reply, reply_markup=MAIN_KB)
 
-    await query.message.reply_text(agent_reply, reply_markup=build_main_keyboard())
-
-
-# -------------------- Error handler --------------------
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error: %s", context.error)
-
-
-# -------------------- MAIN --------------------
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    logger.info("Starting Telegram bot. API_BASE=%r", API_BASE)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_error_handler(on_error)
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # ВАЖНО: polling должен быть только в одном месте (или локально, или Render)
     app.run_polling(stop_signals=None)
 
 
