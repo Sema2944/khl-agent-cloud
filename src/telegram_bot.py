@@ -1,7 +1,7 @@
-# src/telegram_bot.py
+from __future__ import annotations
+
 import os
 import logging
-import asyncio
 import re
 from datetime import datetime
 
@@ -12,6 +12,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,13 +26,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-API_BASE = (os.getenv("API_BASE") or "").strip()
+API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # чтобы не было //agent/query
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
 if not API_BASE:
-    # НЕ валим процесс — бот всё равно должен отвечать
     logger.warning("API_BASE is not set. Bot will work in 'no-backend' mode.")
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -58,11 +58,6 @@ def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
 
 
 async def _safe_request(method: str, url: str, **kwargs) -> dict:
-    """
-    Единая функция запросов к backend:
-    - короткий timeout
-    - понятная ошибка
-    """
     timeout = kwargs.pop("timeout", 10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.request(method, url, **kwargs)
@@ -157,7 +152,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
-        await update.message.reply_text("✅ Бот жив. Если нет ответа на команды — проблема в backend.", reply_markup=MAIN_KB)
+        await update.message.reply_text(
+            "✅ Бот жив. Если нет ответа на команды — проблема в backend.",
+            reply_markup=MAIN_KB,
+        )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -169,8 +167,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text.lower().strip()
     logger.info("handle_message user_id=%s text=%r", user_id, text)
 
-    # чтобы пользователь не думал что бот завис — сразу "печатает"
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    # чтобы не казалось что бот завис
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     # Мои ставки
     if "мои ставки" in norm:
@@ -202,6 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
         return
 
+    # Если сервер вернул "Ставка сохранена (id: X)" — добавим кнопки результата
     m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
     if m:
         bet_id = int(m.group(1))
@@ -211,7 +210,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
@@ -227,7 +226,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
-    cmd = {"win": f"ставка {bet_id} выиграла", "lose": f"ставка {bet_id} проиграла", "push": f"ставка {bet_id} возврат"}[res]
+    cmd = {
+        "win": f"ставка {bet_id} выиграла",
+        "lose": f"ставка {bet_id} проиграла",
+        "push": f"ставка {bet_id} возврат",
+    }[res]
 
     try:
         agent_reply = await call_agent(user_id, cmd)
@@ -242,19 +245,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main() -> None:
-    logger.info("Starting Telegram bot. API_BASE=%r", API_BASE)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    logger.info("🚀 Starting Telegram bot. API_BASE=%r", API_BASE)
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling(stop_signals=None)
 
-async def main():
-    if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
 
+if __name__ == "__main__":
+    main()
