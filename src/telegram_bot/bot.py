@@ -1,7 +1,9 @@
+# src/telegram_bot/bot.py
 from __future__ import annotations
 
 import os
 import logging
+import asyncio
 import re
 from datetime import datetime
 
@@ -12,7 +14,6 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,7 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # чтобы не было //agent/query
+API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # <-- важно
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -69,9 +70,19 @@ async def call_agent(user_id: int, message: str) -> str:
     if not API_BASE:
         return "Backend не настроен (API_BASE пуст). Проверь переменные окружения на Render."
 
-    payload = {"user_id": user_id, "message": message}  # service.py поддерживает message/query
-    data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload)
-    return data.get("reply", "Пустой ответ от сервера 😕")
+    payload = {"user_id": user_id, "message": message}
+    try:
+        data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=12.0)
+        return data.get("reply", "Пустой ответ от сервера 😕")
+    except httpx.TimeoutException:
+        logger.exception("Backend timeout: %s/agent/query", API_BASE)
+        raise
+    except httpx.HTTPStatusError as e:
+        logger.exception("Backend HTTP error: %s %s", e.response.status_code, e.response.text)
+        raise
+    except httpx.RequestError as e:
+        logger.exception("Backend request error: %s", str(e))
+        raise
 
 
 async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
@@ -81,6 +92,7 @@ async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
         "GET",
         f"{API_BASE}/agent/last-bets",
         params={"user_id": user_id, "limit": limit},
+        timeout=12.0,
     )
     return data.get("bets", []) or []
 
@@ -167,15 +179,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text.lower().strip()
     logger.info("handle_message user_id=%s text=%r", user_id, text)
 
-    # чтобы не казалось что бот завис
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    # Мои ставки
     if "мои ставки" in norm:
         try:
             bets = await call_last_bets(user_id, 5)
-        except Exception as e:
-            logger.exception("call_last_bets failed: %s", e)
+        except Exception:
             await update.message.reply_text("Backend недоступен 😔", reply_markup=MAIN_KB)
             return
 
@@ -192,15 +201,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(msg)
         return
 
-    # Остальное — в агент
     try:
         reply = await call_agent(user_id, text)
-    except Exception as e:
-        logger.exception("call_agent failed: %s", e)
+    except Exception:
         await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
         return
 
-    # Если сервер вернул "Ставка сохранена (id: X)" — добавим кнопки результата
     m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
     if m:
         bet_id = int(m.group(1))
@@ -210,7 +216,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
@@ -234,8 +240,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         agent_reply = await call_agent(user_id, cmd)
-    except Exception as e:
-        logger.exception("call_agent for callback failed: %s", e)
+    except Exception:
         agent_reply = "Backend недоступен 😔"
 
     original = query.message.text or ""
@@ -245,14 +250,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def main() -> None:
-    logger.info("🚀 Starting Telegram bot. API_BASE=%r", API_BASE)
+    logger.info("Starting Telegram bot. API_BASE=%r", API_BASE)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.run_polling(stop_signals=None)
 
 
