@@ -37,17 +37,33 @@ if not BOT_TOKEN:
 if not API_BASE:
     logger.warning("API_BASE is not set. Bot will work in 'no-backend' mode.")
 
-# ✅ ЕДИНАЯ reply-клавиатура (без дублей в сообщениях)
+# --- Главное меню (одна клавиатура) ---
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        ["стратегия", "аналитика"],
-        ["профиль", "мои ставки"],
-        ["КХЛ сегодня", "отчёт за неделю"],
-        ["разбор моих рынков", "состояние банка"],
+        ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
+        ["🏒 КХЛ сегодня", "📊 Профиль"],
+        ["📒 Мои ставки", "📆 Отчёт за неделю"],
+        ["📉 Разбор моих рынков", "🏦 Состояние банка"],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
+
+# --- Inline под матчем ---
+def build_match_actions_keyboard(match_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📈 Линия", callback_data=f"MATCH_LINE:{match_id}"),
+                InlineKeyboardButton("🧠 AI разбор", callback_data=f"MATCH_AI:{match_id}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "👤 Мнение эксперта (если есть)", callback_data=f"MATCH_EXPERT:{match_id}"
+                )
+            ],
+        ]
+    )
 
 
 def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
@@ -73,7 +89,6 @@ async def _safe_request(method: str, url: str, **kwargs) -> dict:
 async def backend_health() -> tuple[bool, str]:
     if not API_BASE:
         return False, "API_BASE пуст (backend не настроен)."
-
     try:
         data = await _safe_request("GET", f"{API_BASE}/", timeout=min(BACKEND_TIMEOUT, 6.0))
         status = str(data.get("status", "")).lower()
@@ -91,7 +106,6 @@ async def backend_health() -> tuple[bool, str]:
 async def call_agent(user_id: int, message: str) -> str:
     if not API_BASE:
         return "Backend не настроен (API_BASE пуст). Проверь переменные окружения на Render."
-
     payload = {"user_id": user_id, "message": message}
     data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=BACKEND_TIMEOUT)
     return data.get("reply", "Пустой ответ от сервера 😕")
@@ -166,16 +180,18 @@ def _format_bet_for_user(b: dict) -> str:
     return "\n".join(lines)
 
 
-# ✅ Показать меню по команде
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("Меню:", reply_markup=MAIN_KB)
+def _normalize_menu_text(text: str) -> str:
+    t = (text or "").strip().lower()
+    # убираем эмодзи для сравнения
+    t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(
-            "✅ Я на связи.\n\nНажимай кнопки внизу или напиши запрос.",
+            "✅ Я на связи.\n\nВыбирай действие кнопками ниже.",
             reply_markup=MAIN_KB,
         )
 
@@ -183,7 +199,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-
     ok, info = await backend_health()
     msg = (
         "✅ Бот жив.\n"
@@ -192,8 +207,7 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Backend: {'OK' if ok else 'FAIL'}\n"
         f"Info: {info}"
     )
-    # ⚠️ reply_markup не нужен — клавиатура уже стоит после /start
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, reply_markup=MAIN_KB)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,52 +216,103 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     text = update.message.text or ""
-    norm = text.lower().strip()
-    logger.info("handle_message user_id=%s text=%r", user_id, text)
+    norm = _normalize_menu_text(text)
 
+    logger.info("handle_message user_id=%s text=%r", user_id, text)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # Мои ставки — отдельным эндпоинтом
-    if "мои ставки" in norm:
+    # --- Меню: стратегия / аналитика ---
+    if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
+        try:
+            reply = await call_agent(user_id, "стратегия")
+        except Exception:
+            await update.message.reply_text("Backend недоступен 😔", reply_markup=MAIN_KB)
+            return
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
+        return
+
+    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
+        await update.message.reply_text(
+            "Напиши в формате:\n`аналитика <id матча>` или `аналитика <вопрос>`",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    # --- Мои ставки ---
+    if norm in {"мои ставки"}:
         try:
             bets = await call_last_bets(user_id, 5)
         except Exception:
-            await update.message.reply_text("Backend недоступен 😔")
+            await update.message.reply_text("Backend недоступен 😔", reply_markup=MAIN_KB)
             return
 
         if not bets:
-            await update.message.reply_text("У тебя нет сохранённых ставок.")
+            await update.message.reply_text("У тебя нет сохранённых ставок.", reply_markup=MAIN_KB)
             return
 
-        await update.message.reply_text("Твои последние ставки:")
+        await update.message.reply_text("Твои последние ставки:", reply_markup=MAIN_KB)
         for b in bets:
             msg = _format_bet_for_user(b)
             if b.get("result") is None and b.get("id") is not None:
                 await update.message.reply_text(msg, reply_markup=build_bet_result_keyboard(int(b["id"])))
             else:
-                await update.message.reply_text(msg)
+                await update.message.reply_text(msg, reply_markup=MAIN_KB)
         return
 
-    # Подсказка: если нажали "аналитика" без текста
-    if norm == "аналитика":
-        await update.message.reply_text("Напиши: `аналитика <id матча>` или `аналитика <вопрос>`")
+    # --- КХЛ сегодня (плюс inline под матчем) ---
+    if norm in {"кхл сегодня"}:
+        try:
+            reply = await call_agent(user_id, "кхл сегодня")
+        except Exception:
+            await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
+            return
+
+        # Попробуем вытащить id матча из ответа (id: XXXXX)
+        m = re.search(r"id:\s*([a-zA-Z0-9_\-:.]{4,80})", reply)
+        if m:
+            match_id = m.group(1)
+            await update.message.reply_text(reply, reply_markup=build_match_actions_keyboard(match_id))
+            # отдельным сообщением закрепим главное меню, чтобы оно не исчезало
+            await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
+            return
+
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
-    # Остальное — в агент
+    # --- Остальные кнопки меню мапим на старые команды ---
+    mapping = {
+        "профиль": "профиль",
+        "отчёт за неделю": "отчёт за неделю",
+        "отчет за неделю": "отчет за неделю",
+        "состояние банка": "состояние банка",
+        "разбор моих рынков": "разбор моих рынков",
+    }
+    if norm in mapping:
+        try:
+            reply = await call_agent(user_id, mapping[norm])
+        except Exception:
+            await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
+            return
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
+        return
+
+    # --- Всё остальное отдаём агенту как есть ---
     try:
         reply = await call_agent(user_id, text)
     except Exception:
-        await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.")
+        await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=MAIN_KB)
         return
 
+    # если создали ставку — покажем inline-кнопки результата
     m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
     if m:
         bet_id = int(m.group(1))
         await update.message.reply_text(reply, reply_markup=build_bet_result_keyboard(bet_id))
+        # и снова меню
+        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # ⚠️ здесь reply_markup НЕ ставим, чтобы не было ощущения дублей меню
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,29 +323,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     await query.answer()
 
-    if not data.startswith("BET_RES:"):
+    # --- Inline под матчем ---
+    if data.startswith("MATCH_LINE:"):
+        match_id = data.split(":", 1)[1]
+        try:
+            text = await call_agent(query.from_user.id, f"линия {match_id}")
+        except Exception:
+            text = "Backend недоступен 😔"
+        await query.message.reply_text(text, reply_markup=MAIN_KB)
         return
 
-    _, bet_id_str, res = data.split(":")
-    bet_id = int(bet_id_str)
-    user_id = query.from_user.id
+    if data.startswith("MATCH_AI:"):
+        match_id = data.split(":", 1)[1]
+        try:
+            text = await call_agent(query.from_user.id, f"аналитика {match_id}")
+        except Exception:
+            text = "Backend недоступен 😔"
+        await query.message.reply_text(text, reply_markup=MAIN_KB)
+        return
 
-    mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
-    cmd = {
-        "win": f"ставка {bet_id} выиграла",
-        "lose": f"ставка {bet_id} проиграла",
-        "push": f"ставка {bet_id} возврат",
-    }[res]
+    if data.startswith("MATCH_EXPERT:"):
+        # MVP: просто показываем стратегию на сегодня
+        try:
+            text = await call_agent(query.from_user.id, "стратегия")
+        except Exception:
+            text = "Backend недоступен 😔"
+        await query.message.reply_text(text, reply_markup=MAIN_KB)
+        return
 
-    try:
-        agent_reply = await call_agent(user_id, cmd)
-    except Exception:
-        agent_reply = "Backend недоступен 😔"
+    # --- Inline по ставке ---
+    if data.startswith("BET_RES:"):
+        _, bet_id_str, res = data.split(":")
+        bet_id = int(bet_id_str)
+        user_id = query.from_user.id
 
-    original = query.message.text or ""
-    new_text = original + f"\n\n✅ Результат отмечен: {mapping[res]}."
-    await query.edit_message_text(new_text)
-    await query.message.reply_text(agent_reply)
+        mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
+        cmd = {
+            "win": f"ставка {bet_id} выиграла",
+            "lose": f"ставка {bet_id} проиграла",
+            "push": f"ставка {bet_id} возврат",
+        }[res]
+
+        try:
+            agent_reply = await call_agent(user_id, cmd)
+        except Exception:
+            agent_reply = "Backend недоступен 😔"
+
+        original = query.message.text or ""
+        new_text = original + f"\n\n✅ Результат отмечен: {mapping[res]}."
+        await query.edit_message_text(new_text)
+        await query.message.reply_text(agent_reply, reply_markup=MAIN_KB)
+        return
 
 
 def main() -> None:
@@ -291,7 +384,6 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
