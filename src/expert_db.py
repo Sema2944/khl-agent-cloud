@@ -1,7 +1,5 @@
 # src/expert_db.py
-from __future__ import annotations
-
-from datetime import datetime, date
+import datetime as dt
 from typing import Optional
 
 from sqlmodel import SQLModel, Field
@@ -19,10 +17,13 @@ class ExpertStrategy(SQLModel, table=True):
     __tablename__ = "expert_strategy"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    date: date = Field(index=True)
+
+    # ВАЖНО: используем dt.date, чтобы избежать проблем Pydantic v2
+    date: dt.date = Field(index=True)
+
     text: str
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    updated_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
 
     updated_by: Optional[int] = Field(default=None, index=True)
