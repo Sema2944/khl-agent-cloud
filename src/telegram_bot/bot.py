@@ -14,6 +14,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,7 +28,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # <-- важно
+API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # важно
+BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "8").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -59,11 +61,34 @@ def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
 
 
 async def _safe_request(method: str, url: str, **kwargs) -> dict:
-    timeout = kwargs.pop("timeout", 10.0)
+    timeout = kwargs.pop("timeout", BACKEND_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.request(method, url, **kwargs)
         r.raise_for_status()
         return r.json()
+
+
+async def backend_health() -> tuple[bool, str]:
+    """
+    Проверка доступности backend.
+    Возвращает (ok, message).
+    """
+    if not API_BASE:
+        return False, "API_BASE пуст (backend не настроен)."
+
+    try:
+        data = await _safe_request("GET", f"{API_BASE}/", timeout=min(BACKEND_TIMEOUT, 6.0))
+        # ожидаем {"status":"ok", ...}
+        status = str(data.get("status", "")).lower()
+        if status == "ok":
+            return True, f"OK: {data}"
+        return False, f"Backend ответил, но статус не ok: {data}"
+    except httpx.TimeoutException:
+        return False, f"timeout > {BACKEND_TIMEOUT}s"
+    except httpx.HTTPStatusError as e:
+        return False, f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+    except httpx.RequestError as e:
+        return False, f"RequestError: {str(e)}"
 
 
 async def call_agent(user_id: int, message: str) -> str:
@@ -71,18 +96,8 @@ async def call_agent(user_id: int, message: str) -> str:
         return "Backend не настроен (API_BASE пуст). Проверь переменные окружения на Render."
 
     payload = {"user_id": user_id, "message": message}
-    try:
-        data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=12.0)
-        return data.get("reply", "Пустой ответ от сервера 😕")
-    except httpx.TimeoutException:
-        logger.exception("Backend timeout: %s/agent/query", API_BASE)
-        raise
-    except httpx.HTTPStatusError as e:
-        logger.exception("Backend HTTP error: %s %s", e.response.status_code, e.response.text)
-        raise
-    except httpx.RequestError as e:
-        logger.exception("Backend request error: %s", str(e))
-        raise
+    data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=BACKEND_TIMEOUT)
+    return data.get("reply", "Пустой ответ от сервера 😕")
 
 
 async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
@@ -92,7 +107,7 @@ async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
         "GET",
         f"{API_BASE}/agent/last-bets",
         params={"user_id": user_id, "limit": limit},
-        timeout=12.0,
+        timeout=BACKEND_TIMEOUT,
     )
     return data.get("bets", []) or []
 
@@ -163,11 +178,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "✅ Бот жив. Если нет ответа на команды — проблема в backend.",
-            reply_markup=MAIN_KB,
-        )
+    """
+    Диагностический /ping:
+    - показывает API_BASE
+    - показывает, отвечает ли backend на GET /
+    """
+    if not update.message:
+        return
+
+    ok, info = await backend_health()
+    msg = (
+        "✅ Бот жив.\n"
+        f"API_BASE: {API_BASE or '—'}\n"
+        f"TIMEOUT: {BACKEND_TIMEOUT}s\n"
+        f"Backend: {'OK' if ok else 'FAIL'}\n"
+        f"Info: {info}"
+    )
+    await update.message.reply_text(msg, reply_markup=MAIN_KB)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,8 +206,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text.lower().strip()
     logger.info("handle_message user_id=%s text=%r", user_id, text)
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
+    # Мои ставки
     if "мои ставки" in norm:
         try:
             bets = await call_last_bets(user_id, 5)
@@ -201,6 +229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(msg)
         return
 
+    # Остальное — в агент
     try:
         reply = await call_agent(user_id, text)
     except Exception:
@@ -250,7 +279,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main() -> None:
-    logger.info("Starting Telegram bot. API_BASE=%r", API_BASE)
+    logger.info("Starting Telegram bot. API_BASE=%r TIMEOUT=%s", API_BASE, BACKEND_TIMEOUT)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
