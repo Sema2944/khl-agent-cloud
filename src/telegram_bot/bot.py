@@ -10,6 +10,7 @@ from datetime import datetime
 import httpx
 from telegram import (
     Update,
+    ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
@@ -20,7 +21,6 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler,
     filters,
 )
 
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")
-BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "10").strip())
+BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "8").strip())
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -37,14 +37,31 @@ if not BOT_TOKEN:
 if not API_BASE:
     logger.warning("API_BASE is not set. Bot will work in 'no-backend' mode.")
 
-# -----------------------------
-# FSM states
-# -----------------------------
-SPORT, LEAGUE, MATCH, ACTION = range(4)
+# ✅ ЕДИНАЯ reply-клавиатура (без дублей в сообщениях)
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["стратегия", "аналитика"],
+        ["профиль", "мои ставки"],
+        ["КХЛ сегодня", "отчёт за неделю"],
+        ["разбор моих рынков", "состояние банка"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
 
-# -----------------------------
-# Helpers: backend calls
-# -----------------------------
+
+def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"),
+                InlineKeyboardButton("🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"),
+            ],
+            [InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push")],
+        ]
+    )
+
+
 async def _safe_request(method: str, url: str, **kwargs) -> dict:
     timeout = kwargs.pop("timeout", BACKEND_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -52,9 +69,11 @@ async def _safe_request(method: str, url: str, **kwargs) -> dict:
         r.raise_for_status()
         return r.json()
 
+
 async def backend_health() -> tuple[bool, str]:
     if not API_BASE:
         return False, "API_BASE пуст (backend не настроен)."
+
     try:
         data = await _safe_request("GET", f"{API_BASE}/", timeout=min(BACKEND_TIMEOUT, 6.0))
         status = str(data.get("status", "")).lower()
@@ -68,101 +87,100 @@ async def backend_health() -> tuple[bool, str]:
     except httpx.RequestError as e:
         return False, f"RequestError: {str(e)}"
 
+
 async def call_agent(user_id: int, message: str) -> str:
     if not API_BASE:
         return "Backend не настроен (API_BASE пуст). Проверь переменные окружения на Render."
+
     payload = {"user_id": user_id, "message": message}
     data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=BACKEND_TIMEOUT)
     return data.get("reply", "Пустой ответ от сервера 😕")
 
-# -----------------------------
-# UI keyboards
-# -----------------------------
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🏒 Хоккей", callback_data="SPORT:hockey")],
-            [InlineKeyboardButton("👤 Стратегия эксперта на сегодня", callback_data="EXPERT:today")],
-            [InlineKeyboardButton("📊 Профиль", callback_data="CMD:profile"),
-             InlineKeyboardButton("🧾 Мои ставки", callback_data="CMD:mybets")],
-            [InlineKeyboardButton("📆 Отчёт за неделю", callback_data="CMD:week"),
-             InlineKeyboardButton("🏦 Состояние банка", callback_data="CMD:bank")],
-        ]
+
+async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
+    if not API_BASE:
+        return []
+    data = await _safe_request(
+        "GET",
+        f"{API_BASE}/agent/last-bets",
+        params={"user_id": user_id, "limit": limit},
+        timeout=BACKEND_TIMEOUT,
     )
+    return data.get("bets", []) or []
 
-def kb_leagues_hockey() -> InlineKeyboardMarkup:
-    # MVP: пока только КХЛ кнопкой, позже добавим НХЛ и др.
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("КХЛ (сегодня)", callback_data="LEAGUE:khl")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:main")],
-        ]
-    )
 
-def kb_matches(matches: list[dict]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for m in matches[:10]:
-        mid = str(m.get("id") or "")
-        title = str(m.get("title") or m.get("name") or mid or "match")
-        if not mid:
-            continue
-        rows.append([InlineKeyboardButton(title, callback_data=f"MATCH:{mid}")])
+def _format_bet_for_user(b: dict) -> str:
+    bet_id = b.get("id")
+    created_raw = b.get("created_at")
+    event = b.get("event")
+    outcome = b.get("outcome")
+    stake = b.get("stake")
+    odds = b.get("odds")
+    result = b.get("result")
+    profit = b.get("profit")
 
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="REFRESH:matches")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:league")])
-    return InlineKeyboardMarkup(rows)
+    dt_str = ""
+    if created_raw:
+        try:
+            dt = datetime.fromisoformat(created_raw)
+            dt_str = dt.strftime("%d.%m %H:%M")
+        except Exception:
+            dt_str = str(created_raw)
 
-def kb_match_actions(match_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🧠 AI аналитика", callback_data=f"AI:{match_id}")],
-            [InlineKeyboardButton("📈 Линия / коэффициенты", callback_data=f"LINE:{match_id}")],
-            [InlineKeyboardButton("👤 Стратегия эксперта на сегодня", callback_data="EXPERT:today")],
-            [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:matches")],
-            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:main")],
-        ]
-    )
+    lines: list[str] = []
+    header = f"Ставка #{bet_id}"
+    if dt_str:
+        header += f" от {dt_str}"
+    lines.append(header)
 
-# -----------------------------
-# Parsing helpers (from replies)
-# -----------------------------
-def parse_matches_from_text(text: str) -> list[dict]:
-    """
-    Парсим простой формат, который уже выдаёт backend:
-    "1) СКА — ЦСКА (id: demo_khl_123456)"
-    """
-    matches: list[dict] = []
-    for line in (text or "").splitlines():
-        m = re.search(r"\(id:\s*([^)]+)\)", line)
-        if not m:
-            continue
-        match_id = m.group(1).strip()
-        # title = строка до "(id:"
-        title = line.split("(id:", 1)[0].strip()
-        title = re.sub(r"^\d+\)\s*", "", title).strip()
-        if match_id:
-            matches.append({"id": match_id, "title": title or match_id})
-    return matches
+    if event:
+        lines.append(f"Событие: {event}")
+    if outcome:
+        lines.append(f"Исход: {outcome}")
 
-# -----------------------------
-# Commands
-# -----------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message:
-        return ConversationHandler.END
+    if stake is not None:
+        try:
+            lines.append(f"Сумма: {float(stake):.0f}")
+        except Exception:
+            lines.append(f"Сумма: {stake}")
 
-    await update.message.reply_text(
-        "✅ Меню открыто.\n\nВыбери действие:",
-        reply_markup=kb_main_menu(),
-    )
-    context.user_data.clear()
-    return SPORT
+    if odds is not None:
+        try:
+            lines.append(f"Коэффициент: {float(odds):.2f}")
+        except Exception:
+            lines.append(f"Коэффициент: {odds}")
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # alias to /start
-    return await cmd_start(update, context)
+    if result:
+        mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
+        human = mapping.get(result, result)
+        line = f"Результат: {human}"
+        if profit is not None:
+            try:
+                p = float(profit)
+                sign = "+" if p >= 0 else ""
+                line += f", PnL: {sign}{p:.0f}"
+            except Exception:
+                line += f", PnL: {profit}"
+        lines.append(line)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    return "\n".join(lines)
+
+
+# ✅ Показать меню по команде
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text("Меню:", reply_markup=MAIN_KB)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "✅ Я на связи.\n\nНажимай кнопки внизу или напиши запрос.",
+            reply_markup=MAIN_KB,
+        )
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
@@ -174,203 +192,97 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Backend: {'OK' if ok else 'FAIL'}\n"
         f"Info: {info}"
     )
-    await update.message.reply_text(msg, reply_markup=kb_main_menu())
+    # ⚠️ reply_markup не нужен — клавиатура уже стоит после /start
+    await update.message.reply_text(msg)
 
-# -----------------------------
-# FSM handlers: callbacks
-# -----------------------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if not query:
-        return SPORT
 
-    await query.answer()
-    data = query.data or ""
-    user_id = query.from_user.id
-
-    # unified "typing"
-    try:
-        await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-    # BACK navigation
-    if data.startswith("BACK:"):
-        where = data.split(":", 1)[1]
-        if where == "main":
-            context.user_data.clear()
-            await query.edit_message_text("🏠 Главное меню:", reply_markup=kb_main_menu())
-            return SPORT
-        if where == "league":
-            await query.edit_message_text("Выбери лигу:", reply_markup=kb_leagues_hockey())
-            return LEAGUE
-        if where == "matches":
-            # show cached matches
-            matches = context.user_data.get("matches") or []
-            if not matches:
-                await query.edit_message_text("Матчи не загружены. Нажми КХЛ ещё раз.", reply_markup=kb_leagues_hockey())
-                return LEAGUE
-            await query.edit_message_text("Выбери матч:", reply_markup=kb_matches(matches))
-            return MATCH
-
-    # COMMANDS from menu
-    if data.startswith("CMD:"):
-        cmd = data.split(":", 1)[1]
-        mapping = {
-            "profile": "профиль",
-            "mybets": "мои ставки",
-            "week": "отчёт за неделю",
-            "bank": "состояние банка",
-        }
-        text_cmd = mapping.get(cmd)
-        if not text_cmd:
-            return SPORT
-
-        try:
-            reply = await call_agent(user_id, text_cmd)
-        except Exception:
-            reply = "Backend недоступен 😔\nПопробуй позже."
-
-        await query.edit_message_text(reply, reply_markup=kb_main_menu())
-        return SPORT
-
-    # Expert strategy
-    if data == "EXPERT:today":
-        try:
-            reply = await call_agent(user_id, "стратегия")
-        except Exception:
-            reply = "Backend недоступен 😔\nПопробуй позже."
-        await query.edit_message_text(reply, reply_markup=kb_main_menu())
-        return SPORT
-
-    # Sport selection
-    if data.startswith("SPORT:"):
-        sport = data.split(":", 1)[1]
-        context.user_data["sport"] = sport
-        if sport == "hockey":
-            await query.edit_message_text("Выбери лигу:", reply_markup=kb_leagues_hockey())
-            return LEAGUE
-        await query.edit_message_text("Этот спорт будет добавлен позже.", reply_markup=kb_main_menu())
-        return SPORT
-
-    # League selection
-    if data.startswith("LEAGUE:"):
-        league = data.split(":", 1)[1]
-        context.user_data["league"] = league
-
-        # MVP: КХЛ сегодня — получаем список матчей через existing команду
-        if league == "khl":
-            try:
-                text = await call_agent(user_id, "кхл сегодня")
-                matches = parse_matches_from_text(text)
-                context.user_data["matches"] = matches
-            except Exception:
-                await query.edit_message_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=kb_main_menu())
-                return SPORT
-
-            if not context.user_data.get("matches"):
-                await query.edit_message_text(
-                    "Не нашёл матчи на сегодня. Попробуй позже.",
-                    reply_markup=kb_leagues_hockey(),
-                )
-                return LEAGUE
-
-            await query.edit_message_text("Выбери матч:", reply_markup=kb_matches(context.user_data["matches"]))
-            return MATCH
-
-        await query.edit_message_text("Эта лига будет добавлена позже.", reply_markup=kb_leagues_hockey())
-        return LEAGUE
-
-    # Refresh matches
-    if data == "REFRESH:matches":
-        league = context.user_data.get("league")
-        if league == "khl":
-            try:
-                text = await call_agent(user_id, "кхл сегодня")
-                matches = parse_matches_from_text(text)
-                context.user_data["matches"] = matches
-            except Exception:
-                await query.edit_message_text("Backend недоступен 😔\nПопробуй позже.", reply_markup=kb_main_menu())
-                return SPORT
-
-            if not matches:
-                await query.edit_message_text("Пока нет матчей. Попробуй позже.", reply_markup=kb_leagues_hockey())
-                return LEAGUE
-
-            await query.edit_message_text("Выбери матч:", reply_markup=kb_matches(matches))
-            return MATCH
-
-    # Match selection
-    if data.startswith("MATCH:"):
-        match_id = data.split(":", 1)[1]
-        context.user_data["match_id"] = match_id
-
-        # показываем действия
-        await query.edit_message_text(
-            f"Матч выбран: `{match_id}`\n\nЧто делаем?",
-            reply_markup=kb_match_actions(match_id),
-            parse_mode="Markdown",
-        )
-        return ACTION
-
-    # AI analysis
-    if data.startswith("AI:"):
-        match_id = data.split(":", 1)[1]
-        try:
-            reply = await call_agent(user_id, f"аналитика {match_id}")
-        except Exception:
-            reply = "Backend недоступен 😔\nПопробуй позже."
-
-        await query.edit_message_text(reply, reply_markup=kb_match_actions(match_id))
-        return ACTION
-
-    # Line
-    if data.startswith("LINE:"):
-        match_id = data.split(":", 1)[1]
-        try:
-            reply = await call_agent(user_id, f"линия {match_id}")
-        except Exception:
-            reply = "Backend недоступен 😔\nПопробуй позже."
-
-        await query.edit_message_text(reply, reply_markup=kb_match_actions(match_id))
-        return ACTION
-
-    # default fallthrough
-    return SPORT
-
-# -----------------------------
-# Text handler (fallback: still works)
-# -----------------------------
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Оставляем текстовый ввод как fallback (параллельно FSM).
-    """
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
-        return SPORT
+        return
 
     user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
-    if not text:
-        return SPORT
+    text = update.message.text or ""
+    norm = text.lower().strip()
+    logger.info("handle_message user_id=%s text=%r", user_id, text)
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # быстрый хелп для людей
-    if text.lower() in ("/menu", "меню"):
-        await update.message.reply_text("🏠 Главное меню:", reply_markup=kb_main_menu())
-        return SPORT
+    # Мои ставки — отдельным эндпоинтом
+    if "мои ставки" in norm:
+        try:
+            bets = await call_last_bets(user_id, 5)
+        except Exception:
+            await update.message.reply_text("Backend недоступен 😔")
+            return
 
+        if not bets:
+            await update.message.reply_text("У тебя нет сохранённых ставок.")
+            return
+
+        await update.message.reply_text("Твои последние ставки:")
+        for b in bets:
+            msg = _format_bet_for_user(b)
+            if b.get("result") is None and b.get("id") is not None:
+                await update.message.reply_text(msg, reply_markup=build_bet_result_keyboard(int(b["id"])))
+            else:
+                await update.message.reply_text(msg)
+        return
+
+    # Подсказка: если нажали "аналитика" без текста
+    if norm == "аналитика":
+        await update.message.reply_text("Напиши: `аналитика <id матча>` или `аналитика <вопрос>`")
+        return
+
+    # Остальное — в агент
     try:
         reply = await call_agent(user_id, text)
     except Exception:
-        reply = "Backend недоступен 😔\nПопробуй позже."
+        await update.message.reply_text("Backend недоступен 😔\nПопробуй позже.")
+        return
 
-    await update.message.reply_text(reply, reply_markup=kb_main_menu())
-    return SPORT
+    m = re.search(r"Ставка сохранена \(id:\s*(\d+)\)", reply)
+    if m:
+        bet_id = int(m.group(1))
+        await update.message.reply_text(reply, reply_markup=build_bet_result_keyboard(bet_id))
+        return
 
-# -----------------------------
-# Entry point
-# -----------------------------
+    # ⚠️ здесь reply_markup НЕ ставим, чтобы не было ощущения дублей меню
+    await update.message.reply_text(reply)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    await query.answer()
+
+    if not data.startswith("BET_RES:"):
+        return
+
+    _, bet_id_str, res = data.split(":")
+    bet_id = int(bet_id_str)
+    user_id = query.from_user.id
+
+    mapping = {"win": "выигрыш", "lose": "проигрыш", "push": "возврат"}
+    cmd = {
+        "win": f"ставка {bet_id} выиграла",
+        "lose": f"ставка {bet_id} проиграла",
+        "push": f"ставка {bet_id} возврат",
+    }[res]
+
+    try:
+        agent_reply = await call_agent(user_id, cmd)
+    except Exception:
+        agent_reply = "Backend недоступен 😔"
+
+    original = query.message.text or ""
+    new_text = original + f"\n\n✅ Результат отмечен: {mapping[res]}."
+    await query.edit_message_text(new_text)
+    await query.message.reply_text(agent_reply)
+
+
 def main() -> None:
     logger.info("Starting Telegram bot. API_BASE=%r TIMEOUT=%s", API_BASE, BACKEND_TIMEOUT)
 
@@ -378,27 +290,13 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # ConversationHandler держит FSM на кнопках
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start), CommandHandler("menu", cmd_menu)],
-        states={
-            SPORT: [CallbackQueryHandler(on_callback), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
-            LEAGUE: [CallbackQueryHandler(on_callback), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
-            MATCH: [CallbackQueryHandler(on_callback), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
-            ACTION: [CallbackQueryHandler(on_callback), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)],
-        },
-        fallbacks=[CommandHandler("start", cmd_start), CommandHandler("menu", cmd_menu)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("ping", cmd_ping))
-
-    # На всякий случай: если кто-то пишет вне стейта
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling(stop_signals=None)
+
 
 if __name__ == "__main__":
     main()
