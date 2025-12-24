@@ -8,26 +8,28 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Tuple
 
-from sqlmodel import Session
+from sqlmodel import Session, select
+from zoneinfo import ZoneInfo
 
 from .db import get_session
 from . import bets_db
-from . import expert_db
 from .hockey_logic import khl_today_text_from_winline
+from .expert_db import ExpertStrategy  # <-- ВАЖНО: модель НЕ объявляем тут, чтобы не было дублей
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------
+# Настройки
+# -----------------------------
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
+STRATEGY_TIMEZONE = (os.getenv("STRATEGY_TIMEZONE") or "Europe/Moscow").strip()
 
 
 # -----------------------------
-# УТИЛИТА ДЛЯ SESSION (вне FastAPI)
+# Session helper (вне FastAPI)
 # -----------------------------
 @contextmanager
 def db_session() -> Session:
-    """
-    Берём Session через общий dependency get_session() (yield-генератор).
-    """
     gen = get_session()
     session = next(gen)
     try:
@@ -40,7 +42,36 @@ def db_session() -> Session:
 
 
 # -----------------------------
-# ВСПОМОГАТЕЛЬНОЕ ФОРМАТИРОВАНИЕ
+# Time helpers
+# -----------------------------
+def _today_local_iso() -> str:
+    """
+    Сегодняшняя дата в заданном часовом поясе (по умолчанию МСК).
+    """
+    try:
+        tz = ZoneInfo(STRATEGY_TIMEZONE)
+    except Exception:
+        tz = ZoneInfo("Europe/Moscow")
+    return datetime.now(tz).date().isoformat()
+
+
+def _parse_date_token(s: str) -> Optional[str]:
+    """
+    Принимает YYYY-MM-DD, возвращает строку YYYY-MM-DD или None.
+    """
+    s = (s or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return None
+    try:
+        # валидируем как дату
+        date.fromisoformat(s)
+        return s
+    except Exception:
+        return None
+
+
+# -----------------------------
+# UI helpers
 # -----------------------------
 def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str:
     lines: list[str] = []
@@ -60,7 +91,6 @@ def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str
     lines.append(f"ROI: *{stats.roi:.1f}%*")
     lines.append(f"PnL: *{stats.pnl:+.0f}*")
     lines.append(f"Объём ставок: *{stats.total_stake:.0f}*")
-
     lines.append("")
     lines.append("Это упрощённая статистика по всем твоим ставкам.")
     return "\n".join(lines)
@@ -106,30 +136,34 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
     lines.append(f"Объём ставок: *{total_stake:.0f}*")
     lines.append("")
     lines.append("_Это базовый отчёт MVP. Позже будет разбор по лигам и рынкам._")
-
     return "\n".join(lines)
 
 
 # -----------------------------
-# Эксперт: стратегия
+# Экспертная стратегия: DB
 # -----------------------------
-def _format_expert_strategy() -> str:
-    today: date = datetime.utcnow().date()
+def _get_strategy_by_date(session: Session, date_iso: str) -> Optional[ExpertStrategy]:
+    st = (
+        select(ExpertStrategy)
+        .where(ExpertStrategy.date == date.fromisoformat(date_iso))
+        .order_by(ExpertStrategy.updated_at.desc())
+    )
+    return session.exec(st).first()
 
-    with db_session() as session:
-        row = expert_db.get_strategy(session, today)
 
-    if not row or not (row.text or "").strip():
-        return (
-            "👤 *Стратегия эксперта на сегодня*\n"
-            "_Пока не опубликована._\n\n"
-            "Если ты админ — обнови командой:\n"
-            "`админ стратегия: <текст>`"
-        )
+def _get_latest_strategy(session: Session) -> Optional[ExpertStrategy]:
+    st = (
+        select(ExpertStrategy)
+        .order_by(ExpertStrategy.date.desc(), ExpertStrategy.updated_at.desc())
+    )
+    return session.exec(st).first()
 
+
+def _format_strategy_row(row: ExpertStrategy, title: str = "👤 *Стратегия эксперта*") -> str:
+    date_label = row.date.isoformat()
     lines = [
-        "👤 *Стратегия эксперта на сегодня*",
-        f"Дата: *{row.date.isoformat()}*",
+        title,
+        f"Дата: *{date_label}*",
         "",
         row.text.strip(),
         "",
@@ -138,9 +172,62 @@ def _format_expert_strategy() -> str:
     return "\n".join(lines)
 
 
+def _format_expert_strategy(requested_date: Optional[str] = None, want_latest: bool = False) -> str:
+    """
+    Команды:
+    - "стратегия" -> стратегия на сегодня (по TZ)
+      если нет -> покажет последнюю (с пометкой)
+    - "стратегия последняя" -> последняя
+    - "стратегия 2025-12-24" -> конкретная дата
+    """
+    today_iso = _today_local_iso()
+
+    with db_session() as session:
+        if want_latest:
+            latest = _get_latest_strategy(session)
+            if not latest:
+                return (
+                    "👤 *Стратегия эксперта*\n"
+                    "_Пока не опубликована._"
+                )
+            return _format_strategy_row(latest, title="👤 *Стратегия эксперта (последняя)*")
+
+        if requested_date:
+            row = _get_strategy_by_date(session, requested_date)
+            if not row:
+                return (
+                    "👤 *Стратегия эксперта*\n"
+                    f"На дату *{requested_date}* стратегии нет."
+                )
+            return _format_strategy_row(row, title="👤 *Стратегия эксперта*")
+
+        # default: today
+        row_today = _get_strategy_by_date(session, today_iso)
+        if row_today:
+            return _format_strategy_row(row_today, title="👤 *Стратегия эксперта на сегодня*")
+
+        # fallback: latest
+        latest = _get_latest_strategy(session)
+        if latest:
+            return _format_strategy_row(
+                latest,
+                title="👤 *Стратегия эксперта* (сегодня ещё не обновлена — показываю последнюю)"
+            )
+
+    return (
+        "👤 *Стратегия эксперта на сегодня*\n"
+        "_Пока не опубликована._\n\n"
+        "Админ может обновить командой:\n"
+        "`админ стратегия: <текст>`"
+    )
+
+
 def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
+    """
+    Админ обновляет стратегию на "сегодня" (по TZ).
+    """
     if ADMIN_TELEGRAM_ID <= 0:
-        return False, "ADMIN_TELEGRAM_ID не задан в окружении."
+        return False, "ADMIN_TELEGRAM_ID не задан в окружении backend."
 
     if user_id != ADMIN_TELEGRAM_ID:
         return False, "Доступ запрещён."
@@ -153,20 +240,39 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
     if not new_text:
         return False, "Пустой текст стратегии."
 
-    today = datetime.utcnow().date()
+    today_iso = _today_local_iso()
+    today_dt = date.fromisoformat(today_iso)
 
     with db_session() as session:
-        expert_db.upsert_strategy(session, today, new_text, updated_by=user_id)
+        row = _get_strategy_by_date(session, today_iso)
+        now = datetime.utcnow()
+
+        if row is None:
+            row = ExpertStrategy(
+                date=today_dt,
+                text=new_text,
+                created_at=now,
+                updated_at=now,
+                updated_by=user_id,
+            )
+            session.add(row)
+        else:
+            row.text = new_text
+            row.updated_at = now
+            row.updated_by = user_id
+            session.add(row)
+
+        session.commit()
 
     return True, (
         "✅ Стратегия обновлена и сохранена в БД.\n\n"
-        "Теперь всем пользователям команда `стратегия` покажет обновлённый текст.\n"
-        "ENV/Deploy не нужен."
+        "Команда `стратегия` покажет её всем пользователям.\n"
+        f"(TZ: {STRATEGY_TIMEZONE}, дата: {today_iso})"
     )
 
 
 # -----------------------------
-# Линия и нормализация (MVP демо)
+# Линия/нормализация (MVP демо)
 # -----------------------------
 def _normalize_demo_markets() -> list[dict]:
     return [
@@ -187,7 +293,8 @@ def _format_line(match_id: str) -> str:
     if ml:
         lines.append("*1X2 / Moneyline*")
         lines.append(f"• Победа хозяев: *{ml['home']:.2f}*")
-        lines.append(f"• Ничья: *{ml['draw']:.2f}*")
+        if "draw" in ml:
+            lines.append(f"• Ничья: *{ml['draw']:.2f}*")
         lines.append(f"• Победа гостей: *{ml['away']:.2f}*")
         lines.append("")
 
@@ -201,8 +308,8 @@ def _format_line(match_id: str) -> str:
     hc = next((m for m in markets if m.get("type") == "handicap"), None)
     if hc:
         team = "Хозяева" if hc.get("team") == "home" else "Гости"
-        val = float(hc.get("value"))
-        odds = float(hc.get("odds"))
+        val = hc.get("value")
+        odds = hc.get("odds")
         lines.append("*Фора*")
         lines.append(f"• {team} {val:+.1f}: *{odds:.2f}*")
         lines.append("")
@@ -212,7 +319,7 @@ def _format_line(match_id: str) -> str:
 
 
 # -----------------------------
-# AI аналитика (MVP заглушка)
+# AI аналитика (MVP)
 # -----------------------------
 async def ai_analyze(user_id: int, prompt: str) -> str:
     text = (prompt or "").strip()
@@ -220,79 +327,87 @@ async def ai_analyze(user_id: int, prompt: str) -> str:
         return "Напиши: `аналитика <id матча>` или `аналитика <вопрос>`"
 
     is_match_id = bool(re.fullmatch(r"[a-zA-Z0-9_\-:.]{6,80}", text))
+
     if is_match_id:
-        return "\n".join(
-            [
-                "🧠 *AI аналитика (MVP)*",
-                f"Матч id: `{text}`",
-                "",
-                "Цель: объяснить рынки и логику коэффициентов — без прямых рекомендаций.",
-                "",
-                "*Как читать рынки:*",
-                "• 1X2/Moneyline: кэф ниже → событие считается более вероятным.",
-                "• Тотал: порог (например 5.5) — ожидание результативности.",
-                "• Фора: виртуальное преимущество/отставание меняет условия прохода.",
-                "",
-                "Хочешь рынки структурно — напиши: `линия <id>`.",
-                "",
-                "_Дисклеймер: аналитика не является призывом к ставке._",
-            ]
-        )
-
-    return "\n".join(
-        [
+        lines = [
             "🧠 *AI аналитика (MVP)*",
+            f"Матч id: `{text}`",
             "",
-            f"Запрос: _{text}_",
+            "Цель: объяснить рынки и логику коэффициентов — без прямых рекомендаций.",
             "",
-            "Пока LLM не подключён. Но я могу объяснять:",
-            "• как читать коэффициенты",
-            "• чем отличаются тоталы/форы/moneyline",
-            "• как мыслить сценариями матча",
+            "*Как читать рынки:*",
+            "• 1X2/Moneyline: кэф ниже → событие считается более вероятным.",
+            "• Тотал: ключевой порог (например 5.5) — ожидание результативности.",
+            "• Фора: виртуальное преимущество/отставание меняет условия прохода.",
             "",
-            "_Дисклеймер: аналитика не является рекомендацией к ставке._",
+            "Напиши: `линия <id>` — покажу рынки структурировано.",
+            "",
+            "_Дисклеймер: аналитика не является призывом к ставке._",
         ]
-    )
+        return "\n".join(lines)
+
+    lines = [
+        "🧠 *AI аналитика (MVP)*",
+        "",
+        f"Запрос: _{text}_",
+        "",
+        "Пока LLM не подключён. Но я могу объяснять базовые вещи:",
+        "• как читать коэффициенты и имплицитные вероятности",
+        "• чем отличаются тоталы, форы, moneyline",
+        "• как мыслить сценариями матча (темп, дисциплина, спецбригады)",
+        "",
+        "_Дисклеймер: аналитика не является рекомендацией к ставке._",
+    ]
+    return "\n".join(lines)
 
 
-# ------------------------------------------------------------
-# ОСНОВНАЯ ЛОГИКА АГЕНТА
-# ------------------------------------------------------------
+# -----------------------------
+# Основной агент
+# -----------------------------
 async def run_dialog_agent(user_id: int, message: str) -> str:
     text_raw = message or ""
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
 
-    # Админ: обновить стратегию
+    # 0) Админ: обновить стратегию
     if norm.startswith("админ"):
-        _, msg = _try_admin_update_strategy(user_id, text_raw)
+        ok, msg = _try_admin_update_strategy(user_id, text_raw)
         return msg
 
-    # Стратегия эксперта
-    if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
-        return _format_expert_strategy()
+    # 0.1) Стратегия
+    if norm.startswith("стратег"):
+        # варианты:
+        # "стратегия"
+        # "стратегия последняя"
+        # "стратегия 2025-12-24"
+        tail = norm.split(maxsplit=1)[1].strip() if len(norm.split()) > 1 else ""
+        if tail in {"последняя", "последняя."}:
+            return _format_expert_strategy(want_latest=True)
 
-    # Линия: "линия <id>"
+        date_tok = _parse_date_token(tail) if tail else None
+        return _format_expert_strategy(requested_date=date_tok, want_latest=False)
+
+    # 0.2) Линия
     if norm.startswith("линия"):
         body = text_raw.split("линия", 1)[1].strip(" :\n\t")
         if not body:
             return "Напиши так: `линия <id>`"
         return _format_line(body)
 
-    # AI: "аналитика <id/вопрос>"
+    # 0.3) Аналитика
     if norm.startswith("аналитика"):
         body = text_raw.split("аналитика", 1)[1].strip(" :\n\t")
         return await ai_analyze(user_id=user_id, prompt=body)
 
-    # Профиль
+    # 1) Профиль
     if "профиль" in norm:
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
             stats = bets_db.get_user_stats(session, user_id)
         return _format_profile_text(bank, stats)
 
-    # Состояние банка
+    # 2) Состояние банка
     if "состояние банка" in norm or (("банк" in norm) and ("мой" in norm or "мне" in norm) and not re.search(r"\d", norm)):
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
@@ -304,7 +419,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             )
         return f"Текущий банк: *{bank:,.0f}*".replace(",", " ")
 
-    # Установка банка
+    # 3) Установка банка
     if "банк" in norm:
         new_bank = _parse_bank_set(norm)
         if new_bank is not None:
@@ -312,7 +427,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
                 user = bets_db.set_user_bank(session, user_id, new_bank)
             return f"Банк установлен: *{user.bank:,.0f}*".replace(",", " ")
 
-    # Отчёт за неделю
+    # 4) Отчёт за неделю
     if "отчёт за неделю" in norm or "отчет за неделю" in norm:
         now = datetime.utcnow()
         week_ago = now - timedelta(days=7)
@@ -321,7 +436,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         last_week_bets = [b for b in all_bets if b.created_at >= week_ago]
         return _format_week_report(last_week_bets)
 
-    # КХЛ сегодня
+    # 5) КХЛ сегодня
     if "кхл сегодня" in norm or "кхл на сегодня" in norm:
         try:
             text = await khl_today_text_from_winline()
@@ -336,7 +451,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
                 "Чтобы получить линию, напиши: `линия <id>`"
             )
 
-    # Разбор рынков
+    # 6) Разбор моих рынков
     if "разбор моих рынков" in norm:
         with db_session() as session:
             bets = bets_db.get_all_bets(session, user_id)
@@ -368,7 +483,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         lines.append("_Это упрощённый разбор. В полной версии будет больше аналитики._")
         return "\n".join(lines)
 
-    # settle bet
+    # 7) "ставка {id} выиграла/проиграла/возврат"
     m_res = re.match(r"ставка\s+(\d+)\s+(.+)", norm)
     if m_res:
         bet_id = int(m_res.group(1))
@@ -385,11 +500,12 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         sign = "+" if pnl >= 0 else ""
         return f"Ставка #{bet.id} отмечена как *{human}*, PnL: *{sign}{pnl:.0f}*."
 
-    # add bet
+    # 8) Создание новой ставки
     if norm.startswith("ставка"):
-        body = text_raw.split("ставка", 1)[1].lstrip(" :")
-        parts = [p.strip() for p in body.split(";") if p.strip()]
+        body = text_raw.split("ставка", 1)[1]
+        body = body.lstrip(" :")
 
+        parts = [p.strip() for p in body.split(";") if p.strip()]
         event = None
         outcome = None
         stake = None
@@ -405,13 +521,15 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             if pl.startswith("исход"):
                 outcome = p.split("=", 1)[-1].strip()
             elif pl.startswith("сумма") or pl.startswith("stake"):
-                val = re.sub(r"[^\d.,]", "", p.split("=", 1)[-1]).replace(",", ".")
+                val = p.split("=", 1)[-1]
+                val = re.sub(r"[^\d.,]", "", val).replace(",", ".")
                 try:
                     stake = float(val)
                 except ValueError:
                     pass
             elif pl.startswith("кэф") or pl.startswith("коэф") or pl.startswith("коэффициент"):
-                val = re.sub(r"[^\d.,]", "", p.split("=", 1)[-1]).replace(",", ".")
+                val = p.split("=", 1)[-1]
+                val = re.sub(r"[^\d.,]", "", val).replace(",", ".")
                 try:
                     odds = float(val)
                 except ValueError:
@@ -434,8 +552,8 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
-    # help
-    return (
+    # 9) Help
+    help_text = (
         "Я понимаю команды:\n\n"
         "• `профиль` — статистика и банк\n"
         "• `состояние банка` — текущий банк\n"
@@ -444,8 +562,10 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         "• `линия <id>` — рынки/коэффициенты (MVP)\n"
         "• `аналитика <id/вопрос>` — AI аналитика (MVP)\n"
         "• `стратегия` — стратегия эксперта на сегодня\n"
-        "• `админ стратегия: <текст>` — обновить стратегию (только админ)\n"
+        "• `стратегия последняя` — последняя стратегия\n"
+        "• `стратегия YYYY-MM-DD` — стратегия на дату\n"
         "• `отчёт за неделю` — отчёт по ставкам\n"
         "• `разбор моих рынков` — базовый разбор рынков\n\n"
         "_Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам._"
     )
+    return help_text
