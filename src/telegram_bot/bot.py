@@ -4,7 +4,6 @@ import os
 import logging
 import asyncio
 import re
-from datetime import datetime
 
 import httpx
 from telegram import (
@@ -23,37 +22,46 @@ from telegram.ext import (
     filters,
 )
 
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")
-BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "8").strip())
+BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "8"))
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-if not API_BASE:
-    logger.warning("API_BASE is not set. Bot will work in 'no-backend' mode.")
-
-# =========================
-# ГЛАВНОЕ МЕНЮ (ОДНО!)
-# =========================
+# -------------------------------------------------
+# MAIN MENU (ОДНО)
+# -------------------------------------------------
 MAIN_KB = ReplyKeyboardMarkup(
     [
+        ["🏟 Матчи сегодня"],
         ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
-        ["🏟 Матчи сегодня", "📊 Профиль"],
-        ["📒 Мои ставки", "📆 Отчёт за неделю"],
-        ["📉 Разбор моих рынков", "🏦 Состояние банка"],
     ],
     resize_keyboard=True,
-    one_time_keyboard=False,
 )
 
-# =========================
-# INLINE под матчем
-# =========================
-def build_match_actions_keyboard(match_id: str) -> InlineKeyboardMarkup:
+# -------------------------------------------------
+# INLINE KEYBOARDS
+# -------------------------------------------------
+def sports_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🏒 Хоккей", callback_data="SPORT:hockey")],
+            [InlineKeyboardButton("⚽ Футбол", callback_data="SPORT:football")],
+            [InlineKeyboardButton("🏀 Баскетбол", callback_data="SPORT:basketball")],
+            [InlineKeyboardButton("🎾 Теннис", callback_data="SPORT:tennis")],
+            [InlineKeyboardButton("🕹 Киберспорт", callback_data="SPORT:esports")],
+        ]
+    )
+
+
+def match_actions_keyboard(match_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -62,173 +70,146 @@ def build_match_actions_keyboard(match_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "👤 Мнение эксперта", callback_data=f"MATCH_EXPERT:{match_id}"
+                    "👤 Мнение эксперта",
+                    callback_data=f"MATCH_EXPERT:{match_id}",
                 )
             ],
         ]
     )
 
 
-def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🟢 Выиграла", callback_data=f"BET_RES:{bet_id}:win"),
-                InlineKeyboardButton("🔴 Проиграла", callback_data=f"BET_RES:{bet_id}:lose"),
-            ],
-            [InlineKeyboardButton("⚪️ Возврат", callback_data=f"BET_RES:{bet_id}:push")],
-        ]
-    )
-
-
-# =========================
-# BACKEND
-# =========================
+# -------------------------------------------------
+# BACKEND HELPERS
+# -------------------------------------------------
 async def _safe_request(method: str, url: str, **kwargs) -> dict:
-    timeout = kwargs.pop("timeout", BACKEND_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=BACKEND_TIMEOUT) as client:
         r = await client.request(method, url, **kwargs)
         r.raise_for_status()
         return r.json()
 
 
-async def call_agent(user_id: int, message: str) -> str:
-    if not API_BASE:
-        return "Backend не настроен."
-    payload = {"user_id": user_id, "message": message}
+async def call_agent(user_id: int, text: str) -> str:
+    payload = {"user_id": user_id, "message": text}
     data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload)
-    return data.get("reply", "Пустой ответ 😕")
+    return data.get("reply", "Пустой ответ от сервера")
 
 
-async def call_last_bets(user_id: int, limit: int = 5) -> list[dict]:
-    if not API_BASE:
-        return []
-    data = await _safe_request(
-        "GET",
-        f"{API_BASE}/agent/last-bets",
-        params={"user_id": user_id, "limit": limit},
-    )
-    return data.get("bets", []) or []
-
-
-# =========================
-# UTILS
-# =========================
-def _normalize(text: str) -> str:
-    t = (text or "").lower()
-    t = re.sub(r"[^\w\sа-яё]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def _format_bet(b: dict) -> str:
-    lines = [f"Ставка #{b.get('id')}"]
-    if b.get("event"):
-        lines.append(f"Событие: {b['event']}")
-    if b.get("outcome"):
-        lines.append(f"Исход: {b['outcome']}")
-    if b.get("stake") is not None:
-        lines.append(f"Сумма: {b['stake']}")
-    if b.get("odds") is not None:
-        lines.append(f"Коэф: {b['odds']}")
-    if b.get("result"):
-        lines.append(f"Результат: {b['result']}")
-    return "\n".join(lines)
-
-
-# =========================
-# HANDLERS
-# =========================
+# -------------------------------------------------
+# COMMANDS
+# -------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ Бот запущен.\nВыбирай действие кнопками ниже.",
+        "Привет 👋\n\nВыбери действие:",
         reply_markup=MAIN_KB,
     )
 
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Бот жив", reply_markup=MAIN_KB)
+
+
+# -------------------------------------------------
+# MESSAGE HANDLER
+# -------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text or ""
-    norm = _normalize(text)
-
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-
-    # --- Главное меню ---
-    if norm in {"стратегия эксперта", "стратегия"}:
-        reply = await call_agent(user_id, "стратегия")
-        await update.message.reply_text(reply, reply_markup=MAIN_KB)
+    if not update.message:
         return
 
-    if norm in {"ai аналитика", "аналитика"}:
+    user_id = update.effective_user.id
+    text = update.message.text.strip().lower()
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING,
+    )
+
+    # --- MAIN BUTTONS ---
+    if "матчи сегодня" in text:
         await update.message.reply_text(
-            "Напиши:\n`аналитика <id матча>` или `аналитика <вопрос>`",
+            "Выбери вид спорта:",
+            reply_markup=sports_keyboard(),
+        )
+        return
+
+    if "ai аналитика" in text:
+        await update.message.reply_text(
+            "Напиши:\n"
+            "`аналитика <id матча>`\n"
+            "или\n"
+            "`аналитика <вопрос>`",
             reply_markup=MAIN_KB,
         )
         return
 
-    if norm in {"матчи сегодня", "матчи"}:
-        reply = await call_agent(user_id, "матчи сегодня")
-        m = re.search(r"id:\s*([a-zA-Z0-9_\-:.]+)", reply)
-        if m:
-            await update.message.reply_text(reply, reply_markup=build_match_actions_keyboard(m.group(1)))
-        else:
-            await update.message.reply_text(reply)
-        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
-        return
-
-    if norm == "мои ставки":
-        bets = await call_last_bets(user_id)
-        if not bets:
-            await update.message.reply_text("Ставок нет.", reply_markup=MAIN_KB)
-            return
-        for b in bets:
-            await update.message.reply_text(_format_bet(b))
-        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
-        return
-
-    mapping = {
-        "профиль": "профиль",
-        "отчёт за неделю": "отчёт за неделю",
-        "разбор моих рынков": "разбор моих рынков",
-        "состояние банка": "состояние банка",
-    }
-    if norm in mapping:
-        reply = await call_agent(user_id, mapping[norm])
+    if "стратегия эксперта" in text:
+        reply = await call_agent(user_id, "стратегия")
         await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
-    # --- fallback ---
-    reply = await call_agent(user_id, text)
+    # --- EVERYTHING ELSE → BACKEND ---
+    reply = await call_agent(user_id, update.message.text)
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
+# -------------------------------------------------
+# CALLBACKS
+# -------------------------------------------------
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
 
+    # --- SPORT SELECT ---
+    if data.startswith("SPORT:"):
+        sport = data.split(":", 1)[1]
+        reply = await call_agent(user_id, f"матчи сегодня {sport}")
+        # пробуем найти id матча
+        m = re.search(r"id:\s*([a-zA-Z0-9_\-:.]+)", reply)
+        if m:
+            await query.message.reply_text(
+                reply,
+                reply_markup=match_actions_keyboard(m.group(1)),
+            )
+        else:
+            await query.message.reply_text(reply, reply_markup=MAIN_KB)
+        return
+
+    # --- MATCH ACTIONS ---
     if data.startswith("MATCH_LINE:"):
         match_id = data.split(":", 1)[1]
-        text = await call_agent(q.from_user.id, f"линия {match_id}")
-        await q.message.reply_text(text, reply_markup=MAIN_KB)
+        reply = await call_agent(user_id, f"линия {match_id}")
+        await query.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
     if data.startswith("MATCH_AI:"):
         match_id = data.split(":", 1)[1]
-        text = await call_agent(q.from_user.id, f"аналитика {match_id}")
-        await q.message.reply_text(text, reply_markup=MAIN_KB)
+        reply = await call_agent(user_id, f"аналитика {match_id}")
+        await query.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
     if data.startswith("MATCH_EXPERT:"):
-        text = await call_agent(q.from_user.id, "стратегия")
-        await q.message.reply_text(text, reply_markup=MAIN_KB)
+        reply = await call_agent(user_id, "стратегия")
+        await query.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
 
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
 def main():
+    logger.info("Telegram bot started")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling(stop_signals=None)
 
 
