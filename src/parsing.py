@@ -1,7 +1,6 @@
 # src/parsing.py
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -15,6 +14,7 @@ from zoneinfo import ZoneInfo
 from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy  # ✅ модель только тут, не дублируем
+from .llm_client import analyze_with_llm, render_analysis_text  # ✅ LLM-адаптер
 
 logger = logging.getLogger(__name__)
 
@@ -27,51 +27,18 @@ ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
 EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY-MM-DD (fallback)
 
+# Важно: "на сегодня" считаем по МСК
 MSK = ZoneInfo("Europe/Moscow")
 
-# -----------------------------
-# (3) PROMPT: аналитика ставок LLM (готово под подключение)
-# -----------------------------
-BET_ANALYTICS_SYSTEM_PROMPT = """
-Ты — спортивный аналитик. Твоя задача: объяснять линию и риски, но НЕ давать прямых рекомендаций.
-Запрещено: "ставь", "бери", "грузим", "железка", "верняк", "100%", "проход", "прогноз на победу" в форме совета.
-Разрешено: описывать сценарии, факторы, вероятности, что рынок "ожидает" по коэффициентам.
-
-Формат ответа СТРОГО в JSON:
-{
-  "summary": "1-2 предложения, что происходит в линии и какой главный риск",
-  "market_explainer": ["3-6 буллетов: как читать выбранный рынок"],
-  "what_to_check": ["3-6 буллетов: что проверить перед решением (состав, темп, травмы, календарь, движение линии)"],
-  "risk_notes": ["2-4 буллета: почему ставка может не зайти (вариативность, вратарь, удаление, garbage time и т.п.)"],
-  "no_bet_advice_disclaimer": "короткий дисклеймер что это аналитика, не совет"
-}
-
-Если данных мало — честно скажи, что не хватает, и предложи что уточнить (но всё равно соблюдай JSON).
-Язык: русский. Стиль: коротко, по делу, без воды.
-""".strip()
-
-
-def build_bet_llm_prompt(match_title: str, league: str, match_id: str, market_key: str, market_data: dict) -> str:
-    """
-    Собираем user prompt для LLM из нормализованных данных.
-    """
-    return f"""
-Матч: {match_title}
-Лига: {league}
-match_id: {match_id}
-
-Выбранный рынок: {market_key}
-Нормализованные данные рынка (JSON):
-{json.dumps(market_data, ensure_ascii=False)}
-
-Задача:
-- объясни, что этот рынок означает
-- какие факторы чаще всего влияют на него
-- какие риски
-- никаких призывов ставить/не ставить
-Верни строго JSON по схеме из system prompt.
-""".strip()
-
+# ✅ Пункт 3: Промт аналитика ставок LLM (можно менять без деплоя)
+LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
+if not LLM_PROMPT_PREFIX:
+    LLM_PROMPT_PREFIX = (
+        "Ты профессиональный спортивный аналитик.\n"
+        "Дай осторожный разбор рынка: факторы, сценарии, риски.\n"
+        "НЕ давай прямых призывов ставить. Нужна аналитика, а не совет.\n"
+        "Пиши коротко, структурно."
+    )
 
 # -----------------------------
 # УТИЛИТА ДЛЯ SESSION (вне FastAPI)
@@ -100,7 +67,7 @@ DEMO_SPORTS = {
     "esports": "🎮 Киберспорт",
 }
 
-# match_id должен быть стабильным (чтобы backend узнавал)
+# match_id должен быть стабильным (чтобы бот узнавал)
 DEMO_MATCHES = {
     "hockey": [
         {"id": "demo_hockey_001", "title": "СКА — ЦСКА", "league": "КХЛ"},
@@ -121,8 +88,7 @@ DEMO_MATCHES = {
     ],
 }
 
-# Рынки: key -> нормализованная структура (как в ТЗ)
-# MVP: одни и те же рынки для всех матчей (пока демо)
+# MVP: одинаковые рынки для всех матчей (демо)
 DEMO_MARKETS = {
     "moneyline": {
         "label": "1X2 / Moneyline",
@@ -318,10 +284,9 @@ def _find_match(match_id: str) -> Optional[dict]:
 def _format_matches_today(sport_key: str) -> str:
     sport_key = (sport_key or "").strip().lower()
     if sport_key not in DEMO_MATCHES:
-        sport_list = ", ".join([f"{k}" for k in DEMO_MATCHES.keys()])
         return (
             "Не понял спорт.\n"
-            f"Доступно (MVP): {sport_list}\n\n"
+            "Варианты (MVP): hockey, football, basketball, tennis, esports\n\n"
             "Пример: `матчи сегодня hockey`"
         )
 
@@ -332,7 +297,7 @@ def _format_matches_today(sport_key: str) -> str:
     for m in DEMO_MATCHES[sport_key]:
         lines.append(f"• {m['title']} ({m['league']}) — id: `{m['id']}`")
     lines.append("")
-    lines.append("_Выбери матч кнопкой в Telegram._")
+    lines.append("_Дальше: `матч <id>`._")
     return "\n".join(lines)
 
 
@@ -351,7 +316,7 @@ def _format_match_screen(match_id: str) -> str:
     for key, v in DEMO_MARKETS.items():
         lines.append(f"• {v['label']} — key: `{key}`")
     lines.append("")
-    lines.append("_Дальше: рынок → AI/эксперт._")
+    lines.append("_Дальше: `рынок <id> <market_key>` → `аналитика <id> <market_key>`._")
     return "\n".join(lines)
 
 
@@ -387,14 +352,37 @@ def _format_market(match_id: str, market_key: str) -> str:
         lines.append(f"• Team {data['team']} {data['value']:+.1f}: *{data['odds']:.2f}*")
 
     lines.append("")
+    lines.append("Дальше:")
+    lines.append(f"• `аналитика {match_id} {market_key}` — 🧠 AI разбор")
+    lines.append("• `стратегия` — 👤 стратегия дня (по МСК)")
+    lines.append("")
     lines.append("_Дисклеймер: показано для объяснения рынков. Не является рекомендацией._")
     return "\n".join(lines)
 
 
+def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
+    m = _find_match(match_id)
+    market = DEMO_MARKETS.get(market_key)
+    if not m or not market:
+        return ""
+
+    data = market["data"]
+    pretty = [LLM_PROMPT_PREFIX, "", f"Матч: {m['title']} ({m['league']})", f"match_id: {match_id}", f"Рынок: {market['label']} ({market_key})", ""]
+    # кратко добавим численные данные рынка
+    if data.get("type") == "moneyline":
+        pretty.append(f"Линия: home={data['home']}, draw={data['draw']}, away={data['away']}")
+    elif data.get("type") == "total":
+        pretty.append(f"Линия: total={data['value']}, over={data['over']}, under={data['under']}")
+    elif data.get("type") == "handicap":
+        pretty.append(f"Линия: team={data['team']}, handicap={data['value']}, odds={data['odds']}")
+    pretty.append("")
+    pretty.append("Нужно: 3–5 тезисов, 2–4 риска, 2–4 пункта чек-листа.")
+    return "\n".join(pretty)
+
+
 async def ai_analyze(match_id: str, market_key: str) -> str:
     """
-    MVP: сейчас LLM не вызываем — но уже формируем system+user prompt и возвращаем JSON-структуру ответа.
-    Когда подключим LLM — заменим demo_json на реальный вызов модели и JSON-валидацию.
+    Боевой вызов LLM-адаптера (≤3 сек суммарно, ретраи, JSON-валидация, fallback).
     """
     m = _find_match(match_id)
     if not m:
@@ -405,50 +393,14 @@ async def ai_analyze(match_id: str, market_key: str) -> str:
     if not market:
         return "Рынок не найден (MVP демо)."
 
-    market_data = market["data"]
-    label = market["label"]
+    domain_prompt = _build_llm_domain_prompt(match_id, market_key)
+    analysis, meta = await analyze_with_llm(domain_prompt)
 
-    user_prompt = build_bet_llm_prompt(
-        match_title=m["title"],
-        league=m["league"],
-        match_id=match_id,
-        market_key=market_key,
-        market_data=market_data,
-    )
+    # Можно логировать SLA/ошибки
+    logger.info("LLM meta: %s", meta)
 
-    demo_json = {
-        "summary": f"{label}: коэффициенты отражают ожидания рынка по матчу. Главный риск — вариативность и неожиданные события.",
-        "market_explainer": [
-            "Коэффициент ниже = событие считается более вероятным рынком.",
-            "Порог/значение (например тотал 5.5) — ключевой уровень ожиданий.",
-            "Движение линии перед матчем может отражать новую информацию или спрос.",
-        ],
-        "what_to_check": [
-            "Состав/вратари/травмы (ключевые игроки и спецбригады)",
-            "Календарь (back-to-back), перелёты, усталость",
-            "Темп и стиль команд (агрессия, дисциплина, большинство/меньшинство)",
-            "Изменения коэффициентов за 1–3 часа до старта",
-        ],
-        "risk_notes": [
-            "Ранние удаления/голы ломают сценарий и меняют темп",
-            "Неожиданная игра вратаря меняет результативность",
-            "Случайность/реализация моментов может отклоняться от ожиданий",
-        ],
-        "no_bet_advice_disclaimer": "Это аналитика, а не рекомендация. Решение принимаешь ты.",
-        "_debug": {
-            "system_prompt": BET_ANALYTICS_SYSTEM_PROMPT,
-            "user_prompt": user_prompt,
-            "match_id": match_id,
-            "market_key": market_key,
-        },
-    }
-
-    return (
-        "🧠 *AI аналитика (MVP, подготовлено под LLM)*\n\n"
-        "```json\n"
-        + json.dumps(demo_json, ensure_ascii=False, indent=2)
-        + "\n```"
-    )
+    # Красивый текст под Telegram
+    return render_analysis_text(analysis)
 
 
 def expert_opinion_for_market(match_id: str, market_key: str) -> str:
@@ -472,7 +424,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         return msg
 
     # 1) Эксперт стратегия (по МСК)
-    if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
+    if norm in {"стратегия", "👤 стратегия эксперта", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _format_expert_strategy_for_today()
 
     # 2) Матчи сегодня <sport>
@@ -514,12 +466,11 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         return (
             "Напиши:\n"
             "• `аналитика <match_id> <market_key>`\n"
-            "или сначала открой: `матчи сегодня hockey` → матч → рынок."
+            "или по шагам: `матчи сегодня hockey` → `матч <id>` → `рынок <id> <market>`"
         )
 
-    # 6) Эксперт <match_id> <market_key> (кнопка)
+    # 6) Эксперт мнение (кнопка/команда)
     if norm.startswith("эксперт") or norm.startswith("мнение эксперта"):
-        # MVP: игнорируем параметры и показываем стратегию дня
         return expert_opinion_for_market("", "")
 
     # 7) Профиль
