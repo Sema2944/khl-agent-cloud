@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import os
+import sys
+import time
 import logging
 import asyncio
 import re
 from datetime import datetime
+from typing import Optional, Tuple
 
 import httpx
 from telegram import (
@@ -15,6 +18,7 @@ from telegram import (
     InlineKeyboardButton,
 )
 from telegram.constants import ChatAction
+from telegram.error import Conflict as TgConflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,8 +32,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # важно
+API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")
 BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "8").strip())
+
+# optional: защита от двух polling-инстансов
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+BOT_LOCK_KEY = (os.getenv("BOT_LOCK_KEY") or "telegram_bot_single_instance_lock").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -60,6 +68,34 @@ def build_bet_result_keyboard(bet_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def acquire_single_instance_lock() -> None:
+    """
+    Гарантирует, что polling запускается только в одном процессе.
+    Если Redis не настроен — просто предупреждение.
+    """
+    if not REDIS_URL:
+        logger.warning("REDIS_URL not set — single instance lock disabled.")
+        return
+
+    try:
+        import redis  # type: ignore
+    except Exception:
+        logger.warning("redis package not installed — single instance lock disabled.")
+        return
+
+    r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    lock_value = f"{time.time()}:{os.getpid()}"
+
+    # nx=True -> только если ключа нет
+    ok = r.set(BOT_LOCK_KEY, lock_value, nx=True, ex=60)
+
+    if not ok:
+        logger.error("Another bot instance is already running (lock exists). Exiting.")
+        sys.exit(0)
+
+    logger.info("Single instance lock acquired: key=%s", BOT_LOCK_KEY)
+
+
 async def _safe_request(method: str, url: str, **kwargs) -> dict:
     timeout = kwargs.pop("timeout", BACKEND_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -68,17 +104,12 @@ async def _safe_request(method: str, url: str, **kwargs) -> dict:
         return r.json()
 
 
-async def backend_health() -> tuple[bool, str]:
-    """
-    Проверка доступности backend.
-    Возвращает (ok, message).
-    """
+async def backend_health() -> Tuple[bool, str]:
     if not API_BASE:
         return False, "API_BASE пуст (backend не настроен)."
 
     try:
         data = await _safe_request("GET", f"{API_BASE}/", timeout=min(BACKEND_TIMEOUT, 6.0))
-        # ожидаем {"status":"ok", ...}
         status = str(data.get("status", "")).lower()
         if status == "ok":
             return True, f"OK: {data}"
@@ -178,11 +209,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Диагностический /ping:
-    - показывает API_BASE
-    - показывает, отвечает ли backend на GET /
-    """
     if not update.message:
         return
 
@@ -208,7 +234,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # Мои ставки
     if "мои ставки" in norm:
         try:
             bets = await call_last_bets(user_id, 5)
@@ -229,7 +254,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(msg)
         return
 
-    # Остальное — в агент
     try:
         reply = await call_agent(user_id, text)
     except Exception:
@@ -278,17 +302,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(agent_reply, reply_markup=MAIN_KB)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Не обязателен, но полезен: глушит 'No error handlers' и логирует.
+    """
+    err = context.error
+    if isinstance(err, TgConflict):
+        logger.error("Telegram polling conflict (409). Another instance is running.")
+        return
+    logger.exception("Unhandled error: %s", err)
+
+
 def main() -> None:
     logger.info("Starting Telegram bot. API_BASE=%r TIMEOUT=%s", API_BASE, BACKEND_TIMEOUT)
+
+    # защита от двух polling инстансов
+    acquire_single_instance_lock()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(on_error)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     app.run_polling(stop_signals=None)
 
 
