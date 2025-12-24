@@ -7,10 +7,21 @@ from typing import List, Optional
 
 from sqlmodel import SQLModel, Field, Session, select
 
-from .db import User  # ✅ берём User из db.py, НЕ создаём второй раз
-
 
 # ---------- МОДЕЛИ В БД ----------
+
+class User(SQLModel, table=True):
+    """
+    Пользователь бота.
+
+    id — это тот же user_id, который приходит из Telegram/клиента.
+    bank — текущий банкролл (может быть None, если ещё не задан).
+    """
+    __tablename__ = "users"
+
+    id: int = Field(primary_key=True, index=True)
+    bank: Optional[float] = Field(default=None)
+
 
 class Bet(SQLModel, table=True):
     """
@@ -23,21 +34,17 @@ class Bet(SQLModel, table=True):
     user_id: int = Field(index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    # сырое описание ставки, как ввёл пользователь
     raw_text: str
 
-    # базовые поля
-    stake: Optional[float] = None          # сумма ставки
-    odds: Optional[float] = None           # коэффициент (например 1.85)
-    event: Optional[str] = None            # матч / событие
-    outcome: Optional[str] = None          # исход (П1, тотал и т.п.)
+    stake: Optional[float] = None
+    odds: Optional[float] = None
+    event: Optional[str] = None
+    outcome: Optional[str] = None
 
-    # результат
     result: Optional[str] = Field(default=None, index=True)  # "win" / "lose" / "push" / None
 
-    # финансы
-    profit: Optional[float] = None         # + / - в тех же единицах, что stake
-    settled_at: Optional[datetime] = None  # когда ставка была рассчитана
+    profit: Optional[float] = None
+    settled_at: Optional[datetime] = None
 
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ СТРУКТУРЫ ----------
@@ -56,15 +63,11 @@ class UserStats:
 # ---------- ОПЕРАЦИИ С ПОЛЬЗОВАТЕЛЕМ / БАНКОМ ----------
 
 def get_or_create_user(session: Session, user_id: int) -> User:
-    """
-    Получаем пользователя по id.
-    Если его нет — создаём нового.
-    """
     statement = select(User).where(User.id == user_id)
     user: User | None = session.exec(statement).one_or_none()
 
     if user is None:
-        user = User(id=user_id)
+        user = User(id=user_id, bank=None)
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -143,7 +146,6 @@ def get_all_bets(session: Session, user_id: int) -> List[Bet]:
 
 def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
     result = result.lower().strip()
-
     if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
         norm_result = "win"
     elif result in ("lose", "loss", "проигрыш", "проиграл", "проиграла", "проиграли"):
@@ -172,7 +174,7 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
                 bet.profit = stake
         elif norm_result == "lose":
             bet.profit = -stake
-        elif norm_result == "push":
+        else:
             bet.profit = 0.0
 
     session.add(bet)
@@ -191,8 +193,8 @@ def get_user_stats(session: Session, user_id: int) -> UserStats:
 
     wins = [b for b in bets if b.result == "win"]
     loses = [b for b in bets if b.result == "lose"]
-    pushes = [b for b in bets if b.result == "push"]
     non_push = wins + loses
+    pushes = [b for b in bets if b.result == "push"]
 
     settled_count = len(non_push)
     if settled_count == 0:
