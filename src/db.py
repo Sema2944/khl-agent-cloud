@@ -46,12 +46,13 @@ class User(SQLModel, table=True):
 def init_db() -> None:
     """
     Инициализация БД.
-    Важно: импортируем bets_db, чтобы таблицы Bet зарегистрировались.
+    Важно: импортируем все модули с SQLModel таблицами,
+    чтобы они зарегистрировались в SQLModel.metadata.
     """
     from . import bets_db  # noqa: F401
+    from . import expert_db  # noqa: F401  <-- ВАЖНО: добавили
 
     SQLModel.metadata.create_all(engine)
-
 
 # ---------------------------------------------------------------------
 # SESSION (FastAPI dependency)
