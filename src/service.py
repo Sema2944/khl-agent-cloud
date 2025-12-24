@@ -23,7 +23,9 @@ from .bets_db import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent API")
-
+@app.get("/__health")
+def health():
+    return {"ok": True}
 
 # -----------------------------
 # Healthcheck (Render)
