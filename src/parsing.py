@@ -7,10 +7,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple
 
-from sqlmodel import Session, SQLModel, Field, select
+from sqlmodel import Session, select
 
 from .db import get_session
 from . import bets_db
+from .expert_db import ExpertStrategy  # <- ВАЖНО: модель только здесь, НЕ объявляем в parsing.py
 
 logger = logging.getLogger(__name__)
 
@@ -20,33 +21,22 @@ logger = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
 
 
+def today_msk_date():
+    return datetime.now(MSK).date()
+
+
 def today_msk_str() -> str:
-    return datetime.now(MSK).date().isoformat()
+    return today_msk_date().isoformat()
 
 
 # =============================
-# ADMIN
+# ADMIN / ENV fallback
 # =============================
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 
 # ENV fallback (если БД пустая)
 EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
 EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY-MM-DD
-
-
-# =============================
-# DB model: Expert Strategy
-# =============================
-class ExpertStrategy(SQLModel, table=True):
-    __tablename__ = "expert_strategy"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    date: str = Field(index=True)  # YYYY-MM-DD (по МСК)
-    text: str
-
-    created_at: datetime = Field(default_factory=lambda: datetime.utcnow())
-    updated_at: datetime = Field(default_factory=lambda: datetime.utcnow())
-    updated_by: int = Field(default=0, index=True)
 
 
 # =============================
@@ -137,17 +127,17 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
 # =============================
 # Expert strategy: DB get/set
 # =============================
-def _get_strategy_from_db(session: Session, date_str: str) -> Optional[ExpertStrategy]:
-    st = (
+def _get_strategy_from_db(session: Session, date_obj) -> Optional[ExpertStrategy]:
+    q = (
         select(ExpertStrategy)
-        .where(ExpertStrategy.date == date_str)
+        .where(ExpertStrategy.date == date_obj)
         .order_by(ExpertStrategy.updated_at.desc())
     )
-    return session.exec(st).first()
+    return session.exec(q).first()
 
 
 def _format_expert_strategy() -> str:
-    today = today_msk_str()
+    today = today_msk_date()
 
     db_text: Optional[str] = None
     with db_session() as session:
@@ -155,8 +145,9 @@ def _format_expert_strategy() -> str:
         if row and row.text:
             db_text = row.text
 
+    # fallback на ENV
     text = db_text or EXPERT_STRATEGY_TEXT
-    date_label = today if db_text else (EXPERT_STRATEGY_DATE or today)
+    date_label = today.isoformat() if db_text else (EXPERT_STRATEGY_DATE or today.isoformat())
 
     if not text:
         return (
@@ -193,17 +184,12 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
     if not new_text:
         return False, "Пустой текст стратегии."
 
-    today = today_msk_str()
+    today = today_msk_date()
 
     with db_session() as session:
         row = _get_strategy_from_db(session, today)
         if row is None:
-            row = ExpertStrategy(
-                date=today,
-                text=new_text,
-                updated_by=user_id,
-                updated_at=datetime.utcnow(),
-            )
+            row = ExpertStrategy(date=today, text=new_text, updated_by=user_id, updated_at=datetime.utcnow())
             session.add(row)
         else:
             row.text = new_text
@@ -217,9 +203,9 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 
 
 # =============================
-# Matches today (DEMO, without Winline)
+# Matches today (DEMO)
 # =============================
-def _matches_today_demo() -> tuple[str, list[dict]]:
+def _matches_today_demo_text() -> str:
     matches = [
         {"id": "demo_hockey_001", "sport": "Хоккей", "league": "КХЛ", "title": "СКА — ЦСКА"},
         {"id": "demo_football_001", "sport": "Футбол", "league": "РПЛ", "title": "Зенит — Спартак"},
@@ -229,8 +215,8 @@ def _matches_today_demo() -> tuple[str, list[dict]]:
     for i, m in enumerate(matches, 1):
         lines.append(f"{i}) {m['sport']} / {m['league']}: *{m['title']}* (id: `{m['id']}`)")
     lines.append("")
-    lines.append("Нажми кнопку под матчем в боте или напиши: `линия <id>` / `аналитика <id>`")
-    return "\n".join(lines), matches
+    lines.append("Команды: `линия <id>` / `аналитика <id>` / `стратегия`")
+    return "\n".join(lines)
 
 
 # =============================
@@ -300,8 +286,8 @@ async def ai_analyze(user_id: int, prompt: str) -> str:
                 "*Что можно проверить:*",
                 "• состав/травмы/вратари",
                 "• календарь и усталость",
-                "• стиль команд, спецбригады, дисциплина",
-                "• движение линии (резкие сдвиги кэфов)",
+                "• стиль команд, дисциплина",
+                "• движение линии (сдвиги кэфов)",
                 "",
                 "Хочешь рынки: `линия <id>`",
                 "",
@@ -345,8 +331,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # matches today
     if norm in {"матчи сегодня", "матчи", "сегодня матчи"}:
-        text, _ = _matches_today_demo()
-        return text
+        return _matches_today_demo_text()
 
     # line
     if norm.startswith("линия"):
