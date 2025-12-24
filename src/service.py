@@ -1,4 +1,7 @@
 # src/service.py
+from .telegram_bot.app import mount as mount_telegram
+mount_telegram(app)
+
 from __future__ import annotations
 
 import os
