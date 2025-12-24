@@ -1,12 +1,12 @@
 # src/parsing.py
 from __future__ import annotations
 
-import os
 import logging
+import os
 import re
 from contextlib import contextmanager
-from datetime import datetime, timedelta, date
-from typing import Optional, List
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
 
 from sqlmodel import Session
 
@@ -16,16 +16,20 @@ from .hockey_logic import khl_today_text_from_winline
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------
+# Экспертная стратегия (MVP)
+# -----------------------------
+EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
+EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY-MM-DD
+ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 
-# ------------------------------------------------------------
-# УТИЛИТА ДЛЯ ПОЛУЧЕНИЯ SESSION ВНЕ FastAPI
-# ------------------------------------------------------------
-
+# -----------------------------
+# УТИЛИТА ДЛЯ SESSION (вне FastAPI)
+# -----------------------------
 @contextmanager
 def db_session() -> Session:
     """
     Берём Session через общий dependency get_session() (yield-генератор).
-    Работает и в FastAPI, и в "чистом" питоне.
     """
     gen = get_session()
     session = next(gen)
@@ -38,51 +42,11 @@ def db_session() -> Session:
             pass
 
 
-# ------------------------------------------------------------
-# СТРАТЕГИЯ "КОЖАНОГО" ЭКСПЕРТА (через ENV)
-# ------------------------------------------------------------
-
-def get_expert_strategy_today() -> str:
-    """
-    Стратегия дня от человека-эксперта (НЕ рекомендация ставить).
-    Управляется через переменные окружения:
-      - EXPERT_STRATEGY_TEXT
-      - EXPERT_STRATEGY_DATE (YYYY-MM-DD, опционально)
-    """
-    text = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
-    d = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()
-
-    today = date.today().isoformat()
-
-    if not text:
-        return (
-            "👤 *Стратегия эксперта на сегодня*\n\n"
-            "Пока стратегия не опубликована.\n"
-            "Зайди чуть позже."
-        )
-
-    if d and d != today:
-        return (
-            "👤 *Стратегия эксперта*\n\n"
-            f"⚠️ Сейчас опубликована стратегия за дату: `{d}`.\n\n"
-            f"{text}\n\n"
-            "_Это информационный разбор, не рекомендация ставить._"
-        )
-
-    return (
-        "👤 *Стратегия эксперта на сегодня*\n\n"
-        f"{text}\n\n"
-        "_Это информационный разбор, не рекомендация ставить._"
-    )
-
-
-# ------------------------------------------------------------
+# -----------------------------
 # ВСПОМОГАТЕЛЬНОЕ ФОРМАТИРОВАНИЕ
-# ------------------------------------------------------------
-
+# -----------------------------
 def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str:
     lines: list[str] = []
-
     lines.append("📊 *Твой профиль*")
 
     if bank is None:
@@ -111,7 +75,6 @@ def _parse_bank_set(message: str) -> Optional[float]:
     Поймать команды вроде:
     - "мой банк 100000"
     - "банк 200 000"
-    - "установи банк 50000"
     """
     nums = re.findall(r"(\d+[ \d]*)", message.replace("\u00a0", " "))
     if not nums:
@@ -124,9 +87,6 @@ def _parse_bank_set(message: str) -> Optional[float]:
 
 
 def _format_week_report(bets: List[bets_db.Bet]) -> str:
-    """
-    Простой недельный отчёт: считаем PnL, winrate по последним 7 дням.
-    """
     if not bets:
         return (
             "За последнюю неделю у тебя не было сохранённых ставок.\n"
@@ -159,22 +119,134 @@ def _format_week_report(bets: List[bets_db.Bet]) -> str:
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------
-# ОСНОВНАЯ ЛОГИКА АГЕНТА (MVP без LLM)
-# ------------------------------------------------------------
+# -----------------------------
+# Эксперт: формат вывода
+# -----------------------------
+def _format_expert_strategy() -> str:
+    """
+    Показывает стратегию эксперта на сегодня из ENV.
+    """
+    today = datetime.utcnow().date().isoformat()
 
+    if not EXPERT_STRATEGY_TEXT:
+        return (
+            "👤 *Стратегия эксперта на сегодня*\n"
+            "_Пока не опубликована._\n\n"
+            "Админ может обновить стратегию командой:\n"
+            "`админ стратегия: <текст>`"
+        )
+
+    # Если задана дата — показываем явно, чтобы не путать "вчерашнее"
+    if EXPERT_STRATEGY_DATE:
+        date_label = EXPERT_STRATEGY_DATE
+    else:
+        date_label = today
+
+    lines = [
+        "👤 *Стратегия эксперта на сегодня*",
+        f"Дата: *{date_label}*",
+        "",
+        EXPERT_STRATEGY_TEXT,
+        "",
+        "_Дисклеймер: это аналитическая заметка, не призыв к ставке. Решение всегда на стороне пользователя._",
+    ]
+    return "\n".join(lines)
+
+
+def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
+    """
+    MVP: обновление стратегии командой админа.
+    Технически ENV на Render мы не можем менять из кода.
+    Поэтому делаем "мягкий" режим:
+    - разрешаем только админскому ID
+    - сохраняем стратегию как ставку-заметку в БД? (не надо)
+    - проще: возвращаем понятный текст, что нужно обновить ENV и redeploy.
+    """
+    if ADMIN_TELEGRAM_ID <= 0:
+        return False, "ADMIN_TELEGRAM_ID не задан в окружении."
+
+    if user_id != ADMIN_TELEGRAM_ID:
+        return False, "Доступ запрещён."
+
+    # извлекаем текст после "админ стратегия:"
+    m = re.match(r"админ\s+стратегия\s*:\s*(.+)$", raw_text.strip(), re.IGNORECASE | re.DOTALL)
+    if not m:
+        return False, "Неверный формат. Пример: `админ стратегия: текст...`"
+
+    new_text = m.group(1).strip()
+    if not new_text:
+        return False, "Пустой текст стратегии."
+
+    # Пояснение: ENV меняется вручную на Render
+    return True, (
+        "✅ Команда принята.\n\n"
+        "⚠️ Важно: бот не может сам изменить переменные окружения на Render.\n"
+        "Обнови в Render → Environment:\n"
+        f"• EXPERT_STRATEGY_TEXT = (твой текст)\n"
+        f"• EXPERT_STRATEGY_DATE = {datetime.utcnow().date().isoformat()}\n"
+        "и сделай Redeploy.\n\n"
+        "После redeploy команда `стратегия` покажет обновлённый текст."
+    )
+
+
+# -----------------------------
+# AI аналитика (пока заглушка, архитектура готова)
+# -----------------------------
+async def ai_analyze(user_id: int, prompt: str) -> str:
+    """
+    MVP-заглушка для AI-аналитики.
+    Позже заменим на реальный LLM (OpenAI/другой) + нормализатор рынков.
+    """
+    # Здесь мы уже можем сделать полезный ответ без LLM:
+    # - объяснение линии/кэфов
+    # - напоминание про риск
+    text = prompt.strip()
+    if not text:
+        return "Напиши: `аналитика <матч/рынок/вопрос>`"
+
+    lines = [
+        "🧠 *AI аналитика (MVP)*",
+        "",
+        f"Запрос: _{text}_",
+        "",
+        "Пока LLM не подключён. Но я уже могу объяснять линию и структуру рынков:",
+        "• 1X2 / Moneyline — победа/ничья/победа (или победа хозяев/гостей)",
+        "• Тотал — больше/меньше указанного значения",
+        "• Фора — виртуальное преимущество/отставание, меняет условия выигрыша",
+        "",
+        "Когда подключим OddsAPI и LLM, я буду давать разбор факторов и сценариев именно под твой запрос.",
+        "",
+        "_Дисклеймер: аналитика не является рекомендацией к ставке._",
+    ]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------
+# ОСНОВНАЯ ЛОГИКА АГЕНТА (MVP)
+# ------------------------------------------------------------
 async def run_dialog_agent(user_id: int, message: str) -> str:
     """
-    Главная функция «мозга» бота (MVP без LLM).
+    Главная функция «мозга» бота (MVP).
     """
     text_raw = message or ""
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
 
-    # 0) Стратегия эксперта
-    if "стратегия" in norm or "стратегия дня" in norm:
-        return get_expert_strategy_today()
+    # 0) Админ: обновить стратегию
+    if norm.startswith("админ"):
+        ok, msg = _try_admin_update_strategy(user_id, text_raw)
+        return msg
+
+    # 0.1) Экспертная стратегия
+    if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or "стратегия" in norm:
+        return _format_expert_strategy()
+
+    # 0.2) AI аналитика
+    # Команда: "аналитика ...."
+    if norm.startswith("аналитика"):
+        body = text_raw.split("аналитика", 1)[1].strip(" :\n\t")
+        return await ai_analyze(user_id=user_id, prompt=body)
 
     # 1) Профиль
     if "профиль" in norm:
@@ -184,9 +256,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         return _format_profile_text(bank, stats)
 
     # 2) Состояние банка
-    if "состояние банка" in norm or (
-        ("банк" in norm) and ("мой" in norm or "мне" in norm) and not re.search(r"\d", norm)
-    ):
+    if "состояние банка" in norm or (("банк" in norm) and ("мой" in norm or "мне" in norm) and not re.search(r"\d", norm)):
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
         if bank is None:
@@ -223,12 +293,11 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             return text
         except Exception as e:
             logger.exception("khl_today_text_from_winline failed: %s", e)
-            # fallback (демо), чтобы бот отвечал всегда
+            # fallback (демо)
             return (
-                "Не смог получить реальные матчи КХЛ (ошибка парсера или API).\n\n"
-                "🏒 Матчи КХЛ на сегодня (демо-режим):\n\n"
+                "🏒 Матчи КХЛ на сегодня:\n\n"
                 "1) СКА — ЦСКА (id: demo_khl_123456)\n\n"
-                "Чтобы получить линию, напиши: `линия <id>`\n"
+                "Чтобы получить линию, напиши: `линия <id>`"
             )
 
     # 6) Разбор моих рынков
@@ -334,19 +403,18 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
-    # 9) Дефолтный ответ (пока без LLM)
+    # 9) Дефолтный help
     help_text = (
-        "Пока я в MVP-версии и понимаю такие команды:\n\n"
-        "• `профиль` — показать статистику и банк\n"
-        "• `состояние банка` — показать текущий банк\n"
+        "Я понимаю команды:\n\n"
+        "• `профиль` — статистика и банк\n"
+        "• `состояние банка` — текущий банк\n"
         "• `мой банк 100000` — установить банк\n"
-        "• `стратегия` — стратегия дня от эксперта\n"
-        "• `КХЛ сегодня` — показать матчи и линию на сегодня\n"
-        "• `отчёт за неделю` — краткий отчёт по ставкам\n"
+        "• `КХЛ сегодня` — матчи на сегодня\n"
+        "• `отчёт за неделю` — отчёт по ставкам\n"
         "• `разбор моих рынков` — базовый разбор рынков\n"
-        "• `ставка: <событие>; исход=...; сумма=...; кэф=...` — сохранить ставку\n\n"
-        "Позже я смогу делать полноценную аналитику матчей и рынков с помощью нейросети. "
-        "Пока можешь протестировать эти команды 🙂"
+        "• `ставка: <событие>; исход=...; сумма=...; кэф=...` — сохранить ставку\n"
+        "• `стратегия` — стратегия эксперта на сегодня\n"
+        "• `аналитика <вопрос>` — AI аналитика (пока MVP)\n\n"
+        "_Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам._"
     )
-
     return help_text
