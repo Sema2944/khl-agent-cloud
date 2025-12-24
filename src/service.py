@@ -1,12 +1,15 @@
 # src/service.py
 from __future__ import annotations
 
+import os
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, Depends
+import httpx
+from fastapi import FastAPI, Depends, Request, Header, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session
+from telegram import Update
 
 from .db import init_db, get_session
 from .bets_db import (
@@ -20,12 +23,17 @@ from .bets_db import (
     get_all_bets,
 )
 
-logger = logging.getLogger(__name__)
+# --- Telegram webhook ---
+from .telegram_bot.app import build_telegram_application
+from telegram.ext import Application
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
 app = FastAPI(title="KHL AI Betting Agent API")
-@app.get("/__health")
-def health():
-    return {"ok": True}
 
 # -----------------------------
 # Healthcheck (Render)
@@ -33,6 +41,11 @@ def health():
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "service": "khl-agent-api"}
+
+
+@app.get("/__health")
+def health():
+    return {"ok": True}
 
 
 @app.get("/favicon.ico")
@@ -45,7 +58,6 @@ def favicon():
 # -----------------------------
 class QueryRequest(BaseModel):
     user_id: int
-    # поддержим И message, И query (чтобы бот мог слать как угодно)
     message: Optional[str] = None
     query: Optional[str] = None
 
@@ -74,12 +86,77 @@ class BetSettle(BaseModel):
 
 
 # -----------------------------
+# Telegram webhook state
+# -----------------------------
+TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+TELEGRAM_WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+
+telegram_app: Application | None = None
+
+
+# -----------------------------
 # Startup
 # -----------------------------
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
+    """
+    • инициализация БД
+    • запуск Telegram Application
+    • регистрация webhook
+    """
+    global telegram_app
+
     init_db()
-    logger.info("FastAPI сервис запущен.")
+    logger.info("DB initialized")
+
+    # --- Telegram ---
+    telegram_app = build_telegram_application()
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    public_base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+
+    if not token or not public_base:
+        logger.warning("Telegram webhook NOT set (missing token or PUBLIC_BASE_URL)")
+        return
+
+    webhook_url = f"{public_base}{TELEGRAM_WEBHOOK_PATH}"
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        payload = {"url": webhook_url}
+        if TELEGRAM_WEBHOOK_SECRET:
+            payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+
+        r = await client.post(
+            f"https://api.telegram.org/bot{token}/setWebhook",
+            json=payload,
+        )
+        r.raise_for_status()
+
+    logger.info("Telegram webhook registered: %s", webhook_url)
+
+
+# -----------------------------
+# Telegram webhook endpoint
+# -----------------------------
+@app.post(TELEGRAM_WEBHOOK_PATH)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    if telegram_app is None:
+        raise HTTPException(status_code=503, detail="Telegram app not ready")
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        if x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    payload = await request.json()
+    update = Update.de_json(payload, telegram_app.bot)
+
+    await telegram_app.process_update(update)
+    return {"ok": True}
 
 
 # -----------------------------
@@ -159,7 +236,6 @@ def api_user_stats(
     session: Session = Depends(get_session),
 ):
     s = get_user_stats(session, user_id)
-    # dataclass -> dict
     return {
         "total_bets": s.total_bets,
         "settled_bets": s.settled_bets,
