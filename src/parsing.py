@@ -1,7 +1,8 @@
 # src/parsing.py
-from .llm_client import analyze_with_llm, render_analysis_text
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy  # ✅ модель только тут, не дублируем
-from .llm_client import analyze_with_llm, render_analysis_text  # ✅ LLM-адаптер
+from .llm_client import analyze_with_llm_cached, render_analysis_text  # ✅ LLM + cache
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +32,20 @@ EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY
 # Важно: "на сегодня" считаем по МСК
 MSK = ZoneInfo("Europe/Moscow")
 
-# ✅ Пункт 3: Промт аналитика ставок LLM (можно менять без деплоя)
+# ✅ Промт LLM (можно менять без деплоя через ENV)
 LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
-        "Ты профессиональный спортивный аналитик.\n"
-        "Дай осторожный разбор рынка: факторы, сценарии, риски.\n"
-        "НЕ давай прямых призывов ставить. Нужна аналитика, а не совет.\n"
-        "Пиши коротко, структурно."
+        "Ты дружелюбный, структурированный и безопасный спортивный аналитик.\n"
+        "Твоя задача — объяснять коэффициенты и логику линии, помогать новичкам понимать рынок ставок.\n"
+        "Ты не предсказываешь исход, а анализируешь, что заложено в коэффициентах.\n"
+        "Правила:\n"
+        "- никаких гарантий выигрыша;\n"
+        "- без '100%', 'железно', 'проход', 'all-in';\n"
+        "- никаких сумм ставок;\n"
+        "- не дави на пользователя;\n"
+        "- опирайся на линию, историю ставок пользователя и его банк (если есть).\n"
+        "Пиши коротко и структурировано."
     )
 
 # -----------------------------
@@ -203,7 +210,6 @@ def _format_expert_strategy_for_today() -> str:
             text = row.text
             date_label = row.date.isoformat()
 
-    # fallback на ENV, если в БД пусто
     if not text and EXPERT_STRATEGY_TEXT:
         text = EXPERT_STRATEGY_TEXT
         date_label = EXPERT_STRATEGY_DATE or date_label
@@ -361,54 +367,73 @@ def _format_market(match_id: str, market_key: str) -> str:
     return "\n".join(lines)
 
 
-def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
+def _line_hash_for_cache(match_id: str, market_key: str) -> str:
+    """
+    Кэш должен зависеть от линии (коэфов). Когда линия поменяется — хэш поменяется — кэш обновится.
+    """
+    market = DEMO_MARKETS.get(market_key) or {}
+    data = market.get("data") or {}
+    raw = json.dumps({"match_id": match_id, "market_key": market_key, "data": data}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _build_llm_domain_prompt(user_id: int, match_id: str, market_key: str) -> str:
     m = _find_match(match_id)
     market = DEMO_MARKETS.get(market_key)
     if not m or not market:
         return ""
 
     data = market["data"]
-    pretty = [LLM_PROMPT_PREFIX, "", f"Матч: {m['title']} ({m['league']})", f"match_id: {match_id}", f"Рынок: {market['label']} ({market_key})", ""]
-    # кратко добавим численные данные рынка
+
+    # user context (bank + basic stats)
+    bank_txt = "не задан"
+    stats_txt = "нет данных"
+    with db_session() as session:
+        bank = bets_db.get_user_bank(session, user_id)
+        stats = bets_db.get_user_stats(session, user_id)
+    if bank is not None:
+        bank_txt = f"{bank:,.0f}".replace(",", " ")
+    if stats is not None:
+        stats_txt = f"bets={stats.total_bets}, winrate={stats.winrate:.1f}%, roi={stats.roi:.1f}%"
+
+    lines: list[str] = []
+    lines.append(LLM_PROMPT_PREFIX)
+    lines.append("")
+    lines.append(f"Матч: {m['title']} ({m['league']})")
+    lines.append(f"match_id: {match_id}")
+    lines.append(f"Рынок: {market['label']} ({market_key})")
+    lines.append(f"Пользователь: bank={bank_txt}, stats={stats_txt}")
+    lines.append("")
+
+    # numeric line
     if data.get("type") == "moneyline":
-        pretty.append(f"Линия: home={data['home']}, draw={data['draw']}, away={data['away']}")
+        lines.append(f"Линия: home={data.get('home')}, draw={data.get('draw')}, away={data.get('away')}")
     elif data.get("type") == "total":
-        pretty.append(f"Линия: total={data['value']}, over={data['over']}, under={data['under']}")
+        lines.append(f"Линия: total={data.get('value')}, over={data.get('over')}, under={data.get('under')}")
     elif data.get("type") == "handicap":
-        pretty.append(f"Линия: team={data['team']}, handicap={data['value']}, odds={data['odds']}")
-    pretty.append("")
-    pretty.append("Нужно: 3–5 тезисов, 2–4 риска, 2–4 пункта чек-листа.")
-    return "\n".join(pretty)
+        lines.append(f"Линия: team={data.get('team')}, handicap={data.get('value')}, odds={data.get('odds')}")
+    else:
+        lines.append(f"Линия: {json.dumps(data, ensure_ascii=False)}")
+
+    lines.append("")
+    lines.append("Нужно: 3–5 тезисов, 2–4 риска, 2–4 пункта чек-листа.")
+    return "\n".join(lines)
 
 
-async def ai_analyze(
-    *,
-    user_id: int,
-    match_id: str,
-    market_key: str,
-    line_context: str = "",
-) -> str:
+async def ai_analyze(user_id: int, match_id: str, market_key: str) -> str:
     """
-    AI аналитика через LLM с жёстким SLA и fallback.
-    Возвращает готовый текст для Telegram.
+    AI аналитика через LLM с жёстким SLA, ретраями и fallback.
+    + кэш (экономия и ускорение).
     """
+    domain_prompt = _build_llm_domain_prompt(user_id, match_id, market_key)
+    if not domain_prompt:
+        return "Матч/рынок не найден (MVP демо)."
 
-    # Короткий domain-подсказ для LLM
-    domain_prompt = f"""
-Матч: {match_id}
-Рынок: {market_key}
+    line_hash = _line_hash_for_cache(match_id, market_key)
+    cache_key = f"v1:{match_id}:{market_key}:{line_hash}"
 
-Контекст линии:
-{line_context or "Нет дополнительных данных по линии."}
+    analysis, meta = await analyze_with_llm_cached(domain_prompt, cache_key=cache_key)
 
-Задача:
-Объясни, что заложено в коэффициентах и логике линии.
-Без прогнозов исхода и без советов по суммам ставок.
-"""
-
-    analysis, meta = await analyze_with_llm(domain_prompt)
-
-    # логируем мету (очень полезно для продакшена)
     logger.info(
         "LLM meta: %s",
         {
@@ -417,15 +442,15 @@ async def ai_analyze(
             "elapsed_ms": meta.get("elapsed_ms"),
             "used_fallback": meta.get("used_fallback"),
             "last_error": meta.get("last_error"),
+            "cache_hit": meta.get("cache_hit"),
+            "cache_key": meta.get("cache_key"),
         },
     )
 
-    # превращаем JSON → красивый Telegram-текст
     return render_analysis_text(analysis)
 
 
 def expert_opinion_for_market(match_id: str, market_key: str) -> str:
-    # MVP: экспертная стратегия пока общая на день, без привязки к конкретному матчу/рынку
     base = _format_expert_strategy_for_today()
     return base + "\n\n" + "_Примечание: в MVP мнение эксперта публикуется как общая стратегия дня._"
 
@@ -483,7 +508,8 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         body = text_raw.split("аналитика", 1)[1].strip()
         parts = body.split()
         if len(parts) >= 2:
-            return await ai_analyze(parts[0], parts[1])
+            match_id, market_key = parts[0], parts[1]
+            return await ai_analyze(user_id=user_id, match_id=match_id, market_key=market_key)
         return (
             "Напиши:\n"
             "• `аналитика <match_id> <market_key>`\n"
