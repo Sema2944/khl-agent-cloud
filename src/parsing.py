@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy  # ✅ модель только тут, не дублируем
-from .llm_client import analyze_with_llm_cached, render_analysis_text  # ✅ Redis/In-mem cache wrapper
+from .llm_client import analyze_with_llm_cached, render_analysis_text  # ✅ cache wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY
 # Важно: "на сегодня" считаем по МСК
 MSK = ZoneInfo("Europe/Moscow")
 
-# ✅ Пункт 3: Промт аналитика ставок LLM (можно менять без деплоя)
+# ✅ Промт аналитика ставок LLM (можно менять без деплоя)
 LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
@@ -364,8 +364,7 @@ def _format_market(match_id: str, market_key: str) -> str:
 
 def _line_hash_for_cache(match_id: str, market_key: str) -> str:
     """
-    ✅ ВАЖНО: line_hash должен меняться, когда меняются цифры линии.
-    Тогда кэш автоматически «протухает» при обновлении линии.
+    ✅ line_hash меняется, когда меняются цифры линии.
     """
     m = _find_match(match_id) or {}
     market = DEMO_MARKETS.get(market_key) or {}
@@ -377,14 +376,11 @@ def _line_hash_for_cache(match_id: str, market_key: str) -> str:
         "league": m.get("league", ""),
         "line": market.get("data", {}),
     }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
-    """
-    Формируем короткий domain prompt, опираясь на линию.
-    """
     m = _find_match(match_id)
     market = DEMO_MARKETS.get(market_key)
     if not m or not market:
@@ -399,7 +395,6 @@ def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
     lines.append(f"Рынок: {market['label']} ({market_key})")
     lines.append("")
 
-    # кратко добавим численные данные рынка
     if data.get("type") == "moneyline":
         lines.append(f"Линия 1X2: home={data['home']}, draw={data['draw']}, away={data['away']}")
     elif data.get("type") == "total":
@@ -412,17 +407,13 @@ def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
     return "\n".join(lines)
 
 
-async def ai_analyze(
-    *,
-    user_id: int,
-    match_id: str,
-    market_key: str,
-) -> str:
+async def ai_analyze(*, user_id: int, match_id: str, market_key: str) -> str:
     """
-    ✅ AI аналитика через LLM + Redis/In-memory кэш.
-    - Сначала пробуем кэш по (prompt_hash + line_hash)
-    - Если кэша нет — вызываем LLM с SLA и fallback внутри llm_client
+    ✅ AI аналитика через LLM + In-memory cache (через analyze_with_llm_cached).
+    cache_key = v1:<match_id>:<market_key>:<line_hash>
     """
+    _ = user_id  # пока не используем, но оставляем сигнатуру
+
     m = _find_match(match_id)
     market_key = (market_key or "").strip().lower()
     market = DEMO_MARKETS.get(market_key)
@@ -437,8 +428,9 @@ async def ai_analyze(
         return "Не удалось собрать контекст для аналитики."
 
     line_hash = _line_hash_for_cache(match_id, market_key)
+    cache_key = f"v1:{match_id}:{market_key}:{line_hash}"
 
-    analysis, meta = await analyze_with_llm_cached(domain_prompt, line_hash=line_hash)
+    analysis, meta = await analyze_with_llm_cached(domain_prompt, cache_key=cache_key)
 
     logger.info(
         "LLM meta: %s",
@@ -448,9 +440,7 @@ async def ai_analyze(
             "elapsed_ms": meta.get("elapsed_ms"),
             "used_fallback": meta.get("used_fallback"),
             "last_error": meta.get("last_error"),
-            "cache_hit": meta.get("cache_hit"),
-            "cache_source": meta.get("cache_source"),
-            "cache_key": meta.get("cache_key"),
+            "cache": meta.get("cache"),  # "hit" / "miss"
         },
     )
 
