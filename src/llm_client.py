@@ -444,3 +444,57 @@ async def analyze_with_llm_cached(
         _LLM_CACHE[cache_key] = (time.monotonic() + ttl, analysis_dict, meta2)
 
     return a, meta2
+# --- add near other imports at top of src/llm_client.py ---
+import hashlib
+from .llm_cache import cache_get, cache_set, make_cache_key
+
+async def analyze_with_llm_cached(domain_prompt: str, *, line_hash: str) -> Tuple[LLMAnalysis, dict]:
+    """
+    Redis-backed cache wrapper around analyze_with_llm().
+    Ключ = hash(prompt) + line_hash (чтобы при изменении линии кэш сбрасывался).
+
+    meta дополнительно содержит:
+      cache_hit: bool
+      cache_source: redis|memory|none
+      cache_key: str (укороченно)
+    """
+    start = time.monotonic()
+
+    prompt_hash = hashlib.sha256(domain_prompt.encode("utf-8")).hexdigest()[:24]
+    key = make_cache_key(prompt_hash=prompt_hash, line_hash=line_hash)
+
+    # 1) Try cache first (fast, short timeout)
+    got = await cache_get(key)
+    if got.hit and got.value:
+        ok, analysis, msg = validate_analysis_json(got.value)
+        if ok and analysis is not None:
+            meta = {
+                "provider": "cache",
+                "attempts": 0,
+                "elapsed_ms": int((time.monotonic() - start) * 1000),
+                "used_fallback": False,
+                "last_error": None,
+                "cache_hit": True,
+                "cache_source": got.source,
+                "cache_key": f"{prompt_hash}:{line_hash[:12]}",
+            }
+            return analysis, meta
+
+    # 2) Compute via LLM (with SLA + retries + fallback inside analyze_with_llm)
+    analysis, meta = await analyze_with_llm(domain_prompt)
+
+    # 3) Save only valid JSON (schema-stable) into cache
+    try:
+        await cache_set(key, analysis.to_dict())
+    except Exception:
+        pass
+
+    meta = dict(meta)
+    meta.update(
+        {
+            "cache_hit": False,
+            "cache_source": got.source,
+            "cache_key": f"{prompt_hash}:{line_hash[:12]}",
+        }
+    )
+    return analysis, meta
