@@ -14,44 +14,30 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# CONFIG (requirements from TЗ)
-# - total budget <= 3s
-# - retries + jitter
-# - strict JSON validation
-# - graceful fallback
-# ============================================================
-
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()  # openai | dummy
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-# hard budget ≤ 3 seconds
 LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "3.0").strip())
-# per-attempt timeout (keep a little room for retries)
 LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "1.2").strip())
-LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "1").strip())  # 1 retry => 2 attempts total
+LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "1").strip())
 
-# Optional: improve determinism
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
 
+# Cache (in-memory) — потом заменим на Redis
+LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())  # 15 минут
+_CACHE: Dict[str, Tuple[float, "LLMAnalysis", dict]] = {}
+_CACHE_LOCK = asyncio.Lock()
 
-# ============================================================
-# OUTPUT SCHEMA (minimal, stable)
-# ============================================================
 
 @dataclass
 class LLMAnalysis:
-    """
-    Strict validated output.
-    Keep this schema stable: you can store it, show it in UI, etc.
-    """
-    verdict: str                    # "lean_yes" | "lean_no" | "unclear"
-    confidence: float               # 0..1
-    reasoning_bullets: list[str]    # <= 5 bullets
-    risks: list[str]                # <= 5 bullets
-    checklist: list[str]            # <= 5 bullets
+    verdict: str                 # "lean_yes" | "lean_no" | "unclear"
+    confidence: float            # 0..1
+    reasoning_bullets: list[str] # <=5
+    risks: list[str]             # <=5
+    checklist: list[str]         # <=5
 
     def to_dict(self) -> dict:
         return {
@@ -63,10 +49,6 @@ class LLMAnalysis:
         }
 
 
-# ============================================================
-# VALIDATION
-# ============================================================
-
 _ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
 
 
@@ -75,18 +57,13 @@ def _clamp01(x: Any) -> float:
         v = float(x)
     except Exception:
         return 0.0
-    if v < 0:
-        return 0.0
-    if v > 1:
-        return 1.0
-    return v
+    return 0.0 if v < 0 else 1.0 if v > 1 else v
 
 
 def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
     if v is None:
         return []
     if isinstance(v, str):
-        # if model returns one string - split to lines
         parts = [p.strip("•- \t") for p in v.splitlines() if p.strip()]
         return parts[:max_len]
     if isinstance(v, list):
@@ -94,16 +71,14 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
         for item in v:
             if item is None:
                 continue
-            out.append(str(item).strip())
-        out = [x for x in out if x]
+            s = str(item).strip()
+            if s:
+                out.append(s)
         return out[:max_len]
     return []
 
 
 def validate_analysis_json(obj: Any) -> Tuple[bool, Optional[LLMAnalysis], str]:
-    """
-    Strict validation with helpful error text.
-    """
     if not isinstance(obj, dict):
         return False, None, "root is not an object"
 
@@ -112,62 +87,43 @@ def validate_analysis_json(obj: Any) -> Tuple[bool, Optional[LLMAnalysis], str]:
         return False, None, f"bad verdict: {verdict!r}"
 
     confidence = _clamp01(obj.get("confidence", 0.0))
-
     reasoning = _as_str_list(obj.get("reasoning_bullets"), max_len=5)
     risks = _as_str_list(obj.get("risks"), max_len=5)
     checklist = _as_str_list(obj.get("checklist"), max_len=5)
 
-    # Ensure at least 1 reasoning bullet
     if not reasoning:
         return False, None, "reasoning_bullets is empty"
 
-    analysis = LLMAnalysis(
+    return True, LLMAnalysis(
         verdict=verdict,
         confidence=confidence,
         reasoning_bullets=reasoning,
         risks=risks,
         checklist=checklist,
-    )
-    return True, analysis, "ok"
+    ), "ok"
 
 
-# ============================================================
-# FALLBACK
-# ============================================================
-
-def fallback_analysis(user_prompt: str) -> LLMAnalysis:
-    """
-    Cheap, deterministic fallback that still returns valid schema.
-    """
-    base_reason = [
-        "LLM недоступен/не успел за SLA — даю безопасный базовый разбор.",
-        "Сверь коэффициенты и движение линии (если есть), избегай решений «на эмоциях».",
-        "Соблюдай банк-менеджмент: фиксированный % на ставку, без догонов.",
-    ]
-    risks = [
-        "Недостаток входных данных (составы/травмы/мотивация/форма).",
-        "Случайность и дисперсия в спорте.",
-    ]
-    checklist = [
-        "Проверь составы/вратарей/ключевых игроков",
-        "Проверь календарь (b2b, перелёты)",
-        "Сравни линию у 2–3 источников (позже подключим)",
-        "Определи max stake по банк-менеджменту",
-    ]
+def fallback_analysis(_: str) -> LLMAnalysis:
     return LLMAnalysis(
         verdict="unclear",
         confidence=0.35,
-        reasoning_bullets=base_reason[:5],
-        risks=risks[:5],
-        checklist=checklist[:5],
+        reasoning_bullets=[
+            "LLM недоступен/не успел за SLA — даю безопасный базовый разбор.",
+            "Сверь коэффициенты и движение линии (если есть), избегай решений «на эмоциях».",
+            "Соблюдай банк-менеджмент: фиксированный % на ставку, без догонов.",
+        ],
+        risks=[
+            "Недостаток входных данных (составы/травмы/мотивация/форма).",
+            "Случайность и дисперсия в спорте.",
+        ],
+        checklist=[
+            "Проверь составы/вратарей/ключевых игроков",
+            "Проверь календарь (b2b, перелёты)",
+            "Сравни линию у 2–3 источников (позже подключим)",
+            "Определи max stake по банк-менеджменту",
+        ],
     )
 
-
-# ============================================================
-# OPENAI CLIENT (minimal, production-ish)
-# Uses Chat Completions for compatibility.
-# Ensures JSON-only output by instruction + parsing.
-# ============================================================
 
 _SYSTEM_PROMPT = """Ты спортивный аналитик.
 Отвечай СТРОГО валидным JSON без markdown и без комментариев.
@@ -182,8 +138,8 @@ _SYSTEM_PROMPT = """Ты спортивный аналитик.
 Никаких других ключей. Никакого текста вне JSON.
 """
 
+
 def _make_user_prompt(domain_prompt: str) -> str:
-    # Keep concise (speed). Your agent can provide richer context later.
     return (
         "Задача: дай осторожный аналитический разбор, без прямых призывов ставить.\n"
         f"Вход:\n{domain_prompt.strip()}\n"
@@ -194,11 +150,7 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float) -> Dict[str, A
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
@@ -206,7 +158,6 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float) -> Dict[str, A
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        # keep it small for latency
         "max_tokens": 350,
     }
 
@@ -215,76 +166,45 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float) -> Dict[str, A
         r.raise_for_status()
         data = r.json()
 
-    # Extract content
-    content = (
-        data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    # Parse JSON strictly
     try:
         obj = json.loads(content)
-    except json.JSONDecodeError as e:
-        # Try to recover: sometimes model wraps with whitespace or stray text.
-        # We'll attempt to extract first {...} block.
+    except json.JSONDecodeError:
         s = content.strip()
         start = s.find("{")
         end = s.rfind("}")
         if start >= 0 and end > start:
-            obj = json.loads(s[start : end + 1])
+            obj = json.loads(s[start:end + 1])
         else:
-            raise ValueError(f"invalid JSON from model: {e}") from e
+            raise ValueError("invalid JSON from model")
 
     if not isinstance(obj, dict):
         raise ValueError("model JSON root is not an object")
-
     return obj
 
 
-# ============================================================
-# RETRY / TIME BUDGET WRAPPER
-# ============================================================
-
 def _sleep_jitter(base: float) -> float:
-    # small jitter to avoid thundering herd
     return base + random.random() * 0.12
 
 
 async def analyze_with_llm(domain_prompt: str) -> Tuple[LLMAnalysis, dict]:
-    """
-    Main entrypoint.
-
-    Returns:
-      (analysis, meta)
-    Where meta includes:
-      provider, attempts, elapsed_ms, used_fallback, last_error
-    """
     start = time.monotonic()
     attempts = 0
     last_error: Optional[str] = None
 
-    # quick exit if provider disabled
     if LLM_PROVIDER == "dummy":
-        analysis = fallback_analysis(domain_prompt)
-        return analysis, {
-            "provider": "dummy",
-            "attempts": 0,
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "used_fallback": True,
-            "last_error": "LLM_PROVIDER=dummy",
-        }
+        a = fallback_analysis(domain_prompt)
+        return a, {"provider": "dummy", "attempts": 0, "elapsed_ms": int((time.monotonic() - start) * 1000),
+                   "used_fallback": True, "last_error": "LLM_PROVIDER=dummy"}
 
-    # total budget guard
     deadline = start + max(0.1, LLM_TOTAL_TIMEOUT_S)
 
     for retry_idx in range(LLM_MAX_RETRIES + 1):
         attempts += 1
-
-        now = time.monotonic()
-        remaining = deadline - now
+        remaining = deadline - time.monotonic()
         if remaining <= 0.05:
             last_error = "deadline_exceeded"
             break
@@ -297,204 +217,86 @@ async def analyze_with_llm(domain_prompt: str) -> Tuple[LLMAnalysis, dict]:
             if not ok or analysis is None:
                 raise ValueError(f"schema validation failed: {msg}")
 
-            return analysis, {
-                "provider": "openai",
-                "attempts": attempts,
-                "elapsed_ms": int((time.monotonic() - start) * 1000),
-                "used_fallback": False,
-                "last_error": None,
-            }
+            return analysis, {"provider": "openai", "attempts": attempts,
+                              "elapsed_ms": int((time.monotonic() - start) * 1000),
+                              "used_fallback": False, "last_error": None}
 
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_error = f"network_timeout: {type(e).__name__}"
         except httpx.HTTPStatusError as e:
-            # 429 / 5xx => retry, 4xx other => usually no
             code = e.response.status_code
             last_error = f"http_{code}"
             if code not in (408, 409, 425, 429, 500, 502, 503, 504):
                 break
         except (ValueError, RuntimeError) as e:
             last_error = f"{type(e).__name__}: {e}"
-            # for JSON/schema errors - one retry can help, but don't loop too long
         except Exception as e:
             last_error = f"unexpected: {type(e).__name__}: {e}"
 
-        # Retry if we still have time and retries
         if retry_idx < LLM_MAX_RETRIES:
-            # short jitter sleep, but don't exceed deadline
             sleep_s = _sleep_jitter(0.15)
             if time.monotonic() + sleep_s < deadline:
                 await asyncio.sleep(sleep_s)
 
-    # Fallback
-    analysis = fallback_analysis(domain_prompt)
-    return analysis, {
-        "provider": "openai",
-        "attempts": attempts,
-        "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "used_fallback": True,
-        "last_error": last_error,
-    }
-
-
-# ============================================================
-# Formatting helper (optional)
-# ============================================================
-
-def render_analysis_text(a: LLMAnalysis) -> str:
-    """
-    Convert validated JSON output to Telegram-friendly text.
-    """
-    verdict_map = {
-        "lean_yes": "🟢 Скорее ДА",
-        "lean_no": "🔴 Скорее НЕТ",
-        "unclear": "⚪️ Неясно",
-    }
-    lines: list[str] = []
-    lines.append("🧠 *AI разбор (LLM)*")
-    lines.append(f"Вердикт: *{verdict_map.get(a.verdict, a.verdict)}*")
-    lines.append(f"Уверенность: *{int(a.confidence * 100)}%*")
-    lines.append("")
-
-    lines.append("*Ключевые мысли:*")
-    for b in a.reasoning_bullets[:5]:
-        lines.append(f"• {b}")
-
-    if a.risks:
-        lines.append("")
-        lines.append("*Риски:*")
-        for r in a.risks[:5]:
-            lines.append(f"• {r}")
-
-    if a.checklist:
-        lines.append("")
-        lines.append("*Чек-лист перед решением:*")
-        for c in a.checklist[:5]:
-            lines.append(f"• {c}")
-
-    lines.append("")
-    lines.append("_Дисклеймер: это аналитика, не рекомендация к ставкам._")
-    return "\n".join(lines)
-# ============================================================
-# LLM CACHE (in-memory TTL) — MVP
-# ============================================================
-
-LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "600").strip())  # 10 min default
-LLM_CACHE_MAX_ITEMS = int((os.getenv("LLM_CACHE_MAX_ITEMS") or "500").strip())
-
-# key -> (expires_at_monotonic, analysis_dict, meta_dict)
-_LLM_CACHE: dict[str, tuple[float, dict, dict]] = {}
-_LLM_CACHE_LOCK = asyncio.Lock()
-
-
-def _cache_cleanup(now: float) -> None:
-    # remove expired
-    dead = [k for k, (exp, _, __) in _LLM_CACHE.items() if exp <= now]
-    for k in dead:
-        _LLM_CACHE.pop(k, None)
-
-    # crude size cap: drop oldest-ish (not perfect, but ok for MVP)
-    if len(_LLM_CACHE) > LLM_CACHE_MAX_ITEMS:
-        # sort by expiry (soonest first) and drop extras
-        items = sorted(_LLM_CACHE.items(), key=lambda kv: kv[1][0])
-        for k, _ in items[: max(0, len(_LLM_CACHE) - LLM_CACHE_MAX_ITEMS)]:
-            _LLM_CACHE.pop(k, None)
+    a = fallback_analysis(domain_prompt)
+    return a, {"provider": "openai", "attempts": attempts,
+               "elapsed_ms": int((time.monotonic() - start) * 1000),
+               "used_fallback": True, "last_error": last_error}
 
 
 async def analyze_with_llm_cached(
     domain_prompt: str,
+    *,
     cache_key: str,
-    ttl_s: int | None = None,
-) -> tuple[LLMAnalysis, dict]:
+    ttl_s: int = LLM_CACHE_TTL_S,
+) -> Tuple[LLMAnalysis, dict]:
     """
-    Cached wrapper around analyze_with_llm().
-
-    cache_key must be stable for (match_id, market_key, line_hash).
+    Cached wrapper. cache_key обязателен.
+    Хранит (analysis, meta) в памяти процесса.
     """
-    ttl = int(ttl_s or LLM_CACHE_TTL_S)
-    now = time.monotonic()
+    now = time.time()
 
-    async with _LLM_CACHE_LOCK:
-        _cache_cleanup(now)
-        hit = _LLM_CACHE.get(cache_key)
+    async with _CACHE_LOCK:
+        hit = _CACHE.get(cache_key)
         if hit:
-            exp, analysis_dict, meta = hit
-            if exp > now:
-                a_ok, a, _ = validate_analysis_json(analysis_dict)
-                if a_ok and a:
-                    meta2 = dict(meta)
-                    meta2.update({"cache_hit": True, "cache_key": cache_key})
-                    return a, meta2
+            exp_ts, analysis, meta = hit
+            if exp_ts > now:
+                meta2 = dict(meta)
+                meta2["cache"] = "hit"
+                return analysis, meta2
             else:
-                _LLM_CACHE.pop(cache_key, None)
+                _CACHE.pop(cache_key, None)
 
-    # miss -> call LLM
-    a, meta = await analyze_with_llm(domain_prompt)
-    meta2 = dict(meta)
-    meta2.update({"cache_hit": False, "cache_key": cache_key})
-
-    # store only if got non-empty result (even fallback ok — чтобы не долбить LLM)
-    try:
-        analysis_dict = a.to_dict()
-    except Exception:
-        analysis_dict = {"verdict": "unclear", "confidence": 0.0, "reasoning_bullets": ["bad analysis"], "risks": [], "checklist": []}
-
-    async with _LLM_CACHE_LOCK:
-        _cache_cleanup(time.monotonic())
-        _LLM_CACHE[cache_key] = (time.monotonic() + ttl, analysis_dict, meta2)
-
-    return a, meta2
-# --- add near other imports at top of src/llm_client.py ---
-import hashlib
-from .llm_cache import cache_get, cache_set, make_cache_key
-
-async def analyze_with_llm_cached(domain_prompt: str, *, line_hash: str) -> Tuple[LLMAnalysis, dict]:
-    """
-    Redis-backed cache wrapper around analyze_with_llm().
-    Ключ = hash(prompt) + line_hash (чтобы при изменении линии кэш сбрасывался).
-
-    meta дополнительно содержит:
-      cache_hit: bool
-      cache_source: redis|memory|none
-      cache_key: str (укороченно)
-    """
-    start = time.monotonic()
-
-    prompt_hash = hashlib.sha256(domain_prompt.encode("utf-8")).hexdigest()[:24]
-    key = make_cache_key(prompt_hash=prompt_hash, line_hash=line_hash)
-
-    # 1) Try cache first (fast, short timeout)
-    got = await cache_get(key)
-    if got.hit and got.value:
-        ok, analysis, msg = validate_analysis_json(got.value)
-        if ok and analysis is not None:
-            meta = {
-                "provider": "cache",
-                "attempts": 0,
-                "elapsed_ms": int((time.monotonic() - start) * 1000),
-                "used_fallback": False,
-                "last_error": None,
-                "cache_hit": True,
-                "cache_source": got.source,
-                "cache_key": f"{prompt_hash}:{line_hash[:12]}",
-            }
-            return analysis, meta
-
-    # 2) Compute via LLM (with SLA + retries + fallback inside analyze_with_llm)
     analysis, meta = await analyze_with_llm(domain_prompt)
+    meta2 = dict(meta)
+    meta2["cache"] = "miss"
 
-    # 3) Save only valid JSON (schema-stable) into cache
-    try:
-        await cache_set(key, analysis.to_dict())
-    except Exception:
-        pass
+    async with _CACHE_LOCK:
+        _CACHE[cache_key] = (now + ttl_s, analysis, meta2)
 
-    meta = dict(meta)
-    meta.update(
-        {
-            "cache_hit": False,
-            "cache_source": got.source,
-            "cache_key": f"{prompt_hash}:{line_hash[:12]}",
-        }
-    )
-    return analysis, meta
+    return analysis, meta2
+
+
+def render_analysis_text(a: LLMAnalysis) -> str:
+    verdict_map = {"lean_yes": "🟢 Скорее ДА", "lean_no": "🔴 Скорее НЕТ", "unclear": "⚪️ Неясно"}
+    lines: list[str] = []
+    lines.append("🧠 AI разбор (LLM)")  # <- убрал Markdown, чтобы Telegram не падал
+    lines.append(f"Вердикт: {verdict_map.get(a.verdict, a.verdict)}")
+    lines.append(f"Уверенность: {int(a.confidence * 100)}%")
+    lines.append("")
+    lines.append("Ключевые мысли:")
+    for b in a.reasoning_bullets[:5]:
+        lines.append(f"• {b}")
+    if a.risks:
+        lines.append("")
+        lines.append("Риски:")
+        for r in a.risks[:5]:
+            lines.append(f"• {r}")
+    if a.checklist:
+        lines.append("")
+        lines.append("Чек-лист перед решением:")
+        for c in a.checklist[:5]:
+            lines.append(f"• {c}")
+    lines.append("")
+    lines.append("Дисклеймер: это аналитика, не рекомендация к ставкам.")
+    return "\n".join(lines)
