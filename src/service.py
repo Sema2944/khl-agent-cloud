@@ -81,17 +81,11 @@ class BetSettle(BaseModel):
 @app.on_event("startup")
 async def on_startup():
     init_db()
-    logger.info("FastAPI сервис запущен.")
 
-    # Поднимаем Telegram webhook app + роут /telegram/webhook
-    try:
-        from .telegram_bot.app import mount as mount_telegram, build_telegram_application
+    from .telegram_bot.app import mount
+    mount(app)
 
-        mount_telegram(app)
-        await build_telegram_application()
-        logger.info("Telegram webhook mounted on /telegram/webhook")
-    except Exception as e:
-        logger.exception("Failed to init telegram webhook: %s", e)
+    logger.info("FastAPI сервис запущен + Telegram webhook подключён.")
 
 
 # -----------------------------
