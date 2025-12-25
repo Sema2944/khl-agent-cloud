@@ -1,4 +1,5 @@
 # src/parsing.py
+from .llm_client import analyze_with_llm, render_analysis_text
 from __future__ import annotations
 
 import logging
