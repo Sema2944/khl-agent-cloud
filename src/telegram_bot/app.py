@@ -1,26 +1,25 @@
 # src/telegram_bot/app.py
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
-from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-import httpx
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
     filters,
 )
 
@@ -30,23 +29,30 @@ logger = logging.getLogger(__name__)
 # ENV
 # -----------------------------
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")  # e.g. https://khl-agent-api-9dw6.onrender.com
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
 WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()  # optional
-API_BASE = (os.getenv("API_BASE") or "").strip().rstrip("/")  # backend base (can be same service)
-BACKEND_TIMEOUT = float((os.getenv("BACKEND_TIMEOUT") or "8").strip())
+# Если хочешь отдельный base path для кнопок/меню — пока не надо.
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-# Если API_BASE не задан — будем пытаться использовать этот же сервис (PUBLIC_URL)
-if not API_BASE and PUBLIC_URL:
-    API_BASE = PUBLIC_URL
+# -----------------------------
+# Главное меню (минимально)
+# -----------------------------
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["🏟 Матчи сегодня"],
+        ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
 
 # -----------------------------
-# UI / DATA (demo)
+# Inline клавиатуры (FSM через callback_data)
 # -----------------------------
-SPORTS: list[tuple[str, str]] = [
+SPORTS = [
     ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
     ("basketball", "🏀 Баскетбол"),
@@ -54,70 +60,41 @@ SPORTS: list[tuple[str, str]] = [
     ("esports", "🎮 Киберспорт"),
 ]
 
-MARKETS: list[tuple[str, str]] = [
-    ("moneyline", "🏁 1X2 / Moneyline"),
-    ("total", "📊 Total"),
-    ("handicap", "📐 Handicap"),
+MARKETS = [
+    ("moneyline", "1X2 / Moneyline"),
+    ("total", "Тотал"),
+    ("handicap", "Фора"),
 ]
 
 
-# -----------------------------
-# HTTP helper
-# -----------------------------
-async def _safe_request(method: str, url: str, **kwargs) -> Dict[str, Any]:
-    timeout = kwargs.pop("timeout", BACKEND_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.request(method, url, **kwargs)
-        r.raise_for_status()
-        return r.json()
-
-
-async def call_agent(user_id: int, message: str) -> str:
-    if not API_BASE:
-        return "Backend не настроен (API_BASE/PUBLIC_URL пуст)."
-    payload = {"user_id": user_id, "message": message}
-    data = await _safe_request("POST", f"{API_BASE}/agent/query", json=payload, timeout=BACKEND_TIMEOUT)
-    return str(data.get("reply") or "Пустой ответ от сервера 😕")
-
-
-# -----------------------------
-# Keyboards
-# -----------------------------
 def kb_sports() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(title, callback_data=f"SPORT:{key}")] for key, title in SPORTS]
+    rows: list[list[InlineKeyboardButton]] = []
+    buf: list[InlineKeyboardButton] = []
+    for key, label in SPORTS:
+        buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
     return InlineKeyboardMarkup(rows)
 
 
-def kb_matches_from_text(text: str) -> Optional[InlineKeyboardMarkup]:
-    """
-    Парсим reply backend вида:
-    • Команда — Команда (...) — id: `demo_xxx_001`
-    """
-    ids = re.findall(r"id:\s*`([^`]+)`", text)
-    if not ids:
-        return None
-
-    # для красоты: вытаскиваем строку матча до "— id:"
-    lines = text.splitlines()
-    buttons: list[list[InlineKeyboardButton]] = []
-    for match_id in ids:
-        label = match_id
-        for ln in lines:
-            if f"`{match_id}`" in ln:
-                # "• Зенит — Спартак (РПЛ) — id: `demo_football_001`"
-                label = ln.strip().lstrip("•").strip()
-                label = re.sub(r"\s*—\s*id:\s*`[^`]+`", "", label).strip()
-                break
-        buttons.append([InlineKeyboardButton(label, callback_data=f"MATCH:{match_id}")])
-
-    # нижний ряд: назад к спорту
-    buttons.append([InlineKeyboardButton("⬅️ Назад к спорту", callback_data="BACK:SPORTS")])
-    return InlineKeyboardMarkup(buttons)
+def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
+        for match_id, title in match_buttons
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад к спорту", callback_data="BACK:SPORTS")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_markets(match_id: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(title, callback_data=f"MARKET:{match_id}:{key}")] for key, title in MARKETS]
-    rows.append([InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")])
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"MARKET:{match_id}:{key}")]
+        for key, label in MARKETS
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад к спорту", callback_data="BACK:SPORTS")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -125,177 +102,238 @@ def kb_market_actions(match_id: str, market_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("📈 Линия", callback_data=f"LINE:{match_id}:{market_key}"),
-                InlineKeyboardButton("🧠 AI разбор", callback_data=f"AI:{match_id}:{market_key}"),
+                InlineKeyboardButton(
+                    "📈 Рынок",
+                    callback_data=f"SHOW_MARKET:{match_id}:{market_key}",
+                ),
+                InlineKeyboardButton(
+                    "🧠 AI разбор",
+                    callback_data=f"AI:{match_id}:{market_key}",
+                ),
             ],
-            [InlineKeyboardButton("👤 Мнение эксперта", callback_data=f"EXPERT:{match_id}:{market_key}")],
-            [InlineKeyboardButton("⬅️ Назад к рынкам", callback_data=f"BACK:MARKETS:{match_id}")],
+            [
+                InlineKeyboardButton(
+                    "👤 Мнение эксперта (если есть на сегодня)",
+                    callback_data="EXPERT_TODAY",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад к рынкам",
+                    callback_data=f"BACK:MARKETS:{match_id}",
+                )
+            ],
         ]
     )
 
 
 # -----------------------------
-# Telegram handlers
+# Парсинг матчей из текста backend
+# Ожидаем:
+# • СКА — ЦСКА (КХЛ) — id: `demo_hockey_001`
 # -----------------------------
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
+
+
+def extract_match_buttons(text: str) -> list[tuple[str, str]]:
+    buttons: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        m = ID_RE.search(line)
+        if not m:
+            continue
+        match_id = m.group(1).strip()
+        title = re.sub(r"\s*—\s*id:\s*`?.+`?\s*$", "", line).strip()
+        title = title.lstrip("•").strip()
+        if match_id and title:
+            buttons.append((match_id, title))
+    return buttons
+
+
+def _norm_menu(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# -----------------------------
+# Локальный вызов агента (без HTTP, быстрее и надёжнее)
+# -----------------------------
+async def call_agent_local(user_id: int, message: str) -> str:
+    from ..parsing import run_dialog_agent  # локальный импорт, чтобы не ломать startup
+    return await run_dialog_agent(user_id=user_id, message=message)
+
+
+# -----------------------------
+# Handlers
+# -----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
     user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
+    text = update.message.text or ""
+    norm = _norm_menu(text)
 
+    logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # Главное действие: выводим спорт-меню inline
-    norm = text.lower()
-    if "матчи" in norm:
-        context.user_data.pop("last_sport", None)
-        context.user_data.pop("last_matches_text", None)
+    # --- Главное меню: Матчи сегодня ---
+    if norm in {"матчи сегодня"}:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        # закрепим main menu отдельным сообщением
+        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    if "стратег" in norm or norm in {"эксперт", "стратегия"}:
-        reply = await call_agent(user_id, "стратегия")
-        await update.message.reply_text(reply)
+    # --- Главное меню: Стратегия эксперта ---
+    if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
+        reply = await call_agent_local(user_id, "стратегия")
+        await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
         return
 
-    if "аналитик" in norm:
+    # --- Главное меню: AI аналитика (подсказка) ---
+    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
         await update.message.reply_text(
-            "🧠 AI Аналитика\n\n"
-            "Лучший путь: Матчи сегодня → матч → рынок → AI разбор.\n"
-            "Или командой: `аналитика <match_id> <market_key>`"
+            "Как пользоваться AI:\n"
+            "1) нажми *🏟 Матчи сегодня*\n"
+            "2) выбери спорт → матч → рынок\n"
+            "3) нажми *🧠 AI разбор*\n\n"
+            "Либо текстом: `аналитика <match_id> <market_key>`",
+            reply_markup=MAIN_KB,
+            parse_mode="Markdown",
         )
         return
 
-    # Фолбек: всё в агента
-    reply = await call_agent(user_id, text)
-    await update.message.reply_text(reply)
+    # --- Остальное: проброс в агента (ручные команды) ---
+    reply = await call_agent_local(user_id, text)
+    await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
+
+    data = query.data or ""
+    user_id = query.from_user.id
     await query.answer()
 
-    user_id = query.from_user.id
-    data = query.data or ""
+    logger.info("tg.callback user_id=%s data=%r", user_id, data)
 
     # BACK
     if data == "BACK:SPORTS":
         await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
-        return
-
-    if data == "BACK:MATCHES":
-        # восстановим последний спорт
-        sport = context.user_data.get("last_sport")
-        if not sport:
-            await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
-            return
-        await _send_matches_for_sport(query, context, sport)
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
     if data.startswith("BACK:MARKETS:"):
         match_id = data.split(":", 2)[2]
-        await query.message.reply_text("📊 Выбери рынок:", reply_markup=kb_markets(match_id))
+        await query.message.reply_text("Выбери рынок:", reply_markup=kb_markets(match_id))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # SPORT choose
+    # SPORT -> список матчей
     if data.startswith("SPORT:"):
-        sport = data.split(":", 1)[1]
-        context.user_data["last_sport"] = sport
-        await _send_matches_for_sport(query, context, sport)
+        sport_key = data.split(":", 1)[1]
+        reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
+
+        match_buttons = extract_match_buttons(reply)
+        if not match_buttons:
+            await query.message.reply_text(reply, parse_mode="Markdown")
+            await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+            await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
+            return
+
+        await query.message.reply_text(reply, parse_mode="Markdown")
+        await query.message.reply_text("Выбери матч:", reply_markup=kb_matches(match_buttons))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # MATCH choose
+    # MATCH -> экран матча + рынки
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1]
-        context.user_data["last_match"] = match_id
-        await query.message.reply_text("📊 Выбери рынок:", reply_markup=kb_markets(match_id))
+        reply = await call_agent_local(user_id, f"матч {match_id}")
+
+        await query.message.reply_text(reply, parse_mode="Markdown")
+        await query.message.reply_text("Выбери рынок:", reply_markup=kb_markets(match_id))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # MARKET choose
+    # MARKET -> действия
     if data.startswith("MARKET:"):
         _, match_id, market_key = data.split(":", 2)
-        context.user_data["last_match"] = match_id
-        context.user_data["last_market"] = market_key
         await query.message.reply_text(
-            f"✅ Выбран рынок: `{market_key}`\nМатч: `{match_id}`",
+            f"Выбран рынок: *{market_key}*\nВыбери действие:",
             reply_markup=kb_market_actions(match_id, market_key),
+            parse_mode="Markdown",
         )
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # ACTIONS
-    if data.startswith("LINE:"):
+    # SHOW_MARKET
+    if data.startswith("SHOW_MARKET:"):
         _, match_id, market_key = data.split(":", 2)
-        text = await call_agent(user_id, f"рынок {match_id} {market_key}")
-        await query.message.reply_text(text, reply_markup=kb_market_actions(match_id, market_key))
+        reply = await call_agent_local(user_id, f"рынок {match_id} {market_key}")
+        await query.message.reply_text(reply, parse_mode="Markdown")
+        await query.message.reply_text("Действия:", reply_markup=kb_market_actions(match_id, market_key))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
+    # AI
     if data.startswith("AI:"):
         _, match_id, market_key = data.split(":", 2)
-        text = await call_agent(user_id, f"аналитика {match_id} {market_key}")
-        await query.message.reply_text(text, reply_markup=kb_market_actions(match_id, market_key))
+        reply = await call_agent_local(user_id, f"аналитика {match_id} {market_key}")
+        await query.message.reply_text(reply, parse_mode="Markdown")
+        await query.message.reply_text("Действия:", reply_markup=kb_market_actions(match_id, market_key))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    if data.startswith("EXPERT:"):
-        _, match_id, market_key = data.split(":", 2)
-        text = await call_agent(user_id, "стратегия")
-        await query.message.reply_text(text, reply_markup=kb_market_actions(match_id, market_key))
+    # EXPERT_TODAY
+    if data == "EXPERT_TODAY":
+        reply = await call_agent_local(user_id, "стратегия")
+        await query.message.reply_text(reply, parse_mode="Markdown")
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-
-async def _send_matches_for_sport(query, context: ContextTypes.DEFAULT_TYPE, sport: str) -> None:
-    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
-    reply = await call_agent(query.from_user.id, f"матчи сегодня {sport}")
-    context.user_data["last_matches_text"] = reply
-
-    kb = kb_matches_from_text(reply)
-    if kb:
-        await query.message.reply_text(reply, reply_markup=kb)
-    else:
-        await query.message.reply_text(
-            reply + "\n\nНе смог построить кнопки матчей — проверь формат `id: `...``"
-        )
+    await query.message.reply_text("Не понял действие 🤔", reply_markup=MAIN_KB)
 
 
 # -----------------------------
-# Build Application (required by service.py)
+# Application factory (имя, которое ждёт service.py)
 # -----------------------------
 def build_telegram_application() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    return app
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CallbackQueryHandler(handle_callback))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    return tg_app
 
 
 # -----------------------------
-# FastAPI mount
+# FastAPI mount (webhook-only)
 # -----------------------------
 def mount(fastapi_app: FastAPI) -> None:
     """
-    Регистрирует /telegram/webhook и на startup ставит webhook.
+    Регистрирует /telegram/webhook и lifecycle-хуки.
+    НИКАКОГО polling.
     """
     tg_app = build_telegram_application()
-    router = APIRouter()
+    fastapi_app.state.telegram_app = tg_app
 
-    @router.post(WEBHOOK_PATH)
-    async def telegram_webhook(req: Request):
-        # optional secret in header
-        if WEBHOOK_SECRET:
-            got = req.headers.get("X-Telegram-Bot-Api-Secret-Token") or ""
-            if got != WEBHOOK_SECRET:
-                return {"ok": False, "error": "bad secret"}
+    async def _startup() -> None:
+        # init/start PTB application
+        await tg_app.initialize()
+        await tg_app.start()
 
-        payload = await req.json()
-        update = Update.de_json(payload, tg_app.bot)
-        await tg_app.process_update(update)
-        return {"ok": True}
-
-    fastapi_app.include_router(router)
-
-    @fastapi_app.on_event("startup")
-    async def _startup_webhook():
         if not PUBLIC_URL:
             logger.warning("PUBLIC_URL is not set -> webhook will NOT be configured automatically.")
             return
@@ -311,9 +349,24 @@ def mount(fastapi_app: FastAPI) -> None:
         except Exception as e:
             logger.exception("Failed to set telegram webhook: %s", e)
 
-    @fastapi_app.on_event("shutdown")
-    async def _shutdown():
+    async def _shutdown() -> None:
         try:
-            await tg_app.bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
+            await tg_app.stop()
+        finally:
+            await tg_app.shutdown()
+
+    fastapi_app.add_event_handler("startup", _startup)
+    fastapi_app.add_event_handler("shutdown", _shutdown)
+
+    @fastapi_app.post(WEBHOOK_PATH)
+    async def telegram_webhook(request: Request) -> dict[str, Any]:
+        # (опционально) проверка secret token от Telegram
+        if WEBHOOK_SECRET:
+            got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if got != WEBHOOK_SECRET:
+                raise HTTPException(status_code=403, detail="Bad webhook secret")
+
+        payload = await request.json()
+        update = Update.de_json(payload, tg_app.bot)
+        await tg_app.process_update(update)
+        return {"ok": True}
