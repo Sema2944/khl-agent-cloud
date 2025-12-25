@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent API")
 
+# ✅ ВАЖНО: монтируем Telegram webhook РАНЬШЕ startup,
+# чтобы маршрут /telegram/webhook был зарегистрирован до начала работы.
+try:
+    from .telegram_bot.app import mount as mount_telegram
+    mount_telegram(app)
+    logger.info("Telegram routes mounted.")
+except Exception as e:
+    # не падаем, чтобы API продолжал жить даже если телега не настроена
+    logger.exception("Failed to mount telegram webhook routes: %s", e)
+
 
 @app.get("/__health")
 def health():
@@ -79,13 +89,9 @@ class BetSettle(BaseModel):
 # Startup
 # -----------------------------
 @app.on_event("startup")
-async def on_startup():
+def on_startup():
     init_db()
-
-    from .telegram_bot.app import mount
-    mount(app)
-
-    logger.info("FastAPI сервис запущен + Telegram webhook подключён.")
+    logger.info("FastAPI сервис запущен (DB ok). Telegram webhook init is handled in telegram_bot/app.py startup hook.")
 
 
 # -----------------------------
