@@ -381,26 +381,46 @@ def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
     return "\n".join(pretty)
 
 
-async def ai_analyze(match_id: str, market_key: str) -> str:
+async def ai_analyze(
+    *,
+    user_id: int,
+    match_id: str,
+    market_key: str,
+    line_context: str = "",
+) -> str:
     """
-    Боевой вызов LLM-адаптера (≤3 сек суммарно, ретраи, JSON-валидация, fallback).
+    AI аналитика через LLM с жёстким SLA и fallback.
+    Возвращает готовый текст для Telegram.
     """
-    m = _find_match(match_id)
-    if not m:
-        return "Матч не найден (MVP демо)."
 
-    market_key = (market_key or "").strip().lower()
-    market = DEMO_MARKETS.get(market_key)
-    if not market:
-        return "Рынок не найден (MVP демо)."
+    # Короткий domain-подсказ для LLM
+    domain_prompt = f"""
+Матч: {match_id}
+Рынок: {market_key}
 
-    domain_prompt = _build_llm_domain_prompt(match_id, market_key)
+Контекст линии:
+{line_context or "Нет дополнительных данных по линии."}
+
+Задача:
+Объясни, что заложено в коэффициентах и логике линии.
+Без прогнозов исхода и без советов по суммам ставок.
+"""
+
     analysis, meta = await analyze_with_llm(domain_prompt)
 
-    # Можно логировать SLA/ошибки
-    logger.info("LLM meta: %s", meta)
+    # логируем мету (очень полезно для продакшена)
+    logger.info(
+        "LLM meta: %s",
+        {
+            "provider": meta.get("provider"),
+            "attempts": meta.get("attempts"),
+            "elapsed_ms": meta.get("elapsed_ms"),
+            "used_fallback": meta.get("used_fallback"),
+            "last_error": meta.get("last_error"),
+        },
+    )
 
-    # Красивый текст под Telegram
+    # превращаем JSON → красивый Telegram-текст
     return render_analysis_text(analysis)
 
 
