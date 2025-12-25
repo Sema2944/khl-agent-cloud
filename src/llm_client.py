@@ -375,3 +375,72 @@ def render_analysis_text(a: LLMAnalysis) -> str:
     lines.append("")
     lines.append("_Дисклеймер: это аналитика, не рекомендация к ставкам._")
     return "\n".join(lines)
+# ============================================================
+# LLM CACHE (in-memory TTL) — MVP
+# ============================================================
+
+LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "600").strip())  # 10 min default
+LLM_CACHE_MAX_ITEMS = int((os.getenv("LLM_CACHE_MAX_ITEMS") or "500").strip())
+
+# key -> (expires_at_monotonic, analysis_dict, meta_dict)
+_LLM_CACHE: dict[str, tuple[float, dict, dict]] = {}
+_LLM_CACHE_LOCK = asyncio.Lock()
+
+
+def _cache_cleanup(now: float) -> None:
+    # remove expired
+    dead = [k for k, (exp, _, __) in _LLM_CACHE.items() if exp <= now]
+    for k in dead:
+        _LLM_CACHE.pop(k, None)
+
+    # crude size cap: drop oldest-ish (not perfect, but ok for MVP)
+    if len(_LLM_CACHE) > LLM_CACHE_MAX_ITEMS:
+        # sort by expiry (soonest first) and drop extras
+        items = sorted(_LLM_CACHE.items(), key=lambda kv: kv[1][0])
+        for k, _ in items[: max(0, len(_LLM_CACHE) - LLM_CACHE_MAX_ITEMS)]:
+            _LLM_CACHE.pop(k, None)
+
+
+async def analyze_with_llm_cached(
+    domain_prompt: str,
+    cache_key: str,
+    ttl_s: int | None = None,
+) -> tuple[LLMAnalysis, dict]:
+    """
+    Cached wrapper around analyze_with_llm().
+
+    cache_key must be stable for (match_id, market_key, line_hash).
+    """
+    ttl = int(ttl_s or LLM_CACHE_TTL_S)
+    now = time.monotonic()
+
+    async with _LLM_CACHE_LOCK:
+        _cache_cleanup(now)
+        hit = _LLM_CACHE.get(cache_key)
+        if hit:
+            exp, analysis_dict, meta = hit
+            if exp > now:
+                a_ok, a, _ = validate_analysis_json(analysis_dict)
+                if a_ok and a:
+                    meta2 = dict(meta)
+                    meta2.update({"cache_hit": True, "cache_key": cache_key})
+                    return a, meta2
+            else:
+                _LLM_CACHE.pop(cache_key, None)
+
+    # miss -> call LLM
+    a, meta = await analyze_with_llm(domain_prompt)
+    meta2 = dict(meta)
+    meta2.update({"cache_hit": False, "cache_key": cache_key})
+
+    # store only if got non-empty result (even fallback ok — чтобы не долбить LLM)
+    try:
+        analysis_dict = a.to_dict()
+    except Exception:
+        analysis_dict = {"verdict": "unclear", "confidence": 0.0, "reasoning_bullets": ["bad analysis"], "risks": [], "checklist": []}
+
+    async with _LLM_CACHE_LOCK:
+        _cache_cleanup(time.monotonic())
+        _LLM_CACHE[cache_key] = (time.monotonic() + ttl, analysis_dict, meta2)
+
+    return a, meta2
