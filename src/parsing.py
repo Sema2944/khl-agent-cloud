@@ -590,6 +590,27 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
+if norm == "env":
+    # НЕ выводим секреты, только факты наличия
+    import os
+    keys = [
+        "OPENAI_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+        "PUBLIC_URL",
+        "LLM_ENABLED",
+        "LLM_PROVIDER",
+        "OPENAI_MODEL",
+        "LLM_TOTAL_TIMEOUT_S",
+        "LLM_ATTEMPT_TIMEOUT_S",
+    ]
+    lines = ["🔧 *ENV status*"]
+    for k in keys:
+        v = os.getenv(k)
+        if k in ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN"):
+            lines.append(f"• {k}: {'✅ set' if (v and v.strip()) else '❌ missing'}")
+        else:
+            lines.append(f"• {k}: `{(v or '').strip()}`")
+    return "\n".join(lines)
 
     # UI actions from Telegram buttons:
     # ui match <match_id> <mode> <action>
