@@ -1,13 +1,5 @@
 # src/service.py
 import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
-from __future__ import annotations
-
-import logging
 from typing import Optional
 
 from fastapi import Depends, FastAPI
@@ -26,6 +18,10 @@ from .bets_db import (
     settle_bet,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent API")
@@ -34,6 +30,7 @@ app = FastAPI(title="KHL AI Betting Agent API")
 # чтобы маршрут /telegram/webhook был зарегистрирован до начала работы.
 try:
     from .telegram_bot.app import mount as mount_telegram
+
     mount_telegram(app)
     logger.info("Telegram routes mounted.")
 except Exception as e:
@@ -97,7 +94,9 @@ class BetSettle(BaseModel):
 @app.on_event("startup")
 def on_startup():
     init_db()
-    logger.info("FastAPI сервис запущен (DB ok). Telegram webhook init is handled in telegram_bot/app.py startup hook.")
+    logger.info(
+        "FastAPI сервис запущен (DB ok). Telegram webhook init is handled in telegram_bot/app.py startup hook."
+    )
 
 
 # -----------------------------
