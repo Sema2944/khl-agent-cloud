@@ -1,4 +1,7 @@
 # src/parsing.py
+if norm == "version":
+    return "✅ parsing.py version: 2025-12-26 v2 (ui+llm_ping)"
+
 from __future__ import annotations
 
 import hashlib
