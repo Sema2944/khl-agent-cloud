@@ -1,6 +1,5 @@
 # src/parsing.py
-if norm == "version":
-   from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -30,6 +29,7 @@ ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
 EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY-MM-DD (fallback)
 
+# "на сегодня" считаем по МСК (как было)
 MSK = ZoneInfo("Europe/Moscow")
 
 LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
@@ -283,7 +283,7 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 
 
 # -----------------------------
-# Матчи → матч → рынок → аналитика
+# Матчи → матч → рынок → аналитика (legacy)
 # -----------------------------
 def _find_match(match_id: str) -> Optional[dict]:
     for sport, arr in DEMO_MATCHES.items():
@@ -436,20 +436,15 @@ async def ai_analyze(*, user_id: int, match_id: str, market_key: str) -> str:
     analysis, meta = await analyze_with_llm_cached(domain_prompt, cache_key=cache_key, schema="legacy")
 
     logger.info(
-        "LLM meta: %s",
-        {
-            "provider": meta.get("provider"),
-            "attempts": meta.get("attempts"),
-            "elapsed_ms": meta.get("elapsed_ms"),
-            "used_fallback": meta.get("used_fallback"),
-            "last_error": meta.get("last_error"),
-            "cache": meta.get("cache"),
-        },
+        "LLM meta(legacy): %s",
+        {k: meta.get(k) for k in ("provider", "attempts", "elapsed_ms", "used_fallback", "last_error", "cache")},
     )
 
-    if not isinstance(analysis, dict):
-        return render_analysis_text(analysis)  # legacy
-    return "Неожиданный формат анализа (legacy)."
+    if isinstance(analysis, dict):
+        # если вдруг придёт dict — просто сериализуем безопасно
+        return json.dumps(analysis, ensure_ascii=False)
+
+    return render_analysis_text(analysis)
 
 
 def expert_opinion_for_market(match_id: str, market_key: str) -> str:
@@ -466,6 +461,7 @@ def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
     total = DEMO_MARKETS["total"]["data"]
     hc = DEMO_MARKETS["handicap"]["data"]
     if mode == "live":
+        # LIVE: без кэфов — только “линия” (пример)
         return {
             "total_main": {"value": float(total["value"])},
             "handicap_main": {"team": hc["team"], "value": float(hc["value"])},
@@ -477,10 +473,17 @@ def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
     }
 
 
-def _build_ui_prompt(match_id: str, mode: str, action: str, prev_snap: Optional[Dict[str, Any]], cur_snap: Dict[str, Any]) -> str:
+def _build_ui_prompt(
+    match_id: str,
+    mode: str,
+    action: str,
+    prev_snap: Optional[Dict[str, Any]],
+    cur_snap: Dict[str, Any],
+) -> str:
     m = _find_match(match_id)
     if not m:
         return ""
+
     mode = (mode or "pre").lower()
     action = (action or "overview").lower()
 
@@ -508,7 +511,7 @@ def _build_ui_prompt(match_id: str, mode: str, action: str, prev_snap: Optional[
             "",
             "Задача:",
             "Сформируй LIVE-объяснение: 3-5 пунктов контекста и 1-3 ключевых рынка.",
-            "Если есть предыдущий снапшот — объясни направление изменений (вверх/вниз/без изменений) без цифр коэффициентов.",
+            "Если есть предыдущий снапшот — объясни направление изменений (up/down/flat) без коэффициентов.",
             "",
             "Верни СТРОГО JSON (без markdown) с полями:",
             '{"title": "...", "context": ["..."], "markets": [{"name":"Total|Handicap","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
@@ -517,7 +520,7 @@ def _build_ui_prompt(match_id: str, mode: str, action: str, prev_snap: Optional[
         base += [
             "",
             "Задача:",
-            "Сформируй PREMATCH-объяснение по обзору/рынку: краткое резюме, факторы, логика линии, риски.",
+            "Сформируй PREMATCH-объяснение по обзору: краткое резюме, факторы, логика линии, риски.",
             "",
             "Верни СТРОГО JSON (без markdown) с полями:",
             '{"title": "...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}',
@@ -532,7 +535,7 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     if not isinstance(analysis, dict):
         return "Не удалось получить разбор (неожиданный формат)."
 
-    title = analysis.get("title") or ("🟢 LIVE-обзор" if (mode == "live") else "📊 Обзор")
+    title = analysis.get("title") or ("🟢 LIVE-обзор" if (mode == "live") else "📊 Обзор рынков")
     lines: list[str] = [f"*{title}*"]
 
     if analysis.get("summary"):
@@ -579,7 +582,7 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
 
     disclaimer = analysis.get("disclaimer") or "Аналитический материал, не является рекомендацией."
     lines.append("")
-    lines.append(f"_{disclaimer.strip('_')}_")
+    lines.append(f"_{str(disclaimer).strip('_').strip()}_")
     return "\n".join(lines)
 
 
@@ -591,30 +594,53 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
- return "✅ parsing.py version: 2025-12-26 v2 (ui+llm_ping)"
 
-    # НЕ выводим секреты, только факты наличия
-    import os
-    keys = [
-        "OPENAI_API_KEY",
-        "TELEGRAM_BOT_TOKEN",
-        "PUBLIC_URL",
-        "LLM_ENABLED",
-        "LLM_PROVIDER",
-        "OPENAI_MODEL",
-        "LLM_TOTAL_TIMEOUT_S",
-        "LLM_ATTEMPT_TIMEOUT_S",
-    ]
-    lines = ["🔧 *ENV status*"]
-    for k in keys:
-        v = os.getenv(k)
-        if k in ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN"):
-            lines.append(f"• {k}: {'✅ set' if (v and v.strip()) else '❌ missing'}")
-        else:
-            lines.append(f"• {k}: `{(v or '').strip()}`")
-    return "\n".join(lines)
+    # --- Diagnostics ---
+    if norm == "version":
+        return "✅ parsing.py version: 2025-12-26 v2 (ui+diagnostics)"
 
-    # UI actions from Telegram buttons:
+    if norm == "env":
+        keys = [
+            "OPENAI_API_KEY",
+            "TELEGRAM_BOT_TOKEN",
+            "PUBLIC_URL",
+            "LLM_ENABLED",
+            "LLM_PROVIDER",
+            "OPENAI_MODEL",
+            "LLM_TOTAL_TIMEOUT_S",
+            "LLM_ATTEMPT_TIMEOUT_S",
+            "LLM_MAX_RETRIES",
+            "LLM_CACHE_TTL_S",
+        ]
+        lines = ["🔧 *ENV status*"]
+        for k in keys:
+            v = os.getenv(k)
+            if k in ("OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN"):
+                lines.append(f"• {k}: {'✅ set' if (v and v.strip()) else '❌ missing'}")
+            else:
+                lines.append(f"• {k}: `{(v or '').strip()}`")
+        return "\n".join(lines)
+
+    if norm == "llm ping":
+        prompt = (
+            "Верни строго JSON по ui_pre схеме:\n"
+            '{"title":"...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}'
+        )
+        analysis, meta = await analyze_with_llm_cached(
+            prompt,
+            cache_key=f"diag:ping:{int(time.time())}",
+            schema="ui_pre",
+        )
+        return (
+            "🧪 *LLM ping*\n"
+            f"• provider: `{meta.get('provider')}`\n"
+            f"• used_fallback: `{meta.get('used_fallback')}`\n"
+            f"• last_error: `{meta.get('last_error')}`\n"
+            f"• elapsed_ms: `{meta.get('elapsed_ms')}`\n"
+            f"• cache: `{meta.get('cache')}`"
+        )
+
+    # --- UI actions from Telegram buttons ---
     # ui match <match_id> <mode> <action>
     if norm.startswith("ui match"):
         parts = text_raw.split()
@@ -671,7 +697,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         _, msg = _try_admin_update_strategy(user_id, text_raw)
         return msg
 
-    # 1) Эксперт стратегия (по МСК)
+    # 1) Эксперт стратегия
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _format_expert_strategy_for_today()
 
@@ -680,11 +706,12 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         sport = text_raw.split("матчи сегодня", 1)[1].strip(" :\n\t")
         if not sport:
             return (
-                "Напиши: `матчи сегодня хоккей`\n"
+                "Напиши: `матчи сегодня hockey`\n"
                 "Варианты: hockey, football, basketball, tennis, esports"
             )
         return _format_matches_today(sport)
 
+    # Backward compat
     if "кхл сегодня" in norm:
         return _format_matches_today("hockey")
 
@@ -704,7 +731,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         match_id, market_key = parts[0], parts[1]
         return _format_market(match_id, market_key)
 
-    # 5) Аналитика <match_id> <market_key> (legacy)
+    # 5) Аналитика <match_id> <market_key>
     if norm.startswith("аналитика"):
         body = text_raw.split("аналитика", 1)[1].strip()
         parts = body.split()
@@ -716,7 +743,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             "или по шагам: `матчи сегодня hockey` → `матч <id>` → `рынок <id> <market>`"
         )
 
-    # 6) Эксперт мнение (кнопка/команда)
+    # 6) Эксперт мнение
     if norm.startswith("эксперт") or norm.startswith("мнение эксперта"):
         return expert_opinion_for_market("", "")
 
@@ -856,6 +883,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
+    # Help
     return (
         "Команды (MVP):\n\n"
         "• `матчи сегодня hockey|football|basketball|tennis|esports`\n"
@@ -864,16 +892,5 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         "• `профиль`, `состояние банка`, `отчёт за неделю`, `разбор моих рынков`\n\n"
         "_Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам._"
     )
-if norm == "llm ping":
-    from .llm_client import analyze_with_llm_cached
-    prompt = "Проверь соединение. Верни корректный JSON по ui_pre схеме."
-    analysis, meta = await analyze_with_llm_cached(prompt, cache_key=f"diag:ping:{int(time.time())}", schema="ui_pre")
-    return (
-        "🧪 *LLM ping*\n"
-        f"• provider: `{meta.get('provider')}`\n"
-        f"• used_fallback: `{meta.get('used_fallback')}`\n"
-        f"• last_error: `{meta.get('last_error')}`\n"
-        f"• elapsed_ms: `{meta.get('elapsed_ms')}`\n"
-        f"• cache: `{meta.get('cache')}`"
-    )
+
 
