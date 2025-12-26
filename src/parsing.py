@@ -862,3 +862,16 @@ if norm == "env":
         "• `профиль`, `состояние банка`, `отчёт за неделю`, `разбор моих рынков`\n\n"
         "_Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам._"
     )
+if norm == "llm ping":
+    from .llm_client import analyze_with_llm_cached
+    prompt = "Проверь соединение. Верни корректный JSON по ui_pre схеме."
+    analysis, meta = await analyze_with_llm_cached(prompt, cache_key=f"diag:ping:{int(time.time())}", schema="ui_pre")
+    return (
+        "🧪 *LLM ping*\n"
+        f"• provider: `{meta.get('provider')}`\n"
+        f"• used_fallback: `{meta.get('used_fallback')}`\n"
+        f"• last_error: `{meta.get('last_error')}`\n"
+        f"• elapsed_ms: `{meta.get('elapsed_ms')}`\n"
+        f"• cache: `{meta.get('cache')}`"
+    )
+
