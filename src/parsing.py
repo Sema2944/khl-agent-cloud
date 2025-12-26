@@ -6,17 +6,18 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 from sqlmodel import Session, select
 from zoneinfo import ZoneInfo
 
 from .db import get_session
 from . import bets_db
-from .expert_db import ExpertStrategy  # ✅ модель только тут, не дублируем
-from .llm_client import analyze_with_llm_cached, render_analysis_text  # ✅ cache wrapper
+from .expert_db import ExpertStrategy
+from .llm_client import analyze_with_llm_cached, render_analysis_text
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +26,11 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 
-# Стратегия из ENV (fallback)
 EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
 EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()  # YYYY-MM-DD (fallback)
 
-# Важно: "на сегодня" считаем по МСК
 MSK = ZoneInfo("Europe/Moscow")
 
-# ✅ Промт аналитика ставок LLM (можно менять без деплоя)
 LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
@@ -41,6 +39,20 @@ if not LLM_PROMPT_PREFIX:
         "НЕ предсказывай исход и НЕ давай советов по ставкам.\n"
         "Пиши коротко, структурно: мысли/риски/чек-лист."
     )
+
+# -----------------------------
+# LIVE snapshots (MVP) — на пользователя+матч
+# -----------------------------
+_LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
+
+
+def _snap_key(user_id: int, match_id: str) -> str:
+    return f"{user_id}:{match_id}"
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
 
 # -----------------------------
 # УТИЛИТА ДЛЯ SESSION (вне FastAPI)
@@ -69,7 +81,6 @@ DEMO_SPORTS = {
     "esports": "🎮 Киберспорт",
 }
 
-# match_id должен быть стабильным (чтобы бот узнавал)
 DEMO_MATCHES = {
     "hockey": [
         {"id": "demo_hockey_001", "title": "СКА — ЦСКА", "league": "КХЛ"},
@@ -90,7 +101,6 @@ DEMO_MATCHES = {
     ],
 }
 
-# MVP: одинаковые рынки для всех матчей (демо)
 DEMO_MARKETS = {
     "moneyline": {
         "label": "1X2 / Moneyline",
@@ -204,7 +214,6 @@ def _format_expert_strategy_for_today() -> str:
             text = row.text
             date_label = row.date.isoformat()
 
-    # fallback на ENV, если в БД пусто
     if not text and EXPERT_STRATEGY_TEXT:
         text = EXPERT_STRATEGY_TEXT
         date_label = EXPERT_STRATEGY_DATE or date_label
@@ -363,9 +372,6 @@ def _format_market(match_id: str, market_key: str) -> str:
 
 
 def _line_hash_for_cache(match_id: str, market_key: str) -> str:
-    """
-    ✅ line_hash меняется, когда меняются цифры линии.
-    """
     m = _find_match(match_id) or {}
     market = DEMO_MARKETS.get(market_key) or {}
 
@@ -408,11 +414,7 @@ def _build_llm_domain_prompt(match_id: str, market_key: str) -> str:
 
 
 async def ai_analyze(*, user_id: int, match_id: str, market_key: str) -> str:
-    """
-    ✅ AI аналитика через LLM + In-memory cache (через analyze_with_llm_cached).
-    cache_key = v1:<match_id>:<market_key>:<line_hash>
-    """
-    _ = user_id  # пока не используем, но оставляем сигнатуру
+    _ = user_id
 
     m = _find_match(match_id)
     market_key = (market_key or "").strip().lower()
@@ -430,7 +432,7 @@ async def ai_analyze(*, user_id: int, match_id: str, market_key: str) -> str:
     line_hash = _line_hash_for_cache(match_id, market_key)
     cache_key = f"v1:{match_id}:{market_key}:{line_hash}"
 
-    analysis, meta = await analyze_with_llm_cached(domain_prompt, cache_key=cache_key)
+    analysis, meta = await analyze_with_llm_cached(domain_prompt, cache_key=cache_key, schema="legacy")
 
     logger.info(
         "LLM meta: %s",
@@ -440,16 +442,144 @@ async def ai_analyze(*, user_id: int, match_id: str, market_key: str) -> str:
             "elapsed_ms": meta.get("elapsed_ms"),
             "used_fallback": meta.get("used_fallback"),
             "last_error": meta.get("last_error"),
-            "cache": meta.get("cache"),  # "hit" / "miss"
+            "cache": meta.get("cache"),
         },
     )
 
-    return render_analysis_text(analysis)
+    if not isinstance(analysis, dict):
+        return render_analysis_text(analysis)  # legacy
+    return "Неожиданный формат анализа (legacy)."
 
 
 def expert_opinion_for_market(match_id: str, market_key: str) -> str:
     base = _format_expert_strategy_for_today()
     return base + "\n\n" + "_Примечание: в MVP мнение эксперта публикуется как общая стратегия дня._"
+
+
+# -----------------------------
+# NEW UI helpers (PRE/LIVE)
+# -----------------------------
+def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
+    mode = (mode or "pre").lower()
+    ml = DEMO_MARKETS["moneyline"]["data"]
+    total = DEMO_MARKETS["total"]["data"]
+    hc = DEMO_MARKETS["handicap"]["data"]
+    if mode == "live":
+        return {
+            "total_main": {"value": float(total["value"])},
+            "handicap_main": {"team": hc["team"], "value": float(hc["value"])},
+        }
+    return {
+        "moneyline": {"home": float(ml["home"]), "draw": float(ml["draw"]), "away": float(ml["away"])},
+        "total_main": {"value": float(total["value"]), "over": float(total["over"]), "under": float(total["under"])},
+        "handicap_main": {"team": hc["team"], "value": float(hc["value"]), "odds": float(hc["odds"])},
+    }
+
+
+def _build_ui_prompt(match_id: str, mode: str, action: str, prev_snap: Optional[Dict[str, Any]], cur_snap: Dict[str, Any]) -> str:
+    m = _find_match(match_id)
+    if not m:
+        return ""
+    mode = (mode or "pre").lower()
+    action = (action or "overview").lower()
+
+    base = [
+        LLM_PROMPT_PREFIX,
+        "",
+        "Правила:",
+        "- НЕ давай прогнозов и рекомендаций по ставкам",
+        "- НЕ используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%",
+        "- В LIVE не показывай коэффициенты, только направление и логику",
+        "- Ответ короткий. Лучше списками.",
+        "",
+        f"Матч: {m['title']} ({m['league']})",
+        f"match_id: {match_id}",
+        f"mode: {mode}",
+        f"action: {action}",
+        "",
+        f"Текущий снапшот линии (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
+    ]
+    if prev_snap:
+        base.append(f"Предыдущий снапшот линии (JSON): {json.dumps(prev_snap, ensure_ascii=False)}")
+
+    if mode == "live":
+        base += [
+            "",
+            "Задача:",
+            "Сформируй LIVE-объяснение: 3-5 пунктов контекста и 1-3 ключевых рынка.",
+            "Если есть предыдущий снапшот — объясни направление изменений (вверх/вниз/без изменений) без цифр коэффициентов.",
+            "",
+            "Верни СТРОГО JSON (без markdown) с полями:",
+            '{"title": "...", "context": ["..."], "markets": [{"name":"Total|Handicap","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
+        ]
+    else:
+        base += [
+            "",
+            "Задача:",
+            "Сформируй PREMATCH-объяснение по обзору/рынку: краткое резюме, факторы, логика линии, риски.",
+            "",
+            "Верни СТРОГО JSON (без markdown) с полями:",
+            '{"title": "...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}',
+        ]
+
+    return "\n".join(base)
+
+
+def _render_ui_json(analysis: Any, mode: str) -> str:
+    if isinstance(analysis, str):
+        return analysis
+    if not isinstance(analysis, dict):
+        return "Не удалось получить разбор (неожиданный формат)."
+
+    title = analysis.get("title") or ("🟢 LIVE-обзор" if (mode == "live") else "📊 Обзор")
+    lines: list[str] = [f"*{title}*"]
+
+    if analysis.get("summary"):
+        lines += ["", str(analysis["summary"]).strip()]
+
+    ctx = analysis.get("context") or []
+    if ctx:
+        lines.append("")
+        for x in ctx[:6]:
+            lines.append(f"• {x}")
+
+    kf = analysis.get("key_factors") or []
+    if kf:
+        lines.append("")
+        lines.append("*Факторы*")
+        for x in kf[:6]:
+            lines.append(f"• {x}")
+
+    ll = analysis.get("line_logic") or []
+    if ll:
+        lines.append("")
+        lines.append("*Логика линии*")
+        for x in ll[:6]:
+            lines.append(f"• {x}")
+
+    mk = analysis.get("markets") or []
+    if mk:
+        lines.append("")
+        lines.append("*Ключевые рынки*")
+        for item in mk[:3]:
+            name = item.get("name", "Market")
+            direction = item.get("direction", "unknown")
+            logic = item.get("logic", "")
+            lines.append(f"— {name}: *{direction}*")
+            if logic:
+                lines.append(f"  {logic}")
+
+    risks = analysis.get("risks") or []
+    if risks:
+        lines.append("")
+        lines.append("*Риски*")
+        for r in risks[:6]:
+            lines.append(f"• {r}")
+
+    disclaimer = analysis.get("disclaimer") or "Аналитический материал, не является рекомендацией."
+    lines.append("")
+    lines.append(f"_{disclaimer.strip('_')}_")
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------
@@ -460,6 +590,58 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
+
+    # UI actions from Telegram buttons:
+    # ui match <match_id> <mode> <action>
+    if norm.startswith("ui match"):
+        parts = text_raw.split()
+        if len(parts) < 5:
+            return "Некорректная команда UI."
+        match_id = parts[2].strip()
+        mode = parts[3].strip().lower()
+        action = parts[4].strip().lower()
+
+        m = _find_match(match_id)
+        if not m:
+            return "Матч не найден (MVP демо)."
+
+        cur_snap = _line_snapshot_for_mode(mode)
+
+        prev_snap = None
+        force_refresh = False
+        if mode == "live":
+            k = _snap_key(user_id, match_id)
+            prev_snap = (_LIVE_SNAPSHOT_BY_USER_MATCH.get(k) or {}).get("line")
+            if action == "refresh":
+                _LIVE_SNAPSHOT_BY_USER_MATCH[k] = {"ts": _now_ts(), "line": cur_snap}
+                action = "overview"
+                force_refresh = True
+
+        prompt = _build_ui_prompt(match_id, mode, action, prev_snap, cur_snap)
+        if not prompt:
+            return "Не удалось собрать контекст для UI-разбора."
+
+        base_payload = {
+            "match_id": match_id,
+            "mode": mode,
+            "action": action,
+            "line": cur_snap,
+            "prev": prev_snap,
+        }
+        raw = json.dumps(base_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        suffix = f":r{_now_ts()}" if force_refresh else ""
+        cache_key = f"v2:ui:{match_id}:{mode}:{action}:{h}{suffix}"
+
+        schema = "ui_live" if mode == "live" else "ui_pre"
+        analysis, meta = await analyze_with_llm_cached(prompt, cache_key=cache_key, schema=schema)
+
+        logger.info(
+            "LLM meta(ui): %s",
+            {k: meta.get(k) for k in ("provider", "attempts", "elapsed_ms", "used_fallback", "last_error", "cache")},
+        )
+
+        return _render_ui_json(analysis, mode=mode)
 
     # 0) Админ стратегия
     if norm.startswith("админ"):
@@ -475,12 +657,11 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         sport = text_raw.split("матчи сегодня", 1)[1].strip(" :\n\t")
         if not sport:
             return (
-                "Напиши: `матчи сегодня hockey`\n"
+                "Напиши: `матчи сегодня хоккей`\n"
                 "Варианты: hockey, football, basketball, tennis, esports"
             )
         return _format_matches_today(sport)
 
-    # Backward compat: "кхл сегодня" -> хоккей
     if "кхл сегодня" in norm:
         return _format_matches_today("hockey")
 
@@ -500,7 +681,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         match_id, market_key = parts[0], parts[1]
         return _format_market(match_id, market_key)
 
-    # 5) Аналитика <match_id> <market_key>
+    # 5) Аналитика <match_id> <market_key> (legacy)
     if norm.startswith("аналитика"):
         body = text_raw.split("аналитика", 1)[1].strip()
         parts = body.split()
@@ -600,7 +781,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         sign = "+" if pnl >= 0 else ""
         return f"Ставка #{bet.id} отмечена как *{human}*, PnL: *{sign}{pnl:.0f}*."
 
-    # 13) Создание новой ставки (старый MVP формат)
+    # 13) Создание новой ставки
     if norm.startswith("ставка"):
         body = text_raw.split("ставка", 1)[1]
         body = body.lstrip(" :")
@@ -652,7 +833,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             f"`ставка {bet.id} выиграла` / `ставка {bet.id} проиграла` / `ставка {bet.id} возврат`."
         )
 
-    # Help
     return (
         "Команды (MVP):\n\n"
         "• `матчи сегодня hockey|football|basketball|tennis|esports`\n"
