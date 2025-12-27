@@ -25,47 +25,49 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "10.0").strip())
+# Timeouts / retries
+LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "12.0").strip())
 LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "8.0").strip())
-LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "0").strip())
+LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "1").strip())
 
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 
 # Cache (in-memory) — потом заменим на Redis
 LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # prematch 15 минут
-LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "20").strip()) # live 20 сек
+LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip()) # live 25 сек
 
-# Telegram-safe throttling
-LLM_DEBOUNCE_S = float((os.getenv("LLM_DEBOUNCE_S") or "2.0").strip())  # защита от спама кнопок
-COOLDOWN_BASE_S = float((os.getenv("LLM_COOLDOWN_BASE_S") or "60.0").strip())  # минимум 60с после 429
-COOLDOWN_MAX_S = float((os.getenv("LLM_COOLDOWN_MAX_S") or "600.0").strip())   # максимум 10 мин
+# Safety throttles (Telegram-friendly)
+LLM_GLOBAL_QPS = float((os.getenv("LLM_GLOBAL_QPS") or "1.5").strip())  # ~90 RPM max globally
+LLM_PER_USER_MIN_INTERVAL_S = float((os.getenv("LLM_PER_USER_MIN_INTERVAL_S") or "5").strip())
+
+# Cooldown after 429 (seconds)
+LLM_429_COOLDOWN_DEFAULT_S = int((os.getenv("LLM_429_COOLDOWN_DEFAULT_S") or "600").strip())
+LLM_429_COOLDOWN_MAX_S = int((os.getenv("LLM_429_COOLDOWN_MAX_S") or "3600").strip())
 
 LLMOutput = Union["LLMAnalysis", Dict[str, Any]]
+
 _CACHE: Dict[str, Tuple[float, LLMOutput, dict]] = {}
 _CACHE_LOCK = asyncio.Lock()
 
 _ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
 
-# Мягкий список: баним только как отдельные слова/формы (чтобы не ловить "лучше" внутри другого слова)
-_BANNED_WORDS = (
-    "ставь", "ставьте", "бери", "берите", "выгодно", "проход", "верняк",
-    "гарант", "гарантия", "фикс"
+_BANNED_PHRASES = (
+    "ставь", "ставьте", "бери", "берите", "выгодно", "лучше", "проход", "верняк",
+    "гарант", "гарантия", "100%", "фикс"
 )
 
-_BANNED_RE = re.compile(r"(?i)\b(" + "|".join(map(re.escape, _BANNED_WORDS)) + r")\b")
-
 # -----------------------------
-# Global throttles (per instance)
+# Rate limiting / cooldown state (process-local)
 # -----------------------------
-_LLM_SEM = asyncio.Semaphore(1)  # 1 запрос к OpenAI одновременно
+_GLOBAL_LAST_CALL_TS = 0.0
+_GLOBAL_LOCK = asyncio.Lock()
 
-# per-key cooldown after 429
-_COOLDOWN_UNTIL_TS: float = 0.0
-_COOLDOWN_PENALTY_S: float = 0.0
+_PER_USER_LAST_CALL: Dict[int, float] = {}
+_PER_USER_LOCK = asyncio.Lock()
 
-# small debounce map (cache_key -> last_ts)
-_LAST_CALL_TS: Dict[str, float] = {}
-_LAST_CALL_LOCK = asyncio.Lock()
+_COOLDOWN_UNTIL_TS = 0.0
+_COOLDOWN_REASON = ""
+_COOLDOWN_LOCK = asyncio.Lock()
 
 
 @dataclass
@@ -91,10 +93,10 @@ class LLMAnalysis:
 # -----------------------------
 def _contains_banned_phrases(obj: Any) -> bool:
     try:
-        s = json.dumps(obj, ensure_ascii=False)
+        s = json.dumps(obj, ensure_ascii=False).lower()
     except Exception:
-        s = str(obj)
-    return bool(_BANNED_RE.search(s))
+        s = str(obj).lower()
+    return any(p in s for p in _BANNED_PHRASES)
 
 
 def _clamp01(x: Any) -> float:
@@ -121,31 +123,6 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
                 out.append(s)
         return out[:max_len]
     return []
-
-
-def _try_extract_json_obj(content: str) -> Dict[str, Any]:
-    """
-    Мягкий парсер: если модель обернула JSON текстом — вытаскиваем { ... }.
-    """
-    s = (content or "").strip()
-    if not s:
-        raise ValueError("empty content")
-
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    start = s.find("{")
-    end = s.rfind("}")
-    if start >= 0 and end > start:
-        obj = json.loads(s[start:end + 1])
-        if isinstance(obj, dict):
-            return obj
-
-    raise ValueError("invalid JSON from model")
 
 
 def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -176,9 +153,7 @@ def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
             out["context"] = _as_str_list(out.get("context"), max_len=6)
 
         mk = out.get("markets")
-        if mk is None:
-            out["markets"] = []
-        elif not isinstance(mk, list):
+        if mk is None or not isinstance(mk, list):
             out["markets"] = []
     else:
         if "key_factors" in out and not isinstance(out["key_factors"], list):
@@ -194,11 +169,19 @@ def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _sleep_jitter(base: float) -> float:
-    return base + random.random() * 0.2
+    return base + random.random() * 0.12
 
 
-def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
-    ra = resp.headers.get("retry-after")
+def _now() -> float:
+    return time.monotonic()
+
+
+def _wall_now() -> float:
+    return time.time()
+
+
+def _parse_retry_after_seconds(headers: Dict[str, str]) -> Optional[float]:
+    ra = headers.get("retry-after")
     if not ra:
         return None
     try:
@@ -207,62 +190,77 @@ def _parse_retry_after_seconds(resp: httpx.Response) -> Optional[float]:
         return None
 
 
-def _extract_rate_headers(resp: httpx.Response) -> dict:
-    # хедеры могут различаться, логируем всё похожее
-    out = {}
-    for k, v in resp.headers.items():
-        lk = k.lower()
-        if "ratelimit" in lk or lk in ("retry-after", "x-request-id"):
-            out[k] = v
-    return out
-
-
-def _cooldown_left_s() -> float:
-    now = time.monotonic()
-    left = _COOLDOWN_UNTIL_TS - now
-    return left if left > 0 else 0.0
-
-
-async def _debounce(cache_key: str) -> Optional[float]:
+def _parse_try_again_seconds_from_body(body_text: str) -> Optional[int]:
     """
-    Возвращает seconds_left если надо задебаунсить, иначе None.
+    OpenAI error часто содержит: "Please try again in 8h50m29.759s"
+    Парсим в секунды.
     """
-    if not cache_key:
+    if not body_text:
         return None
-    now = time.monotonic()
-    async with _LAST_CALL_LOCK:
-        last = _LAST_CALL_TS.get(cache_key, 0.0)
-        if now - last < LLM_DEBOUNCE_S:
-            return LLM_DEBOUNCE_S - (now - last)
-        _LAST_CALL_TS[cache_key] = now
-    return None
+    m = re.search(r"try again in\s+([0-9hms\.\s]+)", body_text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    s = m.group(1).strip().lower().replace(" ", "")
+    # Examples: 8h50m29.759s / 10m5s / 30s
+    hours = minutes = seconds = 0.0
+    mh = re.search(r"(\d+(?:\.\d+)?)h", s)
+    mm = re.search(r"(\d+(?:\.\d+)?)m", s)
+    ms = re.search(r"(\d+(?:\.\d+)?)s", s)
+    if mh:
+        hours = float(mh.group(1))
+    if mm:
+        minutes = float(mm.group(1))
+    if ms:
+        seconds = float(ms.group(1))
+    total = int(hours * 3600 + minutes * 60 + seconds)
+    return total if total > 0 else None
 
 
-def _bump_cooldown(retry_after_s: Optional[float]) -> float:
+async def _global_rate_limit_wait() -> None:
     """
-    После 429 увеличиваем cooldown.
+    Глобальный QPS limiter. Если LLM_GLOBAL_QPS=1.5 -> минимум 0.666s между вызовами.
     """
-    global _COOLDOWN_UNTIL_TS, _COOLDOWN_PENALTY_S
-    now = time.monotonic()
-
-    base = COOLDOWN_BASE_S
-    if retry_after_s and retry_after_s > 0:
-        base = max(base, retry_after_s)
-
-    if _COOLDOWN_PENALTY_S <= 0:
-        _COOLDOWN_PENALTY_S = base
-    else:
-        _COOLDOWN_PENALTY_S = min(COOLDOWN_MAX_S, max(base, _COOLDOWN_PENALTY_S * 1.5))
-
-    _COOLDOWN_UNTIL_TS = now + _COOLDOWN_PENALTY_S
-    return _COOLDOWN_PENALTY_S
+    if LLM_GLOBAL_QPS <= 0:
+        return
+    min_interval = 1.0 / LLM_GLOBAL_QPS
+    async with _GLOBAL_LOCK:
+        global _GLOBAL_LAST_CALL_TS
+        now = _now()
+        delta = now - _GLOBAL_LAST_CALL_TS
+        if delta < min_interval:
+            await asyncio.sleep(min_interval - delta)
+        _GLOBAL_LAST_CALL_TS = _now()
 
 
-def _reset_cooldown_on_success() -> None:
-    global _COOLDOWN_PENALTY_S
-    # не обнуляем полностью, но уменьшаем, чтобы не дергаться
-    if _COOLDOWN_PENALTY_S > 0:
-        _COOLDOWN_PENALTY_S = max(0.0, _COOLDOWN_PENALTY_S * 0.5)
+async def _per_user_throttle(user_id: int) -> Optional[float]:
+    """
+    Возвращает seconds_to_wait, если надо подождать (или None).
+    """
+    if LLM_PER_USER_MIN_INTERVAL_S <= 0:
+        return None
+    async with _PER_USER_LOCK:
+        last = _PER_USER_LAST_CALL.get(user_id) or 0.0
+        now = _now()
+        delta = now - last
+        if delta < LLM_PER_USER_MIN_INTERVAL_S:
+            return LLM_PER_USER_MIN_INTERVAL_S - delta
+        _PER_USER_LAST_CALL[user_id] = now
+        return None
+
+
+async def _cooldown_left() -> Tuple[float, str]:
+    async with _COOLDOWN_LOCK:
+        left = _COOLDOWN_UNTIL_TS - _wall_now()
+        return (left if left > 0 else 0.0), _COOLDOWN_REASON
+
+
+async def _set_cooldown(seconds: int, reason: str) -> None:
+    sec = max(1, int(seconds))
+    sec = min(sec, LLM_429_COOLDOWN_MAX_S)
+    async with _COOLDOWN_LOCK:
+        global _COOLDOWN_UNTIL_TS, _COOLDOWN_REASON
+        _COOLDOWN_UNTIL_TS = _wall_now() + sec
+        _COOLDOWN_REASON = reason
 
 
 # -----------------------------
@@ -403,7 +401,7 @@ _SYSTEM_PROMPT_UI = """Ты спортивный аналитик.
 
 Запрещено:
 - прогнозы, советы, призывы ставить
-- слова: ставь, ставьте, бери, берите, выгодно, проход, гарантия, фикс
+- слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%
 
 Формат UI:
 1) ui_pre:
@@ -441,7 +439,7 @@ def _make_user_prompt(domain_prompt: str) -> str:
 
 
 # -----------------------------
-# OpenAI call (chat/completions)
+# OpenAI call
 # -----------------------------
 async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
@@ -452,6 +450,7 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
+        # 🔥 Главное: заставляем API вернуть валидный JSON
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -472,20 +471,24 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
         r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
         try:
             r.raise_for_status()
-        except httpx.HTTPStatusError:
-            # логируем детали (особенно для 429)
-            body_text = ""
-            try:
-                body_text = r.text
-            except Exception:
-                pass
-            rate_headers = _extract_rate_headers(r)
-            logger.warning(
-                "OpenAI HTTP error %s. headers=%s body=%s",
-                r.status_code,
-                rate_headers,
-                (body_text[:1200] if body_text else ""),
-            )
+        except httpx.HTTPStatusError as e:
+            # log 429 details nicely
+            if e.response is not None and e.response.status_code == 429:
+                try:
+                    body = e.response.text
+                except Exception:
+                    body = ""
+                h = {k.lower(): v for k, v in (e.response.headers or {}).items()}
+                logger.warning("OpenAI HTTP error 429. headers=%s body=%s", {
+                    "retry-after": h.get("retry-after"),
+                    "x-ratelimit-limit-requests": h.get("x-ratelimit-limit-requests"),
+                    "x-ratelimit-limit-tokens": h.get("x-ratelimit-limit-tokens"),
+                    "x-ratelimit-remaining-requests": h.get("x-ratelimit-remaining-requests"),
+                    "x-ratelimit-remaining-tokens": h.get("x-ratelimit-remaining-tokens"),
+                    "x-ratelimit-reset-requests": h.get("x-ratelimit-reset-requests"),
+                    "x-ratelimit-reset-tokens": h.get("x-ratelimit-reset-tokens"),
+                    "x-request-id": h.get("x-request-id"),
+                }, body[:2000])
             raise
 
         data = r.json()
@@ -494,8 +497,7 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    # json_object обычно уже валиден, но на всякий случай — мягкий парс
-    obj = _try_extract_json_obj(content)
+    obj = json.loads(content)
     if not isinstance(obj, dict):
         raise ValueError("model JSON root is not an object")
     return obj
@@ -504,37 +506,40 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
 # -----------------------------
 # LLM main
 # -----------------------------
-async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tuple[LLMOutput, dict]:
+async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy", user_id: Optional[int] = None) -> Tuple[LLMOutput, dict]:
+    """
+    user_id optional — чтобы включить per-user throttle в телеге.
+    """
     start = time.monotonic()
     attempts = 0
     last_error: Optional[str] = None
-    cooldown_left = _cooldown_left_s()
-    if cooldown_left > 0:
-        # не стучим в OpenAI, сразу fallback
+
+    # Cooldown guard (after 429)
+    left, reason = await _cooldown_left()
+    if left > 0.01:
         meta = {
             "provider": "openai",
             "attempts": 0,
-            "elapsed_ms": 0,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
             "used_fallback": True,
-            "last_error": f"cooldown_http_429:{cooldown_left:.1f}s",
-            "cooldown_left_s": round(cooldown_left, 1),
+            "last_error": f"cooldown_http_429:{left:.1f}s" if reason else f"cooldown:{left:.1f}s",
         }
         if schema == "legacy":
             return fallback_analysis(domain_prompt), meta
         if schema == "ui_live":
             return {
                 "title": "🟢 LIVE-обзор",
-                "context": ["AI временно недоступен (429). Попробуй позже."],
+                "context": ["AI временно недоступен — лимиты OpenAI (429)."],
                 "markets": [],
-                "risks": ["Сработал анти-спам лимит провайдера."],
+                "risks": ["Подожди немного и повтори позже."],
                 "disclaimer": "Аналитический материал, не является рекомендацией.",
             }, meta
         return {
             "title": "📊 Обзор рынков",
-            "summary": "AI временно недоступен (429). Попробуй позже.",
+            "summary": "AI временно недоступен — лимиты OpenAI (429).",
             "key_factors": [],
             "line_logic": [],
-            "risks": ["Сработал анти-спам лимит провайдера."],
+            "risks": ["Подожди немного и повтори позже."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
         }, meta
 
@@ -594,48 +599,62 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "disclaimer": "Аналитический материал, не является рекомендацией.",
         }, meta
 
+    # Per-user throttle (for Telegram)
+    if user_id is not None:
+        wait_s = await _per_user_throttle(int(user_id))
+        if wait_s and wait_s > 0.01:
+            meta = {
+                "provider": "openai",
+                "attempts": 0,
+                "elapsed_ms": int((time.monotonic() - start) * 1000),
+                "used_fallback": True,
+                "last_error": f"throttle_user:{wait_s:.1f}s",
+            }
+            if schema == "legacy":
+                return fallback_analysis(domain_prompt), meta
+            if schema == "ui_live":
+                return {
+                    "title": "🟢 LIVE-обзор",
+                    "context": ["Слишком частые запросы — подожди пару секунд."],
+                    "markets": [],
+                    "risks": ["Telegram-friendly throttle."],
+                    "disclaimer": "Аналитический материал, не является рекомендацией.",
+                }, meta
+            return {
+                "title": "📊 Обзор рынков",
+                "summary": "Слишком частые запросы — подожди пару секунд.",
+                "key_factors": [],
+                "line_logic": [],
+                "risks": ["Telegram-friendly throttle."],
+                "disclaimer": "Аналитический материал, не является рекомендацией.",
+            }, meta
+
     deadline = start + max(0.1, LLM_TOTAL_TIMEOUT_S)
 
-    # один запрос к OpenAI одновременно (и кнопки не должны пробивать лимиты)
-    async with _LLM_SEM:
-        for retry_idx in range(LLM_MAX_RETRIES + 1):
-            attempts += 1
-            remaining = deadline - time.monotonic()
-            if remaining <= 0.05:
-                last_error = "deadline_exceeded"
-                break
+    for retry_idx in range(LLM_MAX_RETRIES + 1):
+        attempts += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            last_error = "deadline_exceeded"
+            break
 
-            attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.5, remaining))
+        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.3, remaining))
 
-            try:
-                system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
-                obj = await _openai_chat_json(domain_prompt, timeout_s=attempt_timeout, system_prompt=system_prompt)
+        try:
+            # Global QPS limit before calling OpenAI
+            await _global_rate_limit_wait()
 
-                # banned words guard
-                if _contains_banned_phrases(obj):
-                    raise ValueError("banned_phrases_in_output")
+            system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
+            obj = await _openai_chat_json(domain_prompt, timeout_s=attempt_timeout, system_prompt=system_prompt)
 
-                if schema == "legacy":
-                    ok, analysis, msg = validate_analysis_json(obj)
-                    if not ok or analysis is None:
-                        raise ValueError(f"schema validation failed: {msg}")
-                    _reset_cooldown_on_success()
-                    return analysis, {
-                        "provider": "openai",
-                        "attempts": attempts,
-                        "elapsed_ms": int((time.monotonic() - start) * 1000),
-                        "used_fallback": False,
-                        "last_error": None,
-                    }
+            if _contains_banned_phrases(obj):
+                raise ValueError("banned_phrases_in_output")
 
-                # UI schemas: normalize then validate
-                obj2 = _normalize_ui_obj(schema, obj)
-                ok, analysis2, msg = validate_ui_json(schema, obj2)
-                if not ok or analysis2 is None:
-                    raise ValueError(f"ui schema validation failed: {msg}")
-
-                _reset_cooldown_on_success()
-                return analysis2, {
+            if schema == "legacy":
+                ok, analysis, msg = validate_analysis_json(obj)
+                if not ok or analysis is None:
+                    raise ValueError(f"schema validation failed: {msg}")
+                return analysis, {
                     "provider": "openai",
                     "attempts": attempts,
                     "elapsed_ms": int((time.monotonic() - start) * 1000),
@@ -643,31 +662,61 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                     "last_error": None,
                 }
 
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                last_error = f"network_timeout: {type(e).__name__}"
-            except httpx.HTTPStatusError as e:
-                code = e.response.status_code
-                rate_headers = _extract_rate_headers(e.response)
-                retry_after_s = _parse_retry_after_seconds(e.response)
+            obj2 = _normalize_ui_obj(schema, obj)
+            ok, analysis2, msg = validate_ui_json(schema, obj2)
+            if not ok or analysis2 is None:
+                raise ValueError(f"ui schema validation failed: {msg}")
 
-                if code == 429:
-                    cd = _bump_cooldown(retry_after_s)
-                    last_error = f"http_429:cooldown_for:{cd:.0f}s headers:{rate_headers}"
+            return analysis2, {
+                "provider": "openai",
+                "attempts": attempts,
+                "elapsed_ms": int((time.monotonic() - start) * 1000),
+                "used_fallback": False,
+                "last_error": None,
+            }
+
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_error = f"network_timeout: {type(e).__name__}"
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 0
+            if code == 429 and e.response is not None:
+                # compute cooldown
+                h = {k.lower(): v for k, v in (e.response.headers or {}).items()}
+                retry_after = _parse_retry_after_seconds(h) or 0.0
+                body_text = ""
+                try:
+                    body_text = e.response.text or ""
+                except Exception:
+                    body_text = ""
+                try_again = _parse_try_again_seconds_from_body(body_text) or 0
+
+                # Prefer "try again in ..." if huge, but cap to MAX_S
+                cooldown = 0
+                if try_again > 0:
+                    cooldown = min(try_again, LLM_429_COOLDOWN_MAX_S)
+                elif retry_after > 0:
+                    cooldown = int(min(retry_after, LLM_429_COOLDOWN_MAX_S))
                 else:
-                    last_error = f"http_{code} headers:{rate_headers}"
+                    cooldown = LLM_429_COOLDOWN_DEFAULT_S
 
-                # на 4xx (кроме ретраимых) — прекращаем
-                if code not in (408, 409, 425, 429, 500, 502, 503, 504):
-                    break
-            except (ValueError, RuntimeError) as e:
-                last_error = f"{type(e).__name__}: {e}"
-            except Exception as e:
-                last_error = f"unexpected: {type(e).__name__}: {e}"
+                await _set_cooldown(cooldown, reason="http_429")
+                last_error = f"http_429:cooldown_for:{cooldown}s headers:{ {k: h.get(k) for k in ('retry-after','x-ratelimit-limit-requests','x-ratelimit-limit-tokens','x-ratelimit-remaining-requests','x-ratelimit-remaining-tokens','x-ratelimit-reset-requests','x-ratelimit-reset-tokens','x-request-id')} }"
+                # no point retrying immediately if 429
+                break
 
-            if retry_idx < LLM_MAX_RETRIES:
-                sleep_s = _sleep_jitter(0.2)
-                if time.monotonic() + sleep_s < deadline:
-                    await asyncio.sleep(sleep_s)
+            last_error = f"http_{code}"
+            # на 4xx (кроме ретраимых) — прекращаем
+            if code not in (408, 409, 425, 429, 500, 502, 503, 504):
+                break
+        except (ValueError, RuntimeError) as e:
+            last_error = f"{type(e).__name__}: {e}"
+        except Exception as e:
+            last_error = f"unexpected: {type(e).__name__}: {e}"
+
+        if retry_idx < LLM_MAX_RETRIES:
+            sleep_s = _sleep_jitter(0.2)
+            if time.monotonic() + sleep_s < deadline:
+                await asyncio.sleep(sleep_s)
 
     # fallback
     if schema == "legacy":
@@ -720,43 +769,12 @@ async def analyze_with_llm_cached(
     cache_key: str,
     ttl_s: Optional[int] = None,
     schema: str = "legacy",
+    user_id: Optional[int] = None,
 ) -> Tuple[LLMOutput, dict]:
     """
     Cached wrapper. cache_key обязателен.
     Хранит (analysis, meta) в памяти процесса.
-    + debounce для телеги
     """
-    # debounce (против спама кнопок на один и тот же cache_key)
-    left = await _debounce(cache_key)
-    if left is not None and left > 0:
-        meta = {
-            "provider": "openai",
-            "attempts": 0,
-            "elapsed_ms": 0,
-            "used_fallback": True,
-            "last_error": f"debounce:{left:.1f}s",
-            "cache": "miss",
-            "debounce_left_s": round(left, 1),
-        }
-        if schema == "legacy":
-            return fallback_analysis(domain_prompt), meta
-        if schema == "ui_live":
-            return {
-                "title": "🟢 LIVE-обзор",
-                "context": ["Слишком часто. Подожди пару секунд и повтори."],
-                "markets": [],
-                "risks": ["Debounce Telegram-кликов."],
-                "disclaimer": "Аналитический материал, не является рекомендацией.",
-            }, meta
-        return {
-            "title": "📊 Обзор рынков",
-            "summary": "Слишком часто. Подожди пару секунд и повтори.",
-            "key_factors": [],
-            "line_logic": [],
-            "risks": ["Debounce Telegram-кликов."],
-            "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }, meta
-
     now = time.time()
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
@@ -772,7 +790,7 @@ async def analyze_with_llm_cached(
             else:
                 _CACHE.pop(cache_key, None)
 
-    analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
+    analysis, meta = await analyze_with_llm(domain_prompt, schema=schema, user_id=user_id)
     meta2 = dict(meta)
     meta2["cache"] = "miss"
 
