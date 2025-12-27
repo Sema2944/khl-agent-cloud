@@ -12,6 +12,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    Message,
 )
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
@@ -100,6 +101,7 @@ def kb_sports() -> InlineKeyboardMarkup:
             buf = []
     if buf:
         rows.append(buf)
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -108,13 +110,13 @@ def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
         for match_id, title in match_buttons
     ]
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:SPORTS")])
+    rows.append([InlineKeyboardButton("⬅️ Назад к видам спорта", callback_data="BACK:SPORTS")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
     """
-    Компактные кнопки, читаемые на iOS/Android.
     Все AI-разборы идут через команду: ui match <id> <mode> <action>
     """
     return InlineKeyboardMarkup(
@@ -130,6 +132,7 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔄 Обновить", callback_data=f"UI:{match_id}:live:refresh"),
             ],
             [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
         ]
     )
 
@@ -139,37 +142,41 @@ async def call_agent_local(user_id: int, message: str) -> str:
     return await run_dialog_agent(user_id=user_id, message=message)
 
 
-async def _safe_send(
-    update_or_query,
+async def _edit_or_send(
+    msg: Message,
     text: str,
     *,
     reply_markup=None,
-    as_edit: bool = False,
+    force_new: bool = False,
 ) -> None:
     """
-    Отправка/редактирование без Markdown (чтобы не ловить BadRequest по entities).
-    Фоллбек: если edit не удался — отправим новым сообщением.
+    Пытаемся редактировать текущий message (единый "экран").
+    Если нельзя/ошибка — отправляем новое.
+    Не используем parse_mode (plain text), чтобы не ловить entities.
     """
-    text = (text or "").strip()
-    if not text:
-        text = "…"
+    text = (text or "").strip() or "…"
+
+    if not force_new:
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup)
+            return
+        except BadRequest as e:
+            # Очень частая ситуация: "Message is not modified"
+            if "message is not modified" in str(e).lower():
+                return
+            logger.warning("edit_text BadRequest -> fallback to send. err=%s", e)
+        except Exception:
+            logger.exception("edit_text failed -> fallback to send")
 
     try:
-        if as_edit and hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.edit_text(text, reply_markup=reply_markup)
-        elif hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.reply_text(text, reply_markup=reply_markup)
-        else:
-            # update.message case
-            await update_or_query.reply_text(text, reply_markup=reply_markup)
-    except BadRequest as e:
-        logger.warning("Telegram BadRequest (entities/UI). Fallback to plain message. err=%s", e)
-        try:
-            # если это был edit — шлём новое сообщение
-            if hasattr(update_or_query, "message") and update_or_query.message:
-                await update_or_query.message.reply_text(text, reply_markup=reply_markup)
-        except Exception:
-            logger.exception("Failed to fallback send after BadRequest")
+        await msg.reply_text(text, reply_markup=reply_markup)
+    except Exception:
+        logger.exception("reply_text failed")
+
+
+async def _send_menu(update: Update) -> None:
+    if update.message:
+        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
 
 
 # -----------------------------
@@ -178,9 +185,22 @@ async def _safe_send(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await _safe_send(
-        update.message,
+    await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
+        reply_markup=MAIN_KB,
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "Как пользоваться:\n"
+        "1) 🏟 Матчи сегодня\n"
+        "2) спорт → матч\n"
+        "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
+        "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
+        "Диагностика: llm ping, env, version, last_error",
         reply_markup=MAIN_KB,
     )
 
@@ -198,38 +218,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Главное меню: Матчи сегодня ---
     if norm == "матчи сегодня":
-        await _safe_send(update.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
+        # присылаем новый "экран" со спортами (inline)
+        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
     # --- Профиль ---
     if norm in {"профиль", "мой профиль", "статы", "статистика"}:
         reply = await call_agent_local(user_id, "профиль")
-        await _safe_send(update.message, reply, reply_markup=MAIN_KB)
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
     # --- Стратегия эксперта ---
     if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
         reply = await call_agent_local(user_id, "стратегия")
-        await _safe_send(update.message, reply, reply_markup=MAIN_KB)
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
     # --- AI аналитика (help) ---
     if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
-        await _safe_send(
-            update.message,
-            "Как пользоваться:\n"
-            "1) 🏟 Матчи сегодня\n"
-            "2) спорт → матч\n"
-            "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
-            "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
-            "Диагностика: llm ping, env, version, last_error",
-            reply_markup=MAIN_KB,
-        )
+        await help_cmd(update, context)
         return
 
     # --- Остальное: в агента ---
     reply = await call_agent_local(user_id, text)
-    await _safe_send(update.message, reply, reply_markup=MAIN_KB)
+    await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -244,66 +256,79 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("tg.callback user_id=%s data=%r", user_id, data)
     await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
 
+    # Унифицируем: всё рисуем редактированием query.message (единый экран)
+    screen_msg: Message = query.message
+
+    # BACK -> MENU
+    if data == "BACK:MENU":
+        await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
+        return
+
     # BACK -> SPORTS
     if data == "BACK:SPORTS":
-        await _safe_send(query, "🏟 Выбери спорт:", reply_markup=kb_sports(), as_edit=True)
+        await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
     # BACK -> MATCHES
     if data == "BACK:MATCHES":
-        match_buttons = context.user_data.get("last_match_buttons") or []
-        if match_buttons:
-            await _safe_send(query, "Выбери матч:", reply_markup=kb_matches(match_buttons), as_edit=True)
+        last_text = context.user_data.get("last_matches_text")
+        last_buttons = context.user_data.get("last_match_buttons") or []
+        last_sport_key = context.user_data.get("last_sport_key")
+
+        # если текста нет — пробуем восстановить из sport_key
+        if not last_text and last_sport_key:
+            last_text = await call_agent_local(user_id, f"матчи сегодня {last_sport_key}")
+            context.user_data["last_matches_text"] = last_text
+            last_buttons = extract_match_buttons(last_text)
+            context.user_data["last_match_buttons"] = last_buttons
+
+        if last_text and last_buttons:
+            await _edit_or_send(screen_msg, last_text, reply_markup=kb_matches(last_buttons))
         else:
-            await _safe_send(query, "🏟 Выбери спорт:", reply_markup=kb_sports(), as_edit=True)
+            await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # SPORT -> список матчей
+    # SPORT -> список матчей (в ЭТОМ ЖЕ экране)
     if data.startswith("SPORT:"):
-        sport_key = data.split(":", 1)[1]
-        reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
+        sport_key = data.split(":", 1)[1].strip()
+        context.user_data["last_sport_key"] = sport_key
 
+        reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
         match_buttons = extract_match_buttons(reply)
+
+        context.user_data["last_matches_text"] = reply
         context.user_data["last_match_buttons"] = match_buttons
 
-        # редактируем текущее сообщение (чтобы не спамить “меню ниже”)
         if match_buttons:
-            await _safe_send(query, reply, as_edit=True)
-            await _safe_send(query.message, "Выбери матч:", reply_markup=kb_matches(match_buttons))
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_matches(match_buttons))
         else:
-            await _safe_send(query, reply, as_edit=True)
-            await _safe_send(query.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
         return
 
-    # MATCH -> экран матча + хаб кнопок
+    # MATCH -> экран матча + хаб кнопок (в ЭТОМ ЖЕ экране)
     if data.startswith("MATCH:"):
-        match_id = data.split(":", 1)[1]
+        match_id = data.split(":", 1)[1].strip()
+        context.user_data["active_match_id"] = match_id
+
         reply = await call_agent_local(user_id, f"матч {match_id}")
-
-        # 1) редактируем текущую карточку списка матчей на карточку матча
-        await _safe_send(query, reply, as_edit=True)
-
-        # 2) отдельно отправляем кнопки действий
-        await _safe_send(query.message, "Выбери действие:", reply_markup=kb_match_hub(match_id))
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    # UI actions -> ui match <id> <mode> <action>
+    # UI actions -> ui match <id> <mode> <action> (в ЭТОМ ЖЕ экране)
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
-            await _safe_send(query.message, "Некорректная команда UI.", reply_markup=MAIN_KB)
+            await _edit_or_send(screen_msg, "Некорректная команда UI.", reply_markup=MAIN_KB)
             return
 
         _, match_id, mode, action = parts
+        context.user_data["active_match_id"] = match_id
 
-        # ВАЖНО: иногда OpenAI/рендер фейлит — мы всё равно покажем текст (без Markdown)
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
-
-        # редактируем последнее “Выбери действие” или матч-карточку — не важно: Telegram решит по message
-        await _safe_send(query, reply, reply_markup=kb_match_hub(match_id), as_edit=True)
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    await _safe_send(query.message, "Не понял действие 🤔", reply_markup=MAIN_KB)
+    await _edit_or_send(screen_msg, "Не понял действие 🤔", reply_markup=MAIN_KB)
 
 
 # -----------------------------
@@ -319,6 +344,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_telegram_application() -> Application:
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     tg_app.add_error_handler(error_handler)
