@@ -42,7 +42,7 @@ if not BOT_TOKEN:
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["🏟 Матчи сегодня"],
-        ["🧠 AI Аналитика", "👤 Стратегия эксперта на сегодня"],
+        ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
         ["📊 Профиль"],
     ],
     resize_keyboard=True,
@@ -50,7 +50,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 # -----------------------------
-# Inline keyboards
+# Inline клавиатуры
 # -----------------------------
 SPORTS = [
     ("hockey", "🏒 Хоккей"),
@@ -60,57 +60,19 @@ SPORTS = [
     ("esports", "🎮 Киберспорт"),
 ]
 
-
-def kb_sports() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    buf: list[InlineKeyboardButton] = []
-    for key, label in SPORTS:
-        buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
-        if len(buf) == 2:
-            rows.append(buf)
-            buf = []
-    if buf:
-        rows.append(buf)
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
-        for match_id, title in match_buttons
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Назад к спорту", callback_data="BACK:SPORTS")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Ключевая клавиатура внутри матча (PRE + LIVE).
-    """
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📊 Обзор рынков (PREMATCH)", callback_data=f"UI:{match_id}:pre:overview")],
-            [
-                InlineKeyboardButton("🧠 Подробнее про 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
-                InlineKeyboardButton("🧠 Подробнее про Total", callback_data=f"UI:{match_id}:pre:total"),
-            ],
-            [InlineKeyboardButton("🧠 Подробнее про Фору", callback_data=f"UI:{match_id}:pre:handicap")],
-            [
-                InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{match_id}:live:overview"),
-                InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{match_id}:live:refresh"),
-            ],
-            [InlineKeyboardButton("⬅️ Назад к списку матчей", callback_data="BACK:SPORTS")],
-        ]
-    )
-
+# --- helpers
+def _norm_menu(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 # -----------------------------
-# Парсинг match_id из текста backend
+# Парсинг матчей из текста backend
 # Ожидаем:
 # • СКА — ЦСКА (КХЛ) — id: `demo_hockey_001`
 # -----------------------------
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
-
 
 def extract_match_buttons(text: str) -> list[tuple[str, str]]:
     buttons: list[tuple[str, str]] = []
@@ -125,13 +87,49 @@ def extract_match_buttons(text: str) -> list[tuple[str, str]]:
             buttons.append((match_id, title))
     return buttons
 
+# -----------------------------
+# Keyboards
+# -----------------------------
+def kb_sports() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    buf: list[InlineKeyboardButton] = []
+    for key, label in SPORTS:
+        buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
+    return InlineKeyboardMarkup(rows)
 
-def _norm_menu(text: str) -> str:
-    t = (text or "").strip().lower()
-    t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
+        for match_id, title in match_buttons
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:SPORTS")])
+    return InlineKeyboardMarkup(rows)
 
+def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
+    """
+    Компактные кнопки, читаемые на iOS/Android.
+    Все AI-разборы идут через команду: ui match <id> <mode> <action>
+    """
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
+            [
+                InlineKeyboardButton("🧠 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
+                InlineKeyboardButton("🧠 Тотал", callback_data=f"UI:{match_id}:pre:total"),
+            ],
+            [InlineKeyboardButton("🧠 Фора", callback_data=f"UI:{match_id}:pre:handicap")],
+            [
+                InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{match_id}:live:overview"),
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"UI:{match_id}:live:refresh"),
+            ],
+            [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
+        ]
+    )
 
 # -----------------------------
 # Локальный вызов агента (без HTTP)
@@ -139,7 +137,6 @@ def _norm_menu(text: str) -> str:
 async def call_agent_local(user_id: int, message: str) -> str:
     from ..parsing import run_dialog_agent
     return await run_dialog_agent(user_id=user_id, message=message)
-
 
 # -----------------------------
 # Handlers
@@ -152,7 +149,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=MAIN_KB,
     )
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -164,45 +160,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # Главное меню: Матчи сегодня
+    # --- Главное меню: Матчи сегодня ---
     if norm in {"матчи сегодня"}:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # Главное меню: Стратегия эксперта
-    if norm in {"стратегия эксперта на сегодня", "стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
-        reply = await call_agent_local(user_id, "стратегия")
-        await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
-        return
-
-    # Главное меню: Профиль
-    if "профиль" in norm:
+    # --- Профиль ---
+    if norm in {"профиль", "мой профиль", "статы", "статистика"}:
         reply = await call_agent_local(user_id, "профиль")
         await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
         return
 
-    # Главное меню: AI аналитика
+    # --- Стратегия эксперта ---
+    if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
+        reply = await call_agent_local(user_id, "стратегия")
+        await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
+        return
+
+    # --- AI аналитика (как пользоваться) ---
     if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
         await update.message.reply_text(
             "Как пользоваться:\n"
-            "1) нажми *🏟 Матчи сегодня*\n"
-            "2) выбери спорт → матч\n"
-            "3) внутри матча нажми *📊 Обзор рынков* или *Подробнее*\n"
-            "4) для LIVE нажми *🟢 LIVE-обзор*\n\n"
-            "Диагностика:\n"
-            "• `llm ping`\n"
-            "• `env`\n"
-            "• `version`",
+            "1) 🏟 *Матчи сегодня*\n"
+            "2) спорт → матч\n"
+            "3) в матче нажми: *📊 Обзор* или *🧠 1X2/Тотал/Фора*\n"
+            "4) LIVE: *🟢 LIVE* или *🔄 Обновить*\n\n"
+            "Диагностика: `llm ping`, `env`, `version`",
             reply_markup=MAIN_KB,
             parse_mode="Markdown",
         )
         return
 
-    # Остальное: проброс в агента
+    # --- Остальное: в агента ---
     reply = await call_agent_local(user_id, text)
     await update.message.reply_text(reply, reply_markup=MAIN_KB, parse_mode="Markdown")
-
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -214,10 +206,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     logger.info("tg.callback user_id=%s data=%r", user_id, data)
+    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
 
-    # BACK
+    # BACK -> SPORTS
     if data == "BACK:SPORTS":
         await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
+        return
+
+    # BACK -> MATCHES (по последнему выбранному спорту)
+    if data == "BACK:MATCHES":
+        match_buttons = context.user_data.get("last_match_buttons") or []
+        if match_buttons:
+            await query.message.reply_text("Выбери матч:", reply_markup=kb_matches(match_buttons))
+        else:
+            await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
@@ -227,6 +230,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
 
         match_buttons = extract_match_buttons(reply)
+        context.user_data["last_match_buttons"] = match_buttons
+
         await query.message.reply_text(reply, parse_mode="Markdown")
 
         if not match_buttons:
@@ -238,22 +243,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # MATCH -> экран матча + HUB кнопки
+    # MATCH -> экран матча + хаб кнопок
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1]
         reply = await call_agent_local(user_id, f"матч {match_id}")
+
         await query.message.reply_text(reply, parse_mode="Markdown")
-        await query.message.reply_text("Действия по матчу:", reply_markup=kb_match_hub(match_id))
+        await query.message.reply_text("Ещё действия:", reply_markup=kb_match_hub(match_id))
         await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # UI actions (PRE/LIVE)
-    # UI:<match_id>:<mode>:<action>
+    # UI actions -> ui match <id> <mode> <action>
     if data.startswith("UI:"):
-        _, match_id, mode, action = data.split(":", 3)
-        # команда в parsing.py:
-        # ui match <match_id> <mode> <action>
+        # UI:<match_id>:<mode>:<action>
+        parts = data.split(":")
+        if len(parts) != 4:
+            await query.message.reply_text("Некорректная команда UI.", reply_markup=MAIN_KB)
+            return
+
+        _, match_id, mode, action = parts
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
+
         await query.message.reply_text(reply, parse_mode="Markdown")
         await query.message.reply_text("Ещё действия:", reply_markup=kb_match_hub(match_id))
         await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
@@ -261,7 +271,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await query.message.reply_text("Не понял действие 🤔", reply_markup=MAIN_KB)
 
-
+# -----------------------------
+# Application factory
+# -----------------------------
 def build_telegram_application() -> Application:
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
@@ -269,7 +281,9 @@ def build_telegram_application() -> Application:
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return tg_app
 
-
+# -----------------------------
+# FastAPI mount (webhook-only)
+# -----------------------------
 def mount(fastapi_app: FastAPI) -> None:
     """
     Регистрирует /telegram/webhook и lifecycle-хуки.
