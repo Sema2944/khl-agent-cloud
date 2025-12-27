@@ -1,4 +1,3 @@
-# src/llm_client.py
 from __future__ import annotations
 
 import asyncio
@@ -103,12 +102,15 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
 
 def _try_extract_json_obj(content: str) -> Dict[str, Any]:
     """
-    Мягкий парсер: если модель обернула JSON текстом — вытаскиваем { ... }.
+    Мягкий парсер:
+    - сначала пробуем json.loads как есть
+    - если не вышло, вытаскиваем подстроку { ... }
     """
     s = (content or "").strip()
     if not s:
         raise ValueError("empty content")
 
+    # 1) try full
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
@@ -116,6 +118,7 @@ def _try_extract_json_obj(content: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # 2) try extract { ... }
     start = s.find("{")
     end = s.rfind("}")
     if start >= 0 and end > start:
@@ -342,7 +345,6 @@ _SYSTEM_PROMPT_UI = """Ты спортивный аналитик.
 """
 
 
-
 def _make_user_prompt(domain_prompt: str) -> str:
     return (
         "Задача: дай осторожный аналитический разбор, без прямых призывов ставить.\n"
@@ -362,13 +364,14 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
-        # 🔥 Главное: заставляем API вернуть валидный JSON
+        # заставляем вернуть JSON объект
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        "max_tokens": 220,
+        # 220 иногда режет JSON -> даём запас
+        "max_tokens": 420,
     }
 
     timeout = httpx.Timeout(
@@ -388,11 +391,8 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    # при response_format=json_object здесь всегда должен быть валидный JSON
-    obj = json.loads(content)
-    if not isinstance(obj, dict):
-        raise ValueError("model JSON root is not an object")
-    return obj
+    # На практике даже при response_format иногда приходит мусор -> парсим мягко
+    return _try_extract_json_obj(content)
 
 
 def _sleep_jitter(base: float) -> float:
@@ -493,7 +493,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                     "last_error": None,
                 }
 
-            # UI schemas: normalize then validate
+            # UI: normalize -> validate
             obj2 = _normalize_ui_obj(schema, obj)
             ok, analysis2, msg = validate_ui_json(schema, obj2)
             if not ok or analysis2 is None:
@@ -512,7 +512,6 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
         except httpx.HTTPStatusError as e:
             code = e.response.status_code
             last_error = f"http_{code}"
-            # на 4xx (кроме ретраимых) — прекращаем
             if code not in (408, 409, 425, 429, 500, 502, 503, 504):
                 break
         except (ValueError, RuntimeError) as e:
@@ -577,10 +576,6 @@ async def analyze_with_llm_cached(
     ttl_s: Optional[int] = None,
     schema: str = "legacy",
 ) -> Tuple[LLMOutput, dict]:
-    """
-    Cached wrapper. cache_key обязателен.
-    Хранит (analysis, meta) в памяти процесса.
-    """
     now = time.time()
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
@@ -593,8 +588,7 @@ async def analyze_with_llm_cached(
                 meta2 = dict(meta)
                 meta2["cache"] = "hit"
                 return analysis, meta2
-            else:
-                _CACHE.pop(cache_key, None)
+            _CACHE.pop(cache_key, None)
 
     analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
     meta2 = dict(meta)
