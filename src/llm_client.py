@@ -330,23 +330,25 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
+        # 🔥 Главное: заставляем API вернуть валидный JSON
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        # меньше токенов = быстрее ответ
         "max_tokens": 220,
     }
 
     timeout = httpx.Timeout(
         timeout_s,
-        connect=min(5.0, timeout_s),
+        connect=min(8.0, timeout_s),
         read=timeout_s,
-        write=min(5.0, timeout_s),
-        pool=min(5.0, timeout_s),
+        write=min(8.0, timeout_s),
+        pool=min(8.0, timeout_s),
     )
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -358,7 +360,11 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    return _try_extract_json_obj(content)
+    # при response_format=json_object здесь всегда должен быть валидный JSON
+    obj = json.loads(content)
+    if not isinstance(obj, dict):
+        raise ValueError("model JSON root is not an object")
+    return obj
 
 
 def _sleep_jitter(base: float) -> float:
