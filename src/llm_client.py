@@ -1,3 +1,4 @@
+# src/llm_client.py
 from __future__ import annotations
 
 import asyncio
@@ -23,9 +24,10 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "8.0").strip())
-LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "6.0").strip())
-LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "0").strip())
+# Больше времени по дефолту (у тебя уже было)
+LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "18.0").strip())
+LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "8.0").strip())
+LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "2").strip())
 
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 
@@ -98,35 +100,6 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
                 out.append(s)
         return out[:max_len]
     return []
-
-
-def _try_extract_json_obj(content: str) -> Dict[str, Any]:
-    """
-    Мягкий парсер:
-    - сначала пробуем json.loads как есть
-    - если не вышло, вытаскиваем подстроку { ... }
-    """
-    s = (content or "").strip()
-    if not s:
-        raise ValueError("empty content")
-
-    # 1) try full
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-
-    # 2) try extract { ... }
-    start = s.find("{")
-    end = s.rfind("}")
-    if start >= 0 and end > start:
-        obj = json.loads(s[start:end + 1])
-        if isinstance(obj, dict):
-            return obj
-
-    raise ValueError("invalid JSON from model")
 
 
 def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
@@ -364,14 +337,13 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
-        # заставляем вернуть JSON объект
+        # 🔥 Главное: заставляем API вернуть валидный JSON
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        # 220 иногда режет JSON -> даём запас
-        "max_tokens": 420,
+        "max_tokens": 280,
     }
 
     timeout = httpx.Timeout(
@@ -391,12 +363,35 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    # На практике даже при response_format иногда приходит мусор -> парсим мягко
-    return _try_extract_json_obj(content)
+    # при response_format=json_object здесь всегда должен быть валидный JSON
+    obj = json.loads(content)
+    if not isinstance(obj, dict):
+        raise ValueError("model JSON root is not an object")
+    return obj
 
 
 def _sleep_jitter(base: float) -> float:
     return base + random.random() * 0.12
+
+
+def _retry_sleep_seconds_for_http_429(resp: httpx.Response, *, attempt_idx: int) -> float:
+    """
+    Умный backoff для 429:
+    - уважает Retry-After (если есть)
+    - иначе экспонента + джиттер
+    """
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            s = float(ra)
+        except Exception:
+            s = 1.0
+    else:
+        # 0: ~0.8s, 1: ~1.3s, 2: ~2.0s ...
+        s = 0.8 * (1.6 ** max(0, attempt_idx))
+
+    s = min(4.0, s + random.random() * 0.35)
+    return s
 
 
 # -----------------------------
@@ -472,7 +467,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             last_error = "deadline_exceeded"
             break
 
-        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.3, remaining))
+        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.5, remaining))
 
         try:
             system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
@@ -493,7 +488,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                     "last_error": None,
                 }
 
-            # UI: normalize -> validate
+            # UI schemas: normalize then validate
             obj2 = _normalize_ui_obj(schema, obj)
             ok, analysis2, msg = validate_ui_json(schema, obj2)
             if not ok or analysis2 is None:
@@ -509,18 +504,30 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
 
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_error = f"network_timeout: {type(e).__name__}"
+
         except httpx.HTTPStatusError as e:
             code = e.response.status_code
             last_error = f"http_{code}"
+
+            # ✅ 429: умный backoff + ретрай
+            if code == 429 and retry_idx < LLM_MAX_RETRIES:
+                sleep_s = _retry_sleep_seconds_for_http_429(e.response, attempt_idx=retry_idx)
+                if time.monotonic() + sleep_s < deadline:
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+            # на 4xx (кроме ретраимых) — прекращаем
             if code not in (408, 409, 425, 429, 500, 502, 503, 504):
                 break
+
         except (ValueError, RuntimeError) as e:
             last_error = f"{type(e).__name__}: {e}"
         except Exception as e:
             last_error = f"unexpected: {type(e).__name__}: {e}"
 
+        # обычный короткий джиттер между попытками (кроме 429 — он уже обработан выше)
         if retry_idx < LLM_MAX_RETRIES:
-            sleep_s = _sleep_jitter(0.15)
+            sleep_s = _sleep_jitter(0.18)
             if time.monotonic() + sleep_s < deadline:
                 await asyncio.sleep(sleep_s)
 
@@ -576,6 +583,10 @@ async def analyze_with_llm_cached(
     ttl_s: Optional[int] = None,
     schema: str = "legacy",
 ) -> Tuple[LLMOutput, dict]:
+    """
+    Cached wrapper. cache_key обязателен.
+    Хранит (analysis, meta) в памяти процесса.
+    """
     now = time.time()
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
@@ -588,7 +599,8 @@ async def analyze_with_llm_cached(
                 meta2 = dict(meta)
                 meta2["cache"] = "hit"
                 return analysis, meta2
-            _CACHE.pop(cache_key, None)
+            else:
+                _CACHE.pop(cache_key, None)
 
     analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
     meta2 = dict(meta)
