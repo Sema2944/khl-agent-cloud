@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import (
@@ -13,8 +13,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -26,20 +25,29 @@ from telegram.ext import (
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------
+# =========================================================
 # ENV
-# -----------------------------
+# =========================================================
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
-WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()  # optional
+WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-# -----------------------------
-# Главное меню
-# -----------------------------
+# =========================================================
+# SAFE TEXT (убираем Markdown-краши)
+# =========================================================
+def safe_text(text: str) -> str:
+    if not text:
+        return ""
+    # Telegram часто падает из-за `_ * [ ] ( )`
+    return re.sub(r"([_*[\]()~`>#+=|{}.!])", r"\\\1", text)
+
+# =========================================================
+# MAIN MENU
+# =========================================================
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["🏟 Матчи сегодня"],
@@ -47,12 +55,11 @@ MAIN_KB = ReplyKeyboardMarkup(
         ["📊 Профиль"],
     ],
     resize_keyboard=True,
-    one_time_keyboard=False,
 )
 
-# -----------------------------
-# Inline клавиатуры
-# -----------------------------
+# =========================================================
+# SPORTS
+# =========================================================
 SPORTS = [
     ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
@@ -61,85 +68,29 @@ SPORTS = [
     ("esports", "🎮 Киберспорт"),
 ]
 
-# --- helpers
-def _norm_menu(text: str) -> str:
-    t = (text or "").strip().lower()
-    t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# =========================================================
+# HELPERS
+# =========================================================
+ID_RE = re.compile(r"id:\s*([a-zA-Z0-9_\-:.]{4,120})", re.IGNORECASE)
 
-
-# -----------------------------
-# SAFETY: no Markdown/HTML, safe send/edit
-# -----------------------------
-def _tg_safe_text(s: str) -> str:
-    # максимально безопасно для Telegram: без markdown/html, без нулевых байт
-    s = (s or "").replace("\u0000", "")
-    return s.strip()
-
-
-def _split_chunks(s: str, chunk: int = 3900) -> list[str]:
-    s = s or ""
-    if len(s) <= chunk:
-        return [s]
-    return [s[i : i + chunk] for i in range(0, len(s), chunk)]
-
-
-async def _safe_reply(message, text: str, reply_markup=None) -> None:
-    text = _tg_safe_text(text)
-    for ch in _split_chunks(text):
-        await message.reply_text(ch, reply_markup=reply_markup)
-
-
-async def _safe_edit_or_reply(message, text: str, reply_markup=None) -> None:
-    """
-    Пытаемся edit_text (если это сообщение от бота).
-    Если Telegram ругнётся (entities/длина/что угодно) — отправим новым сообщением.
-    """
-    text = _tg_safe_text(text)
-    # Telegram лимит 4096, но лучше не упираться
-    chunks = _split_chunks(text)
-    # edit умеет только 1 текст, поэтому:
-    first = chunks[0] if chunks else ""
-    try:
-        await message.edit_text(first, reply_markup=reply_markup)
-    except BadRequest as e:
-        logger.warning("edit_text failed (%s) -> fallback to reply_text", e)
-        await message.reply_text(first, reply_markup=reply_markup)
-
-    # остаток докидываем reply_text
-    for ch in chunks[1:]:
-        await message.reply_text(ch, reply_markup=reply_markup)
-
-
-# -----------------------------
-# Парсинг матчей из текста backend
-# Ожидаем:
-# • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
-# -----------------------------
-ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
-
-
-def extract_match_buttons(text: str) -> list[tuple[str, str]]:
-    buttons: list[tuple[str, str]] = []
+def extract_match_buttons(text: str) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
     for line in (text or "").splitlines():
         m = ID_RE.search(line)
         if not m:
             continue
-        match_id = m.group(1).strip()
-        title = re.sub(r"\s*—\s*id:\s*`?.+`?\s*$", "", line).strip()
-        title = title.lstrip("•").strip()
-        if match_id and title:
-            buttons.append((match_id, title))
-    return buttons
+        match_id = m.group(1)
+        title = re.sub(r"\s*—\s*id:.*$", "", line).lstrip("•").strip()
+        if title and match_id:
+            out.append((match_id, title))
+    return out
 
-
-# -----------------------------
-# Keyboards
-# -----------------------------
+# =========================================================
+# INLINE KEYBOARDS
+# =========================================================
 def kb_sports() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    buf: list[InlineKeyboardButton] = []
+    rows = []
+    buf = []
     for key, label in SPORTS:
         buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
         if len(buf) == 2:
@@ -149,21 +100,13 @@ def kb_sports() -> InlineKeyboardMarkup:
         rows.append(buf)
     return InlineKeyboardMarkup(rows)
 
-
-def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
-        for match_id, title in match_buttons
-    ]
+def kb_matches(items: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(title, callback_data=f"MATCH:{mid}")]
+            for mid, title in items]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:SPORTS")])
     return InlineKeyboardMarkup(rows)
 
-
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Компактные кнопки, читаемые на iOS/Android.
-    Все AI-разборы идут через команду: ui match <id> <mode> <action>
-    """
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
@@ -180,27 +123,23 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
-
-# -----------------------------
-# Локальный вызов агента (без HTTP)
-# -----------------------------
+# =========================================================
+# LOCAL AGENT
+# =========================================================
 async def call_agent_local(user_id: int, message: str) -> str:
     from ..parsing import run_dialog_agent
     return await run_dialog_agent(user_id=user_id, message=message)
 
-
-# -----------------------------
-# Handlers
-# -----------------------------
+# =========================================================
+# HANDLERS
+# =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    await _safe_reply(
-        update.message,
+    await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
         reply_markup=MAIN_KB,
     )
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
@@ -208,159 +147,119 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     text = update.message.text or ""
-    norm = _norm_menu(text)
+    norm = text.lower().strip()
 
-    logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # --- Главное меню: Матчи сегодня ---
-    if norm in {"матчи сегодня"}:
-        await _safe_reply(update.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
-        await _safe_reply(update.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+    # --- Матчи сегодня ---
+    if norm == "🏟 матчи сегодня" or norm == "матчи сегодня":
+        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
     # --- Профиль ---
-    if norm in {"профиль", "мой профиль", "статы", "статистика"}:
+    if "профиль" in norm:
         reply = await call_agent_local(user_id, "профиль")
-        await _safe_reply(update.message, reply, reply_markup=MAIN_KB)
+        await update.message.reply_text(safe_text(reply), reply_markup=MAIN_KB)
         return
 
-    # --- Стратегия эксперта ---
-    if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
+    # --- Стратегия ---
+    if "стратегия" in norm or "эксперт" in norm:
         reply = await call_agent_local(user_id, "стратегия")
-        await _safe_reply(update.message, reply, reply_markup=MAIN_KB)
+        await update.message.reply_text(safe_text(reply), reply_markup=MAIN_KB)
         return
 
-    # --- AI аналитика (как пользоваться) ---
-    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
-        await _safe_reply(
-            update.message,
-            (
-                "Как пользоваться:\n"
-                "1) 🏟 Матчи сегодня\n"
-                "2) спорт → матч\n"
-                "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
-                "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
-                "Диагностика: llm ping, env, version, last_error"
-            ),
+    # --- AI help ---
+    if "ai" in norm or "аналитика" in norm:
+        await update.message.reply_text(
+            "Как пользоваться:\n"
+            "1) 🏟 Матчи сегодня\n"
+            "2) спорт → матч\n"
+            "3) 📊 Обзор / 🧠 рынки\n"
+            "4) 🟢 LIVE\n\n"
+            "Диагностика: llm ping / env / version",
             reply_markup=MAIN_KB,
         )
         return
 
-    # --- Остальное: в агента ---
+    # --- default ---
     reply = await call_agent_local(user_id, text)
-    await _safe_reply(update.message, reply, reply_markup=MAIN_KB)
-
+    await update.message.reply_text(safe_text(reply), reply_markup=MAIN_KB)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not query or not query.message:
+    if not query:
         return
 
-    data = query.data or ""
+    await query.answer()
     user_id = query.from_user.id
+    data = query.data or ""
 
-    # обязательно отвечаем на callback (чтобы не крутилось)
-    try:
-        await query.answer()
-    except Exception:
-        pass
-
-    logger.info("tg.callback user_id=%s data=%r", user_id, data)
-    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
+    await context.bot.send_chat_action(query.message.chat_id, ChatAction.TYPING)
 
     # BACK -> SPORTS
     if data == "BACK:SPORTS":
-        await _safe_edit_or_reply(query.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
-        await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+        await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # BACK -> MATCHES (по последнему выбранному спорту)
+    # BACK -> MATCHES
     if data == "BACK:MATCHES":
-        match_buttons = context.user_data.get("last_match_buttons") or []
-        if match_buttons:
-            await _safe_edit_or_reply(query.message, "Выбери матч:", reply_markup=kb_matches(match_buttons))
+        items = context.user_data.get("last_match_buttons") or []
+        if items:
+            await query.message.reply_text("Выбери матч:", reply_markup=kb_matches(items))
         else:
-            await _safe_edit_or_reply(query.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
-        await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+            await query.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # SPORT -> список матчей
+    # SPORT
     if data.startswith("SPORT:"):
-        sport_key = data.split(":", 1)[1]
-        reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
+        sport = data.split(":", 1)[1]
+        reply = await call_agent_local(user_id, f"матчи сегодня {sport}")
+        items = extract_match_buttons(reply)
+        context.user_data["last_match_buttons"] = items
 
-        match_buttons = extract_match_buttons(reply)
-        context.user_data["last_match_buttons"] = match_buttons
-
-        # редактируем текущее сообщение (если возможно), иначе просто reply
-        await _safe_edit_or_reply(query.message, reply)
-
-        if not match_buttons:
-            await _safe_reply(query.message, "🏟 Выбери спорт:", reply_markup=kb_sports())
-            await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
-            return
-
-        await _safe_reply(query.message, "Выбери матч:", reply_markup=kb_matches(match_buttons))
-        await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+        await query.message.reply_text(safe_text(reply))
+        if items:
+            await query.message.reply_text("Выбери матч:", reply_markup=kb_matches(items))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # MATCH -> экран матча + хаб кнопок
+    # MATCH
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1]
         reply = await call_agent_local(user_id, f"матч {match_id}")
-
-        await _safe_edit_or_reply(query.message, reply)
-        await _safe_reply(query.message, "Ещё действия:", reply_markup=kb_match_hub(match_id))
-        await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+        await query.message.reply_text(safe_text(reply))
+        await query.message.reply_text("Действия:", reply_markup=kb_match_hub(match_id))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    # UI actions -> ui match <id> <mode> <action>
+    # UI
     if data.startswith("UI:"):
-        parts = data.split(":")
-        if len(parts) != 4:
-            await _safe_reply(query.message, "Некорректная команда UI.", reply_markup=MAIN_KB)
-            return
-
-        _, match_id, mode, action = parts
+        _, match_id, mode, action = data.split(":")
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
-
-        # самый частый источник 400 BadRequest был тут из-за Markdown — теперь просто plain text
-        await _safe_edit_or_reply(query.message, reply, reply_markup=kb_match_hub(match_id))
-        await _safe_reply(query.message, "Меню ниже 👇", reply_markup=MAIN_KB)
+        await query.message.reply_text(safe_text(reply))
+        await query.message.reply_text("Действия:", reply_markup=kb_match_hub(match_id))
+        await query.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
         return
 
-    await _safe_reply(query.message, "Не понял действие 🤔", reply_markup=MAIN_KB)
+    await query.message.reply_text("Не понял действие 🤔", reply_markup=MAIN_KB)
 
-
-# -----------------------------
-# Error handler (чтобы не “молчало”)
-# -----------------------------
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Telegram handler error: %s", context.error)
-
-
-# -----------------------------
-# Application factory
-# -----------------------------
+# =========================================================
+# APPLICATION
+# =========================================================
 def build_telegram_application() -> Application:
-    tg_app = Application.builder().token(BOT_TOKEN).build()
-    tg_app.add_error_handler(on_error)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    return app
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CallbackQueryHandler(handle_callback))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    return tg_app
-
-
-# -----------------------------
-# FastAPI mount (webhook-only)
-# -----------------------------
+# =========================================================
+# FASTAPI WEBHOOK
+# =========================================================
 def mount(fastapi_app: FastAPI) -> None:
-    """
-    Регистрирует /telegram/webhook и lifecycle-хуки.
-    НИКАКОГО polling.
-    """
     tg_app = build_telegram_application()
     fastapi_app.state.telegram_app = tg_app
 
@@ -368,26 +267,16 @@ def mount(fastapi_app: FastAPI) -> None:
         await tg_app.initialize()
         await tg_app.start()
 
-        if not PUBLIC_URL:
-            logger.warning("PUBLIC_URL is not set -> webhook will NOT be configured automatically.")
-            return
-
-        webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-        try:
+        if PUBLIC_URL:
             await tg_app.bot.set_webhook(
-                url=webhook_url,
+                url=f"{PUBLIC_URL}{WEBHOOK_PATH}",
                 secret_token=WEBHOOK_SECRET or None,
                 drop_pending_updates=True,
             )
-            logger.info("Telegram webhook set: %s", webhook_url)
-        except Exception as e:
-            logger.exception("Failed to set telegram webhook: %s", e)
 
     async def _shutdown() -> None:
-        try:
-            await tg_app.stop()
-        finally:
-            await tg_app.shutdown()
+        await tg_app.stop()
+        await tg_app.shutdown()
 
     fastapi_app.add_event_handler("startup", _startup)
     fastapi_app.add_event_handler("shutdown", _shutdown)
@@ -395,8 +284,7 @@ def mount(fastapi_app: FastAPI) -> None:
     @fastapi_app.post(WEBHOOK_PATH)
     async def telegram_webhook(request: Request) -> dict[str, Any]:
         if WEBHOOK_SECRET:
-            got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if got != WEBHOOK_SECRET:
+            if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         payload = await request.json()
