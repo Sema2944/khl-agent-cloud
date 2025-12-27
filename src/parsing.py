@@ -549,29 +549,79 @@ async def _llm_ping() -> str:
 # ОСНОВНАЯ ЛОГИКА АГЕНТА
 # ------------------------------------------------------------
 async def run_dialog_agent(user_id: int, message: str) -> str:
-    text_raw = message or ""
+    text_raw = (message or "").strip()
     norm = text_raw.lower().strip()
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
 
-    # diagnostics
+    # -----------------------------
+    # Diagnostics
+    # -----------------------------
     if norm == "version":
         return "✅ parsing.py version: 2025-12-27 v5 (buttons direct + click + tolerant ids)"
     if norm == "env":
         return _format_env_status()
     if norm == "llm ping":
         return await _llm_ping()
+    if norm == "last_error":
+        meta = (_LAST_LLM_META_BY_USER.get(user_id) or {})
+        return (
+            "🧾 last_error\n"
+            f"• provider: {meta.get('provider')}\n"
+            f"• used_fallback: {meta.get('used_fallback')}\n"
+            f"• last_error: {meta.get('last_error')}\n"
+            f"• elapsed_ms: {meta.get('elapsed_ms')}\n"
+            f"• cache: {meta.get('cache')}"
+        )
 
-    # admin strategy
+    # -----------------------------
+    # Normalize "Клик: ..."
+    # -----------------------------
+    # Иногда Telegram присылает "Клик: 📊 Обзор"
+    if norm.startswith("клик:"):
+        text_raw = text_raw.split(":", 1)[1].strip()
+        norm = text_raw.lower().strip()
+
+    # -----------------------------
+    # UI callback_data support (InlineKeyboard)
+    # формат: ui match <match_id> <pre|live> <action>
+    # -----------------------------
+    if norm.startswith("ui match"):
+        parts = text_raw.split()
+        if len(parts) < 5:
+            return "Некорректная команда UI."
+        match_id = parts[2].strip()
+        mode = parts[3].strip().lower()
+        action = parts[4].strip().lower()
+
+        m = _find_match(match_id)
+        if not m:
+            # попробуем поправить id
+            fixed = _normalize_match_id(match_id)
+            m = _find_match(fixed) if fixed else None
+        if not m:
+            return "Матч не найден (MVP демо)."
+
+        _ACTIVE_MATCH_BY_USER[user_id] = m["id"]
+        reply = await _run_ui_llm(user_id=user_id, match_id=m["id"], mode=mode, action=action)
+        return reply
+
+    # -----------------------------
+    # Admin strategy
+    # -----------------------------
     if norm.startswith("админ"):
-        ok, msg = _try_admin_update_strategy(user_id, text_raw)
+        _, msg = _try_admin_update_strategy(user_id, text_raw)
         return msg
 
-    # strategy
+    # -----------------------------
+    # Strategy
+    # -----------------------------
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _format_expert_strategy_for_today()
 
-    # matches today
+    # -----------------------------
+    # Matches today
+    # -----------------------------
     if norm.startswith("матчи сегодня"):
         sport = text_raw.split("матчи сегодня", 1)[1].strip(" :\n\t")
         if not sport:
@@ -581,25 +631,79 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     if "кхл сегодня" in norm:
         return _format_matches_today("hockey")
 
-    # match <id>
+    # -----------------------------
+    # Match <id>
+    # -----------------------------
     if norm.startswith("матч"):
         match_id = text_raw.split("матч", 1)[1].strip(" :\n\t")
         if not match_id:
             return "Напиши: матч <id>"
+
         m = _find_match(match_id)
         if not m:
+            fixed = _normalize_match_id(match_id)
+            m = _find_match(fixed) if fixed else None
+        if not m:
             return "Матч не найден (MVP демо)."
+
         _ACTIVE_MATCH_BY_USER[user_id] = m["id"]
+
+        # Если у тебя есть inline-кнопки для выбора действий — лучше вернуть экран + кнопки
+        # Иначе просто текстовый экран.
         return _format_match_screen(m["id"])
 
-    # profile
+    # -----------------------------
+    # Buttons: PRE/LIVE actions (text)
+    # -----------------------------
+    if norm in {"📊 обзор (prematch)".lower(), "📊 обзор".lower(), "обзор", "обзор рынков"}:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="pre", action="overview")
+
+    if norm in {"🟢 live".lower(), "live", "лайв", "🟢 live-обзор".lower()}:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="live", action="overview")
+
+    if norm in {"🔄 live".lower(), "refresh", "обновить", "обнови"}:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="live", action="refresh")
+
+    # подробности по рынкам (кнопки/текст)
+    if "1x2" in norm or "moneyline" in norm:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="pre", action="moneyline")
+
+    if "тотал" in norm or "total" in norm:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="pre", action="total")
+
+    if "фора" in norm or "handicap" in norm:
+        match_id = _ACTIVE_MATCH_BY_USER.get(user_id)
+        if not match_id:
+            return "Сначала выбери матч: `матч <id>`"
+        return await _run_ui_llm(user_id=user_id, match_id=match_id, mode="pre", action="handicap")
+
+    # -----------------------------
+    # Profile
+    # -----------------------------
     if "профиль" in norm:
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
             stats = bets_db.get_user_stats(session, user_id)
         return _format_profile_text(bank, stats)
 
-    # bank set / show
+    # -----------------------------
+    # Bank set/show
+    # -----------------------------
     if "банк" in norm:
         if re.search(r"\d", norm):
             new_bank = _parse_bank_set(norm)
@@ -607,12 +711,52 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
                 with db_session() as session:
                     user = bets_db.set_user_bank(session, user_id, new_bank)
                 return f"Банк установлен: {user.bank:,.0f}".replace(",", " ")
+            return "Не понял сумму. Пример: `мой банк 100000`"
         else:
             with db_session() as session:
                 bank = bets_db.get_user_bank(session, user_id)
             if bank is None:
-                return "У тебя пока не задан банк. Установи: мой банк 100000"
+                return "У тебя пока не задан банк. Установи: `мой банк 100000`"
             return f"Текущий банк: {bank:,.0f}".replace(",", " ")
+
+    # -----------------------------
+    # Legacy text commands (оставил для совместимости)
+    # рынок <id> <market_key> / аналитика <id> <market_key>
+    # -----------------------------
+    if norm.startswith("рынок"):
+        body = text_raw.split("рынок", 1)[1].strip()
+        parts = body.split()
+        if len(parts) < 2:
+            return "Напиши: рынок <match_id> <market_key>"
+        match_id, market_key = parts[0], parts[1]
+        fixed = _normalize_match_id(match_id)
+        if fixed:
+            match_id = fixed
+        return _format_market(match_id, market_key)
+
+    if norm.startswith("аналитика"):
+        body = text_raw.split("аналитика", 1)[1].strip()
+        parts = body.split()
+        if len(parts) >= 2:
+            fixed = _normalize_match_id(parts[0])
+            match_id = fixed or parts[0]
+            return await ai_analyze(user_id=user_id, match_id=match_id, market_key=parts[1])
+        return "Напиши: аналитика <match_id> <market_key>"
+
+    # -----------------------------
+    # Default help
+    # -----------------------------
+    return (
+        "Команды:\n\n"
+        "• `матчи сегодня hockey|football|basketball|tennis|esports`\n"
+        "• `матч <id>` (дальше кнопки PRE/LIVE)\n"
+        "• `стратегия`\n"
+        "• `профиль`\n\n"
+        "Диагностика:\n"
+        "• `llm ping` / `env` / `version` / `last_error`\n\n"
+        "Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам."
+    )
+
 
     # ====== КНОПКИ: текст/клик ======
     # если это нажатие кнопки — пытаемся замаппить
