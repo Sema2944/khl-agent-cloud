@@ -45,29 +45,33 @@ if not LLM_PROMPT_PREFIX:
 # -----------------------------
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
 _LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
-_LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}  # <-- фикс NameError
+_LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}  # хранит meta для last_error
+
 
 def _snap_key(user_id: int, match_id: str) -> str:
     return f"{user_id}:{match_id}"
 
+
 def _now_ts() -> int:
     return int(time.time())
 
+
 def _msk_today_date():
     return datetime.now(MSK).date()
+
 
 def _norm_id(x: str) -> str:
     """demo_football_001 == demofootball001 == DEMO-FOOTBALL-001"""
     return re.sub(r"[^a-z0-9]+", "", (x or "").lower())
 
+
 def _md_escape(s: str) -> str:
     """
-    telegram.ext использует parse_mode="Markdown".
+    telegram.ext часто шлёт parse_mode="Markdown".
     Чтобы не ловить BadRequest: Can't parse entities — экранируем спец-символы.
     """
     if s is None:
         return ""
-    # В Markdown (не V2) чаще всего ломают: _, *, [, `.
     return (
         str(s)
         .replace("\\", "\\\\")
@@ -77,10 +81,11 @@ def _md_escape(s: str) -> str:
         .replace("`", "\\`")
     )
 
+
 def _md_safe_text(text: str) -> str:
-    # Экранируем всё сообщение целиком (самый простой и надёжный вариант).
-    # Эмодзи и кириллица не страдают.
+    # Самый надёжный вариант — экранировать всё сообщение целиком.
     return _md_escape(text or "")
+
 
 # -----------------------------
 # УТИЛИТА ДЛЯ SESSION (вне FastAPI)
@@ -96,6 +101,7 @@ def db_session() -> Session:
             gen.close()
         except Exception:
             pass
+
 
 # -----------------------------
 # DEMO: матчи/рынки
@@ -143,6 +149,7 @@ DEMO_MARKETS = {
     },
 }
 
+
 # -----------------------------
 # Профиль / банк
 # -----------------------------
@@ -168,6 +175,7 @@ def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str
     lines.append("Это упрощённая статистика по всем твоим ставкам.")
     return "\n".join(lines)
 
+
 def _parse_bank_set(message: str) -> Optional[float]:
     nums = re.findall(r"(\d+[ \d]*)", (message or "").replace("\u00a0", " "))
     if not nums:
@@ -177,6 +185,7 @@ def _parse_bank_set(message: str) -> Optional[float]:
         return float(num)
     except ValueError:
         return None
+
 
 # -----------------------------
 # Экспертная стратегия
@@ -188,6 +197,7 @@ def _get_strategy_row(session: Session, day) -> Optional[ExpertStrategy]:
         .order_by(ExpertStrategy.updated_at.desc())
     )
     return session.exec(st).first()
+
 
 def _format_expert_strategy_for_today() -> str:
     today = _msk_today_date()
@@ -223,6 +233,7 @@ def _format_expert_strategy_for_today() -> str:
             "Дисклеймер: это аналитическая заметка, не призыв к ставке.",
         ]
     )
+
 
 def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
     if ADMIN_TELEGRAM_ID <= 0:
@@ -265,6 +276,7 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 
     return True, "✅ Стратегия обновлена (по МСК)."
 
+
 # -----------------------------
 # Матчи / матч
 # -----------------------------
@@ -276,6 +288,7 @@ def _find_match(match_id: str) -> Optional[dict]:
                 return {"sport": sport, **m}
     return None
 
+
 def _normalize_match_id(match_id: str) -> Optional[str]:
     """
     Если пользователь прислал "demo_hockey_001" или "DEMO-HOCKEY-001" — возвращаем реальный id из DEMO_MATCHES.
@@ -286,6 +299,7 @@ def _normalize_match_id(match_id: str) -> Optional[str]:
             if _norm_id(m.get("id", "")) == target:
                 return str(m["id"])
     return None
+
 
 def _format_matches_today(sport_key: str) -> str:
     sport_key = (sport_key or "").strip().lower()
@@ -301,11 +315,11 @@ def _format_matches_today(sport_key: str) -> str:
 
     lines = [f"🏟 Матчи сегодня (по МСК) — {title}", f"Дата: {today}", ""]
     for m in DEMO_MATCHES[sport_key]:
-        # ВАЖНО: id может содержать "_" -> экранируем
         lines.append(f"• {m['title']} ({m['league']}) — id: {_md_escape(m['id'])}")
     lines.append("")
     lines.append("Дальше: матч <id>.")
     return "\n".join(lines)
+
 
 def _format_match_screen(match_id: str) -> str:
     m = _find_match(match_id)
@@ -320,6 +334,7 @@ def _format_match_screen(match_id: str) -> str:
         "Выбери действие кнопками ниже 👇",
     ]
     return "\n".join(lines)
+
 
 def _format_market(match_id: str, market_key: str) -> str:
     m = _find_match(match_id)
@@ -354,6 +369,7 @@ def _format_market(match_id: str, market_key: str) -> str:
     lines.append("Дисклеймер: это аналитика, не рекомендация к ставкам.")
     return "\n".join(lines)
 
+
 # -----------------------------
 # UI / LLM
 # -----------------------------
@@ -364,7 +380,7 @@ def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
     hc = DEMO_MARKETS["handicap"]["data"]
 
     if mode == "live":
-        # в live специально минимум чисел/коэф — это уходит в prompt, но правила в prompt запрещают числа в ответе
+        # в live держим минимум чисел — правила prompt запрещают числа в ответе
         return {
             "total_main": {"value": float(total["value"])},
             "handicap_main": {"team": hc["team"], "value": float(hc["value"])},
@@ -375,6 +391,7 @@ def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
         "total_main": {"value": float(total["value"]), "over": float(total["over"]), "under": float(total["under"])},
         "handicap_main": {"team": hc["team"], "value": float(hc["value"]), "odds": float(hc["odds"])},
     }
+
 
 def _build_ui_prompt(
     match_id: str,
@@ -424,6 +441,7 @@ def _build_ui_prompt(
 
     return "\n".join(base)
 
+
 def _render_ui_json(analysis: Any, mode: str) -> str:
     if not isinstance(analysis, dict):
         return (
@@ -433,7 +451,7 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
             "Аналитический материал, не является рекомендацией."
         )
 
-    title = str(analysis.get("title") or ("🟢 LIVE-обзор" if mode == "live" else "📊 Обзор рынков")).strip()
+    title = str(analysis.get("title") or ("🟢 LIVE-обзор" if (mode or "").lower() == "live" else "📊 Обзор рынков")).strip()
     lines: list[str] = [title]
 
     if analysis.get("summary"):
@@ -485,10 +503,12 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     lines.append(disclaimer)
     return "\n".join(lines)
 
+
 def _hash_cache_key(match_id: str, mode: str, action: str, cur_snap: Dict[str, Any], prev_snap: Optional[Dict[str, Any]]) -> str:
     payload = {"m": match_id, "mode": mode, "action": action, "cur": cur_snap, "prev": prev_snap}
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     m = _find_match(match_id)
@@ -520,10 +540,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         prompt,
         cache_key=cache_key,
         schema=schema,
-        user_id=user_id,  # <-- важно для throttling из llm_client.py
+        user_id=user_id,
     )
 
-    # сохраняем last_error для команды last_error
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
 
     logger.info(
@@ -531,6 +550,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         {k: (meta or {}).get(k) for k in ("provider", "elapsed_ms", "used_fallback", "last_error", "cache")},
     )
     return _render_ui_json(analysis, mode=mode)
+
 
 # -----------------------------
 # КНОПКИ (входящие тексты)
@@ -544,6 +564,7 @@ def _extract_click_label(text_raw: str) -> str:
     if m:
         return m.group(1).strip()
     return (text_raw or "").strip()
+
 
 def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
     s = (label or "").strip().lower()
@@ -567,6 +588,7 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
         return ("live", "overview")
 
     return None
+
 
 # -----------------------------
 # Diagnostics
@@ -592,6 +614,7 @@ def _format_env_status() -> str:
             lines.append(f"• {k}: {(v or '').strip()}")
     return "\n".join(lines)
 
+
 async def _llm_ping(user_id: int) -> str:
     prompt = "Верни корректный JSON по ui_pre схеме. Все ключи непустые."
     analysis, meta = await analyze_with_llm_cached(
@@ -614,6 +637,7 @@ async def _llm_ping(user_id: int) -> str:
         f"• cache: {(meta or {}).get('cache')}\n"
         f"• sampletitle: {title}"
     )
+
 
 # ------------------------------------------------------------
 # ОСНОВНАЯ ЛОГИКА АГЕНТА
@@ -648,7 +672,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # -----------------------------
     # Normalize "Клик: ..."
     # -----------------------------
-    # Иногда Telegram присылает "Клик: 📊 Обзор"
     if norm.startswith("клик:"):
         text_raw = text_raw.split(":", 1)[1].strip()
         norm = text_raw.lower().strip()
@@ -720,7 +743,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         return _md_safe_text(_format_match_screen(m["id"]))
 
     # -----------------------------
-    # Buttons: text click-map (если кнопка отправила текст)
+    # Buttons: text click-map
     # -----------------------------
     label = _extract_click_label(text_raw)
     mapped = _map_button_to_ui(label)
@@ -760,7 +783,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             return _md_safe_text(f"Текущий банк: {bank:,.0f}".replace(",", " "))
 
     # -----------------------------
-    # Legacy (минимально)
+    # Legacy: рынок <id> <market_key>
     # -----------------------------
     if norm.startswith("рынок"):
         body = text_raw.split("рынок", 1)[1].strip()
