@@ -24,16 +24,19 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-# Больше времени по дефолту (у тебя уже было)
-LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "18.0").strip())
+LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "12.0").strip())
 LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "8.0").strip())
-LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "2").strip())
+LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "1").strip())  # 1 попытка ретрая ок
 
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
+OPENAI_MAX_TOKENS = int((os.getenv("OPENAI_MAX_TOKENS") or "260").strip())
 
-# Cache (in-memory) — потом заменим на Redis
+# Cache (in-memory) — потом Redis
 LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # prematch 15 минут
 LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "20").strip()) # live 20 сек
+
+# Если LLM упал/429 — кэшируем fallback на короткий срок, чтобы не спамить API
+LLM_ERROR_TTL_S = int((os.getenv("LLM_ERROR_TTL_S") or "25").strip())
 
 LLMOutput = Union["LLMAnalysis", Dict[str, Any]]
 _CACHE: Dict[str, Tuple[float, LLMOutput, dict]] = {}
@@ -41,29 +44,59 @@ _CACHE_LOCK = asyncio.Lock()
 
 _ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
 
+# Слова, которые могут превратить аналитику в “призыв”
 _BANNED_PHRASES = (
-    "ставь", "ставьте", "бери", "берите", "выгодно", "лучше", "проход", "верняк",
+    "ставь", "ставьте", "бери", "берите", "верняк",
     "гарант", "гарантия", "100%", "фикс"
 )
 
+_SYSTEM_PROMPT_LEGACY = """Ты спортивный аналитик.
+Отвечай СТРОГО валидным JSON без markdown и без комментариев.
+Схема ответа:
+{
+  "verdict": "lean_yes" | "lean_no" | "unclear",
+  "confidence": number (0..1),
+  "reasoning_bullets": [string, ...] (1..5),
+  "risks": [string, ...] (0..5),
+  "checklist": [string, ...] (0..5)
+}
+Никаких других ключей. Никакого текста вне JSON.
+"""
 
-@dataclass
-class LLMAnalysis:
-    verdict: str                 # "lean_yes" | "lean_no" | "unclear"
-    confidence: float            # 0..1
-    reasoning_bullets: list[str] # <=5
-    risks: list[str]             # <=5
-    checklist: list[str]         # <=5
+_SYSTEM_PROMPT_UI = """Ты спортивный аналитик.
+Отвечай СТРОГО одним JSON-объектом (без markdown, без текста, без пояснений).
+ВСЕ ключи обязательны и не пустые.
 
-    def to_dict(self) -> dict:
-        return {
-            "verdict": self.verdict,
-            "confidence": self.confidence,
-            "reasoning_bullets": self.reasoning_bullets,
-            "risks": self.risks,
-            "checklist": self.checklist,
-        }
+Запрещено:
+- прогнозы, советы, призывы ставить
+- слова: ставь, ставьте, бери, берите, верняк, гарантия, 100%, фикс
 
+Формат UI:
+1) ui_pre:
+{
+ "title": string,
+ "summary": string,
+ "key_factors": [string],
+ "line_logic": [string],
+ "risks": [string],
+ "disclaimer": string
+}
+
+2) ui_live:
+{
+ "title": string,
+ "context": [string],
+ "markets": [{"name": string, "direction":"up|down|flat|unknown", "logic": string}],
+ "risks": [string],
+ "disclaimer": string
+}
+
+Правила:
+- disclaimer ОБЯЗАТЕЛЬНО заполнить (короткая фраза на русском).
+- В LIVE НЕ показывай коэффициенты и числа — только направление и логика.
+- Пиши коротко, списками.
+Верни только JSON.
+"""
 
 # -----------------------------
 # Helpers
@@ -75,14 +108,12 @@ def _contains_banned_phrases(obj: Any) -> bool:
         s = str(obj).lower()
     return any(p in s for p in _BANNED_PHRASES)
 
-
 def _clamp01(x: Any) -> float:
     try:
         v = float(x)
     except Exception:
         return 0.0
     return 0.0 if v < 0 else 1.0 if v > 1 else v
-
 
 def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
     if v is None:
@@ -101,43 +132,30 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
         return out[:max_len]
     return []
 
-
 def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Делает UI-ответ устойчивым:
-    - если disclaimer пустой -> подставляем дефолт
-    - если title пустой -> подставляем дефолт
-    - если поля не того типа -> приводим к безопасным
-    """
     out = dict(obj or {})
 
-    # title
     title = str(out.get("title") or "").strip()
     if not title:
         out["title"] = "🟢 LIVE-обзор" if schema == "ui_live" else "📊 Обзор рынков"
 
-    # disclaimer
     disclaimer = str(out.get("disclaimer") or "").strip()
     if not disclaimer:
         out["disclaimer"] = "Аналитический материал, не является рекомендацией."
 
-    # risks
     if "risks" in out and not isinstance(out["risks"], list):
         out["risks"] = _as_str_list(out.get("risks"), max_len=6)
 
     if schema == "ui_live":
-        # context
         if "context" in out and not isinstance(out["context"], list):
             out["context"] = _as_str_list(out.get("context"), max_len=6)
 
-        # markets
         mk = out.get("markets")
         if mk is None:
             out["markets"] = []
         elif not isinstance(mk, list):
             out["markets"] = []
     else:
-        # ui_pre fields
         if "key_factors" in out and not isinstance(out["key_factors"], list):
             out["key_factors"] = _as_str_list(out.get("key_factors"), max_len=6)
         if "line_logic" in out and not isinstance(out["line_logic"], list):
@@ -149,6 +167,42 @@ def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
 
     return out
 
+def _sleep_jitter(base: float) -> float:
+    return base + random.random() * 0.25
+
+def _backoff_s(attempt_idx: int, *, base: float = 0.8, cap: float = 6.0) -> float:
+    # 0 -> 0.8.., 1 -> 1.6.., 2 -> 3.2.. etc
+    val = min(cap, base * (2 ** attempt_idx))
+    return _sleep_jitter(val)
+
+def _parse_retry_after(resp: httpx.Response) -> Optional[float]:
+    ra = (resp.headers.get("retry-after") or "").strip()
+    if not ra:
+        return None
+    try:
+        return float(ra)
+    except Exception:
+        return None
+
+# -----------------------------
+# Models
+# -----------------------------
+@dataclass
+class LLMAnalysis:
+    verdict: str
+    confidence: float
+    reasoning_bullets: list[str]
+    risks: list[str]
+    checklist: list[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "verdict": self.verdict,
+            "confidence": self.confidence,
+            "reasoning_bullets": self.reasoning_bullets,
+            "risks": self.risks,
+            "checklist": self.checklist,
+        }
 
 # -----------------------------
 # Validation
@@ -177,13 +231,7 @@ def validate_analysis_json(obj: Any) -> Tuple[bool, Optional[LLMAnalysis], str]:
         checklist=checklist,
     ), "ok"
 
-
 def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-    """
-    schema:
-      - ui_pre  -> {title, summary, key_factors, line_logic, risks, disclaimer}
-      - ui_live -> {title, context, markets, risks, disclaimer}
-    """
     if not isinstance(obj, dict):
         return False, None, "root is not an object"
 
@@ -240,7 +288,6 @@ def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, An
         "disclaimer": disclaimer,
     }, "ok"
 
-
 # -----------------------------
 # Fallbacks
 # -----------------------------
@@ -250,80 +297,26 @@ def fallback_analysis(_: str) -> LLMAnalysis:
         confidence=0.35,
         reasoning_bullets=[
             "LLM недоступен/не успел — даю безопасный базовый разбор.",
-            "Сверь коэффициенты и движение линии (если есть), избегай решений «на эмоциях».",
-            "Соблюдай банк-менеджмент: фиксированный % на ставку, без догонов.",
+            "Сверь движение линии (если есть) и избегай решений «на эмоциях».",
+            "Соблюдай риск-менеджмент: фиксированный % на действие, без догонов.",
         ],
         risks=[
             "Недостаток входных данных (составы/травмы/мотивация/форма).",
             "Случайность и дисперсия в спорте.",
         ],
         checklist=[
-            "Проверь составы/вратарей/ключевых игроков",
+            "Проверь составы/ключевых игроков",
             "Проверь календарь (b2b, перелёты)",
             "Сравни линию у 2–3 источников",
-            "Определи max stake по банк-менеджменту",
+            "Определи лимит риска по банку",
         ],
     )
-
-
-# -----------------------------
-# Prompts
-# -----------------------------
-_SYSTEM_PROMPT_LEGACY = """Ты спортивный аналитик.
-Отвечай СТРОГО валидным JSON без markdown и без комментариев.
-Схема ответа:
-{
-  "verdict": "lean_yes" | "lean_no" | "unclear",
-  "confidence": number (0..1),
-  "reasoning_bullets": [string, ...] (1..5),
-  "risks": [string, ...] (0..5),
-  "checklist": [string, ...] (0..5)
-}
-Никаких других ключей. Никакого текста вне JSON.
-"""
-
-_SYSTEM_PROMPT_UI = """Ты спортивный аналитик.
-Отвечай СТРОГО одним JSON-объектом (без markdown, без текста, без пояснений).
-ВСЕ ключи обязательны и не пустые.
-
-Запрещено:
-- прогнозы, советы, призывы ставить
-- слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%
-
-Формат UI:
-1) ui_pre:
-{
- "title": string,
- "summary": string,
- "key_factors": [string],
- "line_logic": [string],
- "risks": [string],
- "disclaimer": string
-}
-
-2) ui_live:
-{
- "title": string,
- "context": [string],
- "markets": [{"name": string, "direction":"up|down|flat|unknown", "logic": string}],
- "risks": [string],
- "disclaimer": string
-}
-
-Правила:
-- disclaimer ОБЯЗАТЕЛЬНО заполнить (короткая фраза на русском).
-- В LIVE НЕ показывай коэффициенты и числа — только направление и логика.
-- Пиши коротко, списками.
-Верни только JSON.
-"""
-
 
 def _make_user_prompt(domain_prompt: str) -> str:
     return (
         "Задача: дай осторожный аналитический разбор, без прямых призывов ставить.\n"
         f"Вход:\n{domain_prompt.strip()}\n"
     )
-
 
 # -----------------------------
 # OpenAI call
@@ -337,13 +330,12 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": OPENAI_TEMPERATURE,
-        # 🔥 Главное: заставляем API вернуть валидный JSON
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        "max_tokens": 280,
+        "max_tokens": OPENAI_MAX_TOKENS,
     }
 
     timeout = httpx.Timeout(
@@ -356,6 +348,9 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+        if r.status_code == 429:
+            # пробрасываем наружу, чтобы analyze_with_llm сделал правильный backoff
+            raise httpx.HTTPStatusError("429 Too Many Requests", request=r.request, response=r)
         r.raise_for_status()
         data = r.json()
 
@@ -363,36 +358,10 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    # при response_format=json_object здесь всегда должен быть валидный JSON
     obj = json.loads(content)
     if not isinstance(obj, dict):
         raise ValueError("model JSON root is not an object")
     return obj
-
-
-def _sleep_jitter(base: float) -> float:
-    return base + random.random() * 0.12
-
-
-def _retry_sleep_seconds_for_http_429(resp: httpx.Response, *, attempt_idx: int) -> float:
-    """
-    Умный backoff для 429:
-    - уважает Retry-After (если есть)
-    - иначе экспонента + джиттер
-    """
-    ra = resp.headers.get("Retry-After")
-    if ra:
-        try:
-            s = float(ra)
-        except Exception:
-            s = 1.0
-    else:
-        # 0: ~0.8s, 1: ~1.3s, 2: ~2.0s ...
-        s = 0.8 * (1.6 ** max(0, attempt_idx))
-
-    s = min(4.0, s + random.random() * 0.35)
-    return s
-
 
 # -----------------------------
 # LLM main
@@ -458,16 +427,16 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "disclaimer": "Аналитический материал, не является рекомендацией.",
         }, meta
 
-    deadline = start + max(0.1, LLM_TOTAL_TIMEOUT_S)
+    deadline = start + max(0.2, LLM_TOTAL_TIMEOUT_S)
 
     for retry_idx in range(LLM_MAX_RETRIES + 1):
         attempts += 1
         remaining = deadline - time.monotonic()
-        if remaining <= 0.05:
+        if remaining <= 0.08:
             last_error = "deadline_exceeded"
             break
 
-        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.5, remaining))
+        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.6, remaining))
 
         try:
             system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
@@ -488,7 +457,6 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                     "last_error": None,
                 }
 
-            # UI schemas: normalize then validate
             obj2 = _normalize_ui_obj(schema, obj)
             ok, analysis2, msg = validate_ui_json(schema, obj2)
             if not ok or analysis2 is None:
@@ -506,41 +474,44 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             last_error = f"network_timeout: {type(e).__name__}"
 
         except httpx.HTTPStatusError as e:
-            code = e.response.status_code
+            code = e.response.status_code if e.response else 0
             last_error = f"http_{code}"
 
-            # ✅ 429: умный backoff + ретрай
-            if code == 429 and retry_idx < LLM_MAX_RETRIES:
-                sleep_s = _retry_sleep_seconds_for_http_429(e.response, attempt_idx=retry_idx)
-                if time.monotonic() + sleep_s < deadline:
+            # 429: уважаем Retry-After + backoff, НЕ молотим запросами
+            if code == 429:
+                ra = _parse_retry_after(e.response) if e.response else None
+                sleep_s = ra if (ra is not None and ra > 0) else _backoff_s(retry_idx, base=1.2, cap=8.0)
+                if retry_idx < LLM_MAX_RETRIES and (time.monotonic() + sleep_s) < deadline:
                     await asyncio.sleep(sleep_s)
                     continue
+                break
 
-            # на 4xx (кроме ретраимых) — прекращаем
-            if code not in (408, 409, 425, 429, 500, 502, 503, 504):
+            # на неретраимые 4xx — прекращаем
+            if code and code not in (408, 409, 425, 429, 500, 502, 503, 504):
                 break
 
         except (ValueError, RuntimeError) as e:
             last_error = f"{type(e).__name__}: {e}"
+
         except Exception as e:
             last_error = f"unexpected: {type(e).__name__}: {e}"
 
-        # обычный короткий джиттер между попытками (кроме 429 — он уже обработан выше)
         if retry_idx < LLM_MAX_RETRIES:
-            sleep_s = _sleep_jitter(0.18)
+            sleep_s = _backoff_s(retry_idx, base=0.6, cap=4.0)
             if time.monotonic() + sleep_s < deadline:
                 await asyncio.sleep(sleep_s)
 
     # fallback
+    meta = {
+        "provider": "openai",
+        "attempts": attempts,
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
+        "used_fallback": True,
+        "last_error": last_error,
+    }
+
     if schema == "legacy":
-        a = fallback_analysis(domain_prompt)
-        return a, {
-            "provider": "openai",
-            "attempts": attempts,
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "used_fallback": True,
-            "last_error": last_error,
-        }
+        return fallback_analysis(domain_prompt), meta
 
     if schema == "ui_live":
         return {
@@ -549,13 +520,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "markets": [],
             "risks": ["Недостаточно данных для детального LIVE-разбора."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }, {
-            "provider": "openai",
-            "attempts": attempts,
-            "elapsed_ms": int((time.monotonic() - start) * 1000),
-            "used_fallback": True,
-            "last_error": last_error,
-        }
+        }, meta
 
     return {
         "title": "📊 Обзор рынков",
@@ -564,14 +529,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
         "line_logic": [],
         "risks": ["Недостаточно данных для детального разбора."],
         "disclaimer": "Аналитический материал, не является рекомендацией.",
-    }, {
-        "provider": "openai",
-        "attempts": attempts,
-        "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "used_fallback": True,
-        "last_error": last_error,
-    }
-
+    }, meta
 
 # -----------------------------
 # Cache wrapper
@@ -583,14 +541,13 @@ async def analyze_with_llm_cached(
     ttl_s: Optional[int] = None,
     schema: str = "legacy",
 ) -> Tuple[LLMOutput, dict]:
-    """
-    Cached wrapper. cache_key обязателен.
-    Хранит (analysis, meta) в памяти процесса.
-    """
     now = time.time()
+
+    # TTL по умолчанию
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
 
+    # Cache read
     async with _CACHE_LOCK:
         hit = _CACHE.get(cache_key)
         if hit:
@@ -599,21 +556,25 @@ async def analyze_with_llm_cached(
                 meta2 = dict(meta)
                 meta2["cache"] = "hit"
                 return analysis, meta2
-            else:
-                _CACHE.pop(cache_key, None)
+            _CACHE.pop(cache_key, None)
 
     analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
+
+    # Если упали и отдали fallback — кладём в кэш на короткий срок, чтобы не спамить API
+    used_fallback = bool(meta.get("used_fallback"))
+    cache_ttl = (LLM_ERROR_TTL_S if used_fallback else ttl_s)
+
     meta2 = dict(meta)
     meta2["cache"] = "miss"
+    meta2["ttl"] = cache_ttl
 
     async with _CACHE_LOCK:
-        _CACHE[cache_key] = (now + ttl_s, analysis, meta2)
+        _CACHE[cache_key] = (now + cache_ttl, analysis, meta2)
 
     return analysis, meta2
 
-
 # -----------------------------
-# Legacy renderer (telegram)
+# Legacy renderer (telegram text)
 # -----------------------------
 def render_analysis_text(a: LLMAnalysis) -> str:
     verdict_map = {"lean_yes": "🟢 Скорее ДА", "lean_no": "🔴 Скорее НЕТ", "unclear": "⚪️ Неясно"}
