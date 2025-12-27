@@ -31,7 +31,6 @@ class GatewayResult:
 class BaseGateway:
     """
     Унифицированный слой, чтобы llm_client мог дергать gateway.
-    Сделано максимально совместимо: есть несколько алиас-методов.
     """
 
     async def chat_json(
@@ -46,7 +45,7 @@ class BaseGateway:
     ) -> GatewayResult:
         raise NotImplementedError
 
-    # алиасы на случай, если llm_client ожидает другое имя метода
+    # алиасы на случай несовпадения имён в llm_client
     async def chat_completions_json(self, **kwargs) -> GatewayResult:
         return await self.chat_json(**kwargs)
 
@@ -56,12 +55,11 @@ class BaseGateway:
 
 class DummyGateway(BaseGateway):
     async def chat_json(self, **kwargs) -> GatewayResult:
-        # Возвращаем заведомо валидный JSON-объект, чтобы пайплайн не падал
         obj = {
             "title": "📊 Обзор рынков",
             "summary": "LLM_PROVIDER=dummy — безопасный режим.",
             "key_factors": ["Сейчас используется заглушка вместо LLM."],
-            "line_logic": ["Для включения LLM задай OPENAI_API_KEY и LLM_PROVIDER=openai."],
+            "line_logic": ["Чтобы включить LLM: LLM_PROVIDER=openai и OPENAI_API_KEY задан."],
             "risks": ["Данные ограничены."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
         }
@@ -118,9 +116,8 @@ class OpenAIGateway(BaseGateway):
             except Exception:
                 request_id = None
 
-            # не скрываем 429 — llm_client пусть сам решает cooldown
+            # 429/5xx пусть обработает llm_client
             r.raise_for_status()
-
             data = r.json()
 
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -142,7 +139,7 @@ _GATEWAY_SINGLETON: Optional[BaseGateway] = None
 
 def llm_gateway() -> BaseGateway:
     """
-    Старое имя (если где-то уже использовалось).
+    Синхронный доступ к singleton gateway.
     """
     global _GATEWAY_SINGLETON
     if _GATEWAY_SINGLETON is not None:
@@ -157,9 +154,11 @@ def llm_gateway() -> BaseGateway:
     return _GATEWAY_SINGLETON
 
 
-def get_gateway() -> BaseGateway:
-    """
-    Новое имя, которое сейчас импортит llm_client.py:
-      from .llm_gateway import get_gateway
-    """
+# ✅ ВАЖНО: llm_client.py делает "await get_gateway()"
+async def get_gateway() -> BaseGateway:
+    return llm_gateway()
+
+
+# (опционально) если где-то потребуется синхронный вызов
+def get_gateway_sync() -> BaseGateway:
     return llm_gateway()
