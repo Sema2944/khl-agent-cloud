@@ -14,6 +14,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------
+# ENV
+# -----------------------------
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()  # openai | dummy
 LLM_ENABLED = (os.getenv("LLM_ENABLED") or "1").strip() == "1"
 
@@ -21,26 +24,35 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "3.0").strip())
-LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "1.2").strip())
-LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "1").strip())
-OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.2").strip())
+LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "8.0").strip())
+LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "6.0").strip())
+LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "0").strip())
 
-LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # prematch 15m
-LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "20").strip()) # live 20s
+OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
+
+# Cache (in-memory) — потом заменим на Redis
+LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # prematch 15 минут
+LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "20").strip()) # live 20 сек
 
 LLMOutput = Union["LLMAnalysis", Dict[str, Any]]
 _CACHE: Dict[str, Tuple[float, LLMOutput, dict]] = {}
 _CACHE_LOCK = asyncio.Lock()
 
+_ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
+
+_BANNED_PHRASES = (
+    "ставь", "ставьте", "бери", "берите", "выгодно", "лучше", "проход", "верняк",
+    "гарант", "гарантия", "100%", "фикс"
+)
+
 
 @dataclass
 class LLMAnalysis:
-    verdict: str
-    confidence: float
-    reasoning_bullets: list[str]
-    risks: list[str]
-    checklist: list[str]
+    verdict: str                 # "lean_yes" | "lean_no" | "unclear"
+    confidence: float            # 0..1
+    reasoning_bullets: list[str] # <=5
+    risks: list[str]             # <=5
+    checklist: list[str]         # <=5
 
     def to_dict(self) -> dict:
         return {
@@ -52,14 +64,9 @@ class LLMAnalysis:
         }
 
 
-_ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
-
-_BANNED_PHRASES = (
-    "ставь", "ставьте", "бери", "берите", "выгодно", "лучше", "проход", "верняк",
-    "гарант", "гарантия", "100%", "фикс"
-)
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _contains_banned_phrases(obj: Any) -> bool:
     try:
         s = json.dumps(obj, ensure_ascii=False).lower()
@@ -94,6 +101,82 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
     return []
 
 
+def _try_extract_json_obj(content: str) -> Dict[str, Any]:
+    """
+    Мягкий парсер: если модель обернула JSON текстом — вытаскиваем { ... }.
+    """
+    s = (content or "").strip()
+    if not s:
+        raise ValueError("empty content")
+
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    start = s.find("{")
+    end = s.rfind("}")
+    if start >= 0 and end > start:
+        obj = json.loads(s[start:end + 1])
+        if isinstance(obj, dict):
+            return obj
+
+    raise ValueError("invalid JSON from model")
+
+
+def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Делает UI-ответ устойчивым:
+    - если disclaimer пустой -> подставляем дефолт
+    - если title пустой -> подставляем дефолт
+    - если поля не того типа -> приводим к безопасным
+    """
+    out = dict(obj or {})
+
+    # title
+    title = str(out.get("title") or "").strip()
+    if not title:
+        out["title"] = "🟢 LIVE-обзор" if schema == "ui_live" else "📊 Обзор рынков"
+
+    # disclaimer
+    disclaimer = str(out.get("disclaimer") or "").strip()
+    if not disclaimer:
+        out["disclaimer"] = "Аналитический материал, не является рекомендацией."
+
+    # risks
+    if "risks" in out and not isinstance(out["risks"], list):
+        out["risks"] = _as_str_list(out.get("risks"), max_len=6)
+
+    if schema == "ui_live":
+        # context
+        if "context" in out and not isinstance(out["context"], list):
+            out["context"] = _as_str_list(out.get("context"), max_len=6)
+
+        # markets
+        mk = out.get("markets")
+        if mk is None:
+            out["markets"] = []
+        elif not isinstance(mk, list):
+            out["markets"] = []
+    else:
+        # ui_pre fields
+        if "key_factors" in out and not isinstance(out["key_factors"], list):
+            out["key_factors"] = _as_str_list(out.get("key_factors"), max_len=6)
+        if "line_logic" in out and not isinstance(out["line_logic"], list):
+            out["line_logic"] = _as_str_list(out.get("line_logic"), max_len=6)
+
+        summary = str(out.get("summary") or "").strip()
+        if not summary and not out.get("key_factors") and not out.get("line_logic"):
+            out["summary"] = "Короткий разбор недоступен — показываю базовую структуру."
+
+    return out
+
+
+# -----------------------------
+# Validation
+# -----------------------------
 def validate_analysis_json(obj: Any) -> Tuple[bool, Optional[LLMAnalysis], str]:
     if not isinstance(obj, dict):
         return False, None, "root is not an object"
@@ -120,6 +203,11 @@ def validate_analysis_json(obj: Any) -> Tuple[bool, Optional[LLMAnalysis], str]:
 
 
 def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """
+    schema:
+      - ui_pre  -> {title, summary, key_factors, line_logic, risks, disclaimer}
+      - ui_live -> {title, context, markets, risks, disclaimer}
+    """
     if not isinstance(obj, dict):
         return False, None, "root is not an object"
 
@@ -151,7 +239,13 @@ def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, An
         if not context and not mk_out:
             return False, None, "context and markets are empty"
 
-        return True, {"title": title, "context": context, "markets": mk_out, "risks": risks, "disclaimer": disclaimer}, "ok"
+        return True, {
+            "title": title,
+            "context": context,
+            "markets": mk_out,
+            "risks": risks,
+            "disclaimer": disclaimer,
+        }, "ok"
 
     # ui_pre
     summary = str(obj.get("summary", "")).strip()
@@ -161,15 +255,25 @@ def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, An
     if not summary and not key_factors and not line_logic:
         return False, None, "summary/key_factors/line_logic are empty"
 
-    return True, {"title": title, "summary": summary, "key_factors": key_factors, "line_logic": line_logic, "risks": risks, "disclaimer": disclaimer}, "ok"
+    return True, {
+        "title": title,
+        "summary": summary,
+        "key_factors": key_factors,
+        "line_logic": line_logic,
+        "risks": risks,
+        "disclaimer": disclaimer,
+    }, "ok"
 
 
+# -----------------------------
+# Fallbacks
+# -----------------------------
 def fallback_analysis(_: str) -> LLMAnalysis:
     return LLMAnalysis(
         verdict="unclear",
         confidence=0.35,
         reasoning_bullets=[
-            "LLM недоступен/не успел за SLA — даю безопасный базовый разбор.",
+            "LLM недоступен/не успел — даю безопасный базовый разбор.",
             "Сверь коэффициенты и движение линии (если есть), избегай решений «на эмоциях».",
             "Соблюдай банк-менеджмент: фиксированный % на ставку, без догонов.",
         ],
@@ -180,12 +284,15 @@ def fallback_analysis(_: str) -> LLMAnalysis:
         checklist=[
             "Проверь составы/вратарей/ключевых игроков",
             "Проверь календарь (b2b, перелёты)",
-            "Сравни линию у 2–3 источников (позже подключим)",
+            "Сравни линию у 2–3 источников",
             "Определи max stake по банк-менеджменту",
         ],
     )
 
 
+# -----------------------------
+# Prompts
+# -----------------------------
 _SYSTEM_PROMPT_LEGACY = """Ты спортивный аналитик.
 Отвечай СТРОГО валидным JSON без markdown и без комментариев.
 Схема ответа:
@@ -203,6 +310,7 @@ _SYSTEM_PROMPT_UI = """Ты спортивный аналитик.
 Отвечай СТРОГО валидным JSON без markdown и без комментариев.
 Не давай прогнозов и рекомендаций по ставкам.
 Не используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%.
+Обязательно всегда возвращай непустые поля "title" и "disclaimer".
 Никакого текста вне JSON.
 """
 
@@ -214,6 +322,9 @@ def _make_user_prompt(domain_prompt: str) -> str:
     )
 
 
+# -----------------------------
+# OpenAI call
+# -----------------------------
 async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set")
@@ -226,10 +337,19 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _make_user_prompt(domain_prompt)},
         ],
-        "max_tokens": 450,
+        # меньше токенов = быстрее ответ
+        "max_tokens": 220,
     }
 
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
+    timeout = httpx.Timeout(
+        timeout_s,
+        connect=min(5.0, timeout_s),
+        read=timeout_s,
+        write=min(5.0, timeout_s),
+        pool=min(5.0, timeout_s),
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
@@ -238,34 +358,24 @@ async def _openai_chat_json(domain_prompt: str, timeout_s: float, system_prompt:
     if not content:
         raise ValueError("empty OpenAI response content")
 
-    try:
-        obj = json.loads(content)
-    except json.JSONDecodeError:
-        s = content.strip()
-        start = s.find("{")
-        end = s.rfind("}")
-        if start >= 0 and end > start:
-            obj = json.loads(s[start:end + 1])
-        else:
-            raise ValueError("invalid JSON from model")
-
-    if not isinstance(obj, dict):
-        raise ValueError("model JSON root is not an object")
-    return obj
+    return _try_extract_json_obj(content)
 
 
 def _sleep_jitter(base: float) -> float:
     return base + random.random() * 0.12
 
 
+# -----------------------------
+# LLM main
+# -----------------------------
 async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tuple[LLMOutput, dict]:
     start = time.monotonic()
     attempts = 0
     last_error: Optional[str] = None
 
-    # LLM выключен
+    # Disabled
     if not LLM_ENABLED:
-        used_meta = {
+        meta = {
             "provider": "disabled",
             "attempts": 0,
             "elapsed_ms": int((time.monotonic() - start) * 1000),
@@ -273,7 +383,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "last_error": "LLM_ENABLED=0",
         }
         if schema == "legacy":
-            return fallback_analysis(domain_prompt), used_meta
+            return fallback_analysis(domain_prompt), meta
         if schema == "ui_live":
             return {
                 "title": "🟢 LIVE-обзор",
@@ -281,7 +391,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                 "markets": [],
                 "risks": ["Недостаточно данных для детального LIVE-разбора."],
                 "disclaimer": "Аналитический материал, не является рекомендацией.",
-            }, used_meta
+            }, meta
         return {
             "title": "📊 Обзор рынков",
             "summary": "AI отключён (LLM_ENABLED=0).",
@@ -289,11 +399,11 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "line_logic": [],
             "risks": ["Недостаточно данных для детального разбора."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }, used_meta
+        }, meta
 
-    # dummy
+    # Dummy
     if LLM_PROVIDER == "dummy":
-        used_meta = {
+        meta = {
             "provider": "dummy",
             "attempts": 0,
             "elapsed_ms": int((time.monotonic() - start) * 1000),
@@ -301,7 +411,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "last_error": "LLM_PROVIDER=dummy",
         }
         if schema == "legacy":
-            return fallback_analysis(domain_prompt), used_meta
+            return fallback_analysis(domain_prompt), meta
         if schema == "ui_live":
             return {
                 "title": "🟢 LIVE-обзор",
@@ -309,7 +419,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                 "markets": [],
                 "risks": ["Отключён внешний LLM."],
                 "disclaimer": "Аналитический материал, не является рекомендацией.",
-            }, used_meta
+            }, meta
         return {
             "title": "📊 Обзор рынков",
             "summary": "LLM_PROVIDER=dummy — безопасный режим.",
@@ -317,7 +427,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "line_logic": [],
             "risks": ["Отключён внешний LLM."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }, used_meta
+        }, meta
 
     deadline = start + max(0.1, LLM_TOTAL_TIMEOUT_S)
 
@@ -328,7 +438,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             last_error = "deadline_exceeded"
             break
 
-        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.2, remaining))
+        attempt_timeout = min(LLM_ATTEMPT_TIMEOUT_S, max(0.3, remaining))
 
         try:
             system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
@@ -349,7 +459,9 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                     "last_error": None,
                 }
 
-            ok, analysis2, msg = validate_ui_json(schema, obj)
+            # UI schemas: normalize then validate
+            obj2 = _normalize_ui_obj(schema, obj)
+            ok, analysis2, msg = validate_ui_json(schema, obj2)
             if not ok or analysis2 is None:
                 raise ValueError(f"ui schema validation failed: {msg}")
 
@@ -366,6 +478,7 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
         except httpx.HTTPStatusError as e:
             code = e.response.status_code
             last_error = f"http_{code}"
+            # на 4xx (кроме ретраимых) — прекращаем
             if code not in (408, 409, 425, 429, 500, 502, 503, 504):
                 break
         except (ValueError, RuntimeError) as e:
@@ -379,16 +492,15 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
                 await asyncio.sleep(sleep_s)
 
     # fallback
-    meta = {
-        "provider": "openai",
-        "attempts": attempts,
-        "elapsed_ms": int((time.monotonic() - start) * 1000),
-        "used_fallback": True,
-        "last_error": last_error,
-    }
-
     if schema == "legacy":
-        return fallback_analysis(domain_prompt), meta
+        a = fallback_analysis(domain_prompt)
+        return a, {
+            "provider": "openai",
+            "attempts": attempts,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+            "used_fallback": True,
+            "last_error": last_error,
+        }
 
     if schema == "ui_live":
         return {
@@ -397,7 +509,13 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
             "markets": [],
             "risks": ["Недостаточно данных для детального LIVE-разбора."],
             "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }, meta
+        }, {
+            "provider": "openai",
+            "attempts": attempts,
+            "elapsed_ms": int((time.monotonic() - start) * 1000),
+            "used_fallback": True,
+            "last_error": last_error,
+        }
 
     return {
         "title": "📊 Обзор рынков",
@@ -406,9 +524,18 @@ async def analyze_with_llm(domain_prompt: str, *, schema: str = "legacy") -> Tup
         "line_logic": [],
         "risks": ["Недостаточно данных для детального разбора."],
         "disclaimer": "Аналитический материал, не является рекомендацией.",
-    }, meta
+    }, {
+        "provider": "openai",
+        "attempts": attempts,
+        "elapsed_ms": int((time.monotonic() - start) * 1000),
+        "used_fallback": True,
+        "last_error": last_error,
+    }
 
 
+# -----------------------------
+# Cache wrapper
+# -----------------------------
 async def analyze_with_llm_cached(
     domain_prompt: str,
     *,
@@ -416,15 +543,11 @@ async def analyze_with_llm_cached(
     ttl_s: Optional[int] = None,
     schema: str = "legacy",
 ) -> Tuple[LLMOutput, dict]:
+    """
+    Cached wrapper. cache_key обязателен.
+    Хранит (analysis, meta) в памяти процесса.
+    """
     now = time.time()
-
-    # ttl=0 => всегда мимо кэша (удобно для llm ping)
-    if ttl_s == 0:
-        analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
-        meta2 = dict(meta)
-        meta2["cache"] = "miss"
-        return analysis, meta2
-
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
 
@@ -436,7 +559,8 @@ async def analyze_with_llm_cached(
                 meta2 = dict(meta)
                 meta2["cache"] = "hit"
                 return analysis, meta2
-            _CACHE.pop(cache_key, None)
+            else:
+                _CACHE.pop(cache_key, None)
 
     analysis, meta = await analyze_with_llm(domain_prompt, schema=schema)
     meta2 = dict(meta)
@@ -448,6 +572,9 @@ async def analyze_with_llm_cached(
     return analysis, meta2
 
 
+# -----------------------------
+# Legacy renderer (telegram)
+# -----------------------------
 def render_analysis_text(a: LLMAnalysis) -> str:
     verdict_map = {"lean_yes": "🟢 Скорее ДА", "lean_no": "🔴 Скорее НЕТ", "unclear": "⚪️ Неясно"}
     lines: list[str] = []
