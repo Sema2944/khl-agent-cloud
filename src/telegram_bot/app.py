@@ -1,10 +1,10 @@
-# src/telegram_bot/app.py  (v6)
+# src/telegram_bot/app.py  (v6.1)
 from __future__ import annotations
 
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import (
@@ -177,6 +177,16 @@ async def _edit_or_send(
 async def _send_menu(update: Update) -> None:
     if update.message:
         await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
+        return
+
+    # callback case: попробуем отправить в чат, если есть
+    try:
+        chat = update.effective_chat
+        bot = update.get_bot()
+        if chat and bot:
+            await bot.send_message(chat_id=chat.id, text="Меню ниже 👇", reply_markup=MAIN_KB)
+    except Exception:
+        logger.exception("_send_menu fallback failed")
 
 
 # -----------------------------
@@ -259,9 +269,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Унифицируем: всё рисуем редактированием query.message (единый экран)
     screen_msg: Message = query.message
 
-    # BACK -> MENU
+    # BACK -> MENU  (FIX: не оставляем "старый" inline-экран с кнопками)
     if data == "BACK:MENU":
-        await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
+        # 1) гасим inline-экран: редактируем текущее сообщение и убираем inline-кнопки
+        await _edit_or_send(
+            screen_msg,
+            "🏠 Главное меню\n\nВыбирай действие кнопками ниже 👇",
+            reply_markup=None,
+        )
+        # 2) возвращаем ReplyKeyboard отдельным сообщением
+        await _send_menu(update)
         return
 
     # BACK -> SPORTS
@@ -398,6 +415,6 @@ def mount(fastapi_app: FastAPI) -> None:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         payload = await request.json()
-        update = Update.de_json(payload, tg_app.bot)
-        await tg_app.process_update(update)
+        upd = Update.de_json(payload, tg_app.bot)
+        await tg_app.process_update(upd)
         return {"ok": True}
