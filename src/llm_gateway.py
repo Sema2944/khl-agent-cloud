@@ -23,6 +23,7 @@ LLM_429_COOLDOWN_MAX_S = int((os.getenv("LLM_429_COOLDOWN_MAX_S") or "3600").str
 GW_MAX_CACHE_ITEMS = int((os.getenv("GW_MAX_CACHE_ITEMS") or "2000").strip())
 GW_CLEANUP_EVERY_S = int((os.getenv("GW_CLEANUP_EVERY_S") or "30").strip())
 
+
 # -----------------------------
 # Types expected by llm_client
 # -----------------------------
@@ -193,12 +194,10 @@ class LLMGateway:
             if task is not None:
                 try:
                     obj, meta = await task
-                    # overwrite cache marker
                     meta.cache = "dedupe"
                     meta.elapsed_ms = int((_mono_now() - t0) * 1000)
                     return obj, meta
                 except Exception as e:
-                    # if the inflight task crashed, fall through and recompute
                     logger.warning("gateway inflight task failed for key=%s err=%r", cache_key, e)
 
             # create task for this key
@@ -214,12 +213,10 @@ class LLMGateway:
 
         try:
             obj, meta = await task
-            # task already returns meta.cache="miss"
             meta.elapsed_ms = int((_mono_now() - t0) * 1000)
             return obj, meta
         finally:
             async with self._inflight_lock:
-                # remove if still pointing to our task
                 cur = self._inflight.get(cache_key)
                 if cur is task:
                     self._inflight.pop(cache_key, None)
