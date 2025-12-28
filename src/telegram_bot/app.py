@@ -161,7 +161,7 @@ async def _edit_or_send(
             await msg.edit_text(text, reply_markup=reply_markup)
             return
         except BadRequest as e:
-            # Очень частая ситуация: "Message is not modified"
+            # Частая ситуация: "Message is not modified"
             if "message is not modified" in str(e).lower():
                 return
             logger.warning("edit_text BadRequest -> fallback to send. err=%s", e)
@@ -172,21 +172,6 @@ async def _edit_or_send(
         await msg.reply_text(text, reply_markup=reply_markup)
     except Exception:
         logger.exception("reply_text failed")
-
-
-async def _send_menu(update: Update) -> None:
-    if update.message:
-        await update.message.reply_text("Меню ниже 👇", reply_markup=MAIN_KB)
-        return
-
-    # callback case: попробуем отправить в чат, если есть
-    try:
-        chat = update.effective_chat
-        bot = update.get_bot()
-        if chat and bot:
-            await bot.send_message(chat_id=chat.id, text="Меню ниже 👇", reply_markup=MAIN_KB)
-    except Exception:
-        logger.exception("_send_menu fallback failed")
 
 
 # -----------------------------
@@ -228,7 +213,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Главное меню: Матчи сегодня ---
     if norm == "матчи сегодня":
-        # присылаем новый "экран" со спортами (inline)
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
@@ -266,19 +250,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("tg.callback user_id=%s data=%r", user_id, data)
     await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
 
-    # Унифицируем: всё рисуем редактированием query.message (единый экран)
+    # Единый экран — редактируем query.message
     screen_msg: Message = query.message
 
-    # BACK -> MENU  (FIX: не оставляем "старый" inline-экран с кнопками)
+    # BACK -> MENU
     if data == "BACK:MENU":
-        # 1) гасим inline-экран: редактируем текущее сообщение и убираем inline-кнопки
-        await _edit_or_send(
-            screen_msg,
-            "🏠 Главное меню\n\nВыбирай действие кнопками ниже 👇",
-            reply_markup=None,
-        )
-        # 2) возвращаем ReplyKeyboard отдельным сообщением
-        await _send_menu(update)
+        # меню — лучше отдельным сообщением (force_new), чтобы не ломать "экран" истории
+        await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
         return
 
     # BACK -> SPORTS
@@ -292,7 +270,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         last_buttons = context.user_data.get("last_match_buttons") or []
         last_sport_key = context.user_data.get("last_sport_key")
 
-        # если текста нет — пробуем восстановить из sport_key
         if not last_text and last_sport_key:
             last_text = await call_agent_local(user_id, f"матчи сегодня {last_sport_key}")
             context.user_data["last_matches_text"] = last_text
@@ -305,7 +282,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # SPORT -> список матчей (в ЭТОМ ЖЕ экране)
+    # SPORT -> список матчей
     if data.startswith("SPORT:"):
         sport_key = data.split(":", 1)[1].strip()
         context.user_data["last_sport_key"] = sport_key
@@ -322,7 +299,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
         return
 
-    # MATCH -> экран матча + хаб кнопок (в ЭТОМ ЖЕ экране)
+    # MATCH -> экран матча + хаб
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1].strip()
         context.user_data["active_match_id"] = match_id
@@ -331,7 +308,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    # UI actions -> ui match <id> <mode> <action> (в ЭТОМ ЖЕ экране)
+    # UI actions
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -349,7 +326,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # -----------------------------
-# Errors handler (чтобы не было "No error handlers")
+# Errors handler
 # -----------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled telegram error: %s", context.error)
@@ -415,6 +392,6 @@ def mount(fastapi_app: FastAPI) -> None:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         payload = await request.json()
-        upd = Update.de_json(payload, tg_app.bot)
-        await tg_app.process_update(upd)
+        update = Update.de_json(payload, tg_app.bot)
+        await tg_app.process_update(update)
         return {"ok": True}
