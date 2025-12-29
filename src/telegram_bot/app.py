@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v6.1)
+# src/telegram_bot/app.py  (v6.1) — FULL REPLACEMENT
 from __future__ import annotations
 
 import logging
@@ -152,7 +152,7 @@ async def _edit_or_send(
     """
     Пытаемся редактировать текущий message (единый "экран").
     Если нельзя/ошибка — отправляем новое.
-    Не используем parse_mode (plain text), чтобы не ловить entities.
+    Plain text (без parse_mode), чтобы не ловить entities.
     """
     text = (text or "").strip() or "…"
 
@@ -255,7 +255,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # BACK -> MENU
     if data == "BACK:MENU":
-        # меню — лучше отдельным сообщением (force_new), чтобы не ломать "экран" истории
+        # меню — лучше отдельным сообщением, чтобы не конфликтовать с edit_text текущего "экрана"
         await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
         return
 
