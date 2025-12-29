@@ -16,3 +16,5 @@ python-dotenv==1.0.1
 python-telegram-bot==21.6
 aiogram==3.6.0
 redis==5.0.8
+sqlalchemy>=2.0
+asyncpg
