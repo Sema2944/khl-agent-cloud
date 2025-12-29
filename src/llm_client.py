@@ -432,13 +432,66 @@ async def analyze_with_llm_cached(
     Единственная точка входа.
     - Redis cache / dedupe / quotas / global rpm-tpm / 429 cooldown -> через gateway
     - Локально: мягкий per-user throttle (Telegram-friendly)
+    - ACCESS (free/premium) -> здесь, ДО вызова OpenAI
     """
     start = time.monotonic()
 
     if ttl_s is None:
         ttl_s = LLM_CACHE_TTL_LIVE_S if schema == "ui_live" else LLM_CACHE_TTL_S
 
+    # -----------------------------
+    # ACCESS CONTROL (free/premium) — ДО ЛЮБЫХ LLM ВЫЗОВОВ
+    # -----------------------------
+    # Требует файлов:
+    #   src/user_access.py
+    #   src/user_store.py
+    #
+    # Если schema == ui_live:
+    #   - FREE: 1 trial (первый live), затем paywall
+    #   - PREMIUM: всегда можно
+    if schema == "ui_live" and user_id is not None:
+        try:
+            from .user_store import get_user, mark_trial_used
+        except Exception:
+            # если файлы ещё не добавлены — не ломаем прод, просто пропускаем
+            get_user = None
+            mark_trial_used = None
+
+        if get_user is not None:
+            u = get_user(int(user_id))
+
+            # paywall
+            if not getattr(u, "can_live", False):
+                meta = {
+                    "provider": "access",
+                    "attempts": 0,
+                    "elapsed_ms": int((time.monotonic() - start) * 1000),
+                    "used_fallback": True,
+                    "last_error": "premium_required",
+                    "cache": "miss",
+                }
+                return (
+                    {
+                        "title": "🟢 LIVE-обзор — Premium",
+                        "context": [
+                            "LIVE-анализ доступен в Premium.",
+                            "В Premium: обновления по ходу матча, без задержек.",
+                        ],
+                        "markets": [],
+                        "risks": [],
+                        "disclaimer": "Доступ ограничен тарифом.",
+                    },
+                    meta,
+                )
+
+            # trial “сжигаем” только если реально пропускаем в LLM
+            if (not getattr(u, "is_premium", False)) and (not getattr(u, "trial_live_used", True)):
+                if mark_trial_used is not None:
+                    mark_trial_used(int(user_id))
+
+    # -----------------------------
     # Disabled
+    # -----------------------------
     if not LLM_ENABLED:
         meta = {
             "provider": "disabled",
@@ -452,7 +505,9 @@ async def analyze_with_llm_cached(
             return fallback_analysis(domain_prompt), meta
         return _fallback_ui(schema, "AI отключён (LLM_ENABLED=0)."), meta
 
+    # -----------------------------
     # Dummy
+    # -----------------------------
     if LLM_PROVIDER == "dummy":
         meta = {
             "provider": "dummy",
@@ -466,7 +521,9 @@ async def analyze_with_llm_cached(
             return fallback_analysis(domain_prompt), meta
         return _fallback_ui(schema, "LLM_PROVIDER=dummy — безопасный режим."), meta
 
+    # -----------------------------
     # Telegram-friendly per-user throttle (дешёвый анти-спам)
+    # -----------------------------
     if user_id is not None:
         wait_s = await _per_user_throttle(int(user_id))
         if wait_s and wait_s > 0.01:
@@ -482,7 +539,9 @@ async def analyze_with_llm_cached(
                 return fallback_analysis(domain_prompt), meta
             return _fallback_ui(schema, "Слишком частые запросы — подожди пару секунд."), meta
 
+    # -----------------------------
     # choose kind for gateway quotas/ttl
+    # -----------------------------
     if schema == "ui_live":
         kind = "live"
     else:
@@ -520,21 +579,31 @@ async def analyze_with_llm_cached(
                     ok, analysis, msg = validate_analysis_json(obj)
                     if not ok or analysis is None:
                         raise ValueError(f"schema validation failed: {msg}")
-                    return analysis.to_dict(), {"provider": "openai", "attempts": attempts, "used_fallback": False, "last_error": None}, {}
+                    return analysis.to_dict(), {
+                        "provider": "openai",
+                        "attempts": attempts,
+                        "used_fallback": False,
+                        "last_error": None,
+                    }, {}
 
                 obj2 = _normalize_ui_obj(schema, obj)
                 ok, analysis2, msg = validate_ui_json(schema, obj2)
                 if not ok or analysis2 is None:
                     raise ValueError(f"ui schema validation failed: {msg}")
 
-                return analysis2, {"provider": "openai", "attempts": attempts, "used_fallback": False, "last_error": None}, {}
+                return analysis2, {
+                    "provider": "openai",
+                    "attempts": attempts,
+                    "used_fallback": False,
+                    "last_error": None,
+                }, {}
 
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code if e.response is not None else 0
                 headers = dict(e.response.headers) if e.response is not None else {}
                 last_error = f"http_{code}"
 
-                # Логируем 429 подробно (как у тебя было)
+                # Логируем 429 подробно
                 if code == 429 and e.response is not None:
                     try:
                         body = e.response.text or ""
@@ -558,7 +627,13 @@ async def analyze_with_llm_cached(
 
                 # Если 429 — смысла ретраить в этом же цикле обычно нет
                 if code == 429:
-                    return None, {"provider": "openai", "attempts": attempts, "used_fallback": True, "last_error": last_error, "http_status": 429}, headers
+                    return None, {
+                        "provider": "openai",
+                        "attempts": attempts,
+                        "used_fallback": True,
+                        "last_error": last_error,
+                        "http_status": 429,
+                    }, headers
 
                 # На неретраимых 4xx — стоп
                 if code and code not in (408, 409, 425, 429, 500, 502, 503, 504):
@@ -623,6 +698,7 @@ async def analyze_with_llm_cached(
     meta["used_fallback"] = False
     meta["last_error"] = None
     return obj, meta
+
 
 
 # -----------------------------
