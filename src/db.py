@@ -11,7 +11,6 @@ from sqlalchemy.orm import sessionmaker
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
 # Force psycopg (v3) driver on Postgres
-# postgresql:// -> postgresql+psycopg://
 if DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -25,7 +24,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db() -> None:
-    # если используешь SQLModel/metadata — можешь тут вызывать create_all
+    # Если используешь SQLModel:
     # from sqlmodel import SQLModel
     # SQLModel.metadata.create_all(engine)
     return
