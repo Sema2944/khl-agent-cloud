@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v6.1) — FULL REPLACEMENT
+# src/telegram_bot/app.py  (v6.2)
 from __future__ import annotations
 
 import logging
@@ -25,35 +25,29 @@ from telegram.ext import (
     filters,
 )
 
+from ..user_store import get_or_create_user
+from ..entitlements import get_effective_entitlements
+
 logger = logging.getLogger(__name__)
 
-# -----------------------------
-# ENV
-# -----------------------------
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
-WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()  # optional
+WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-# -----------------------------
-# Главное меню (ReplyKeyboard)
-# -----------------------------
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["🏟 Матчи сегодня"],
         ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
-        ["📊 Профиль"],
+        ["📊 Профиль", "⭐ Premium"],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
 
-# -----------------------------
-# Inline клавиатуры
-# -----------------------------
 SPORTS = [
     ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
@@ -62,14 +56,9 @@ SPORTS = [
     ("esports", "🎮 Киберспорт"),
 ]
 
-# ожидаем строки типа:
-# • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _norm_menu(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
@@ -116,9 +105,6 @@ def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Все AI-разборы идут через команду: ui match <id> <mode> <action>
-    """
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
@@ -137,31 +123,27 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
     )
 
 
+def kb_premium() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔓 Активировать Premium", callback_data="PAY:PREMIUM")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+        ]
+    )
+
+
 async def call_agent_local(user_id: int, message: str) -> str:
     from ..parsing import run_dialog_agent
     return await run_dialog_agent(user_id=user_id, message=message)
 
 
-async def _edit_or_send(
-    msg: Message,
-    text: str,
-    *,
-    reply_markup=None,
-    force_new: bool = False,
-) -> None:
-    """
-    Пытаемся редактировать текущий message (единый "экран").
-    Если нельзя/ошибка — отправляем новое.
-    Plain text (без parse_mode), чтобы не ловить entities.
-    """
+async def _edit_or_send(msg: Message, text: str, *, reply_markup=None, force_new: bool = False) -> None:
     text = (text or "").strip() or "…"
-
     if not force_new:
         try:
             await msg.edit_text(text, reply_markup=reply_markup)
             return
         except BadRequest as e:
-            # Частая ситуация: "Message is not modified"
             if "message is not modified" in str(e).lower():
                 return
             logger.warning("edit_text BadRequest -> fallback to send. err=%s", e)
@@ -174,12 +156,11 @@ async def _edit_or_send(
         logger.exception("reply_text failed")
 
 
-# -----------------------------
-# Handlers
-# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    # создаём юзера сразу
+    u = get_or_create_user(update.effective_user.id)
     await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
         reply_markup=MAIN_KB,
@@ -200,6 +181,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    u = get_or_create_user(update.effective_user.id)
+    ent = get_effective_entitlements(u.id)
+
+    text = (
+        "⭐ Premium\n\n"
+        f"Текущий доступ: {ent.tier.upper()}\n"
+        f"Лимит AI/день: {ent.ai_daily_limit}\n"
+        f"Минимальная пауза LIVE: {ent.live_min_interval_sec} сек\n\n"
+        "Premium даёт больше лимитов и расширенные фичи.\n"
+        "Оплата подключается следующим шагом — кнопка уже готова."
+    )
+    await update.message.reply_text(text, reply_markup=kb_premium())
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -208,32 +206,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text or ""
     norm = _norm_menu(text)
 
+    get_or_create_user(user_id)
+
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    # --- Главное меню: Матчи сегодня ---
     if norm == "матчи сегодня":
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # --- Профиль ---
     if norm in {"профиль", "мой профиль", "статы", "статистика"}:
         reply = await call_agent_local(user_id, "профиль")
         await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
-    # --- Стратегия эксперта ---
     if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
         reply = await call_agent_local(user_id, "стратегия")
         await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
-    # --- AI аналитика (help) ---
     if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
         await help_cmd(update, context)
         return
 
-    # --- Остальное: в агента ---
+    if norm in {"premium", "премиум", "⭐ premium"}:
+        await premium_cmd(update, context)
+        return
+
     reply = await call_agent_local(user_id, text)
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
@@ -244,36 +243,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     data = query.data or ""
-    user_id = query.from_user.id
+    tg_user_id = query.from_user.id
     await query.answer()
 
-    logger.info("tg.callback user_id=%s data=%r", user_id, data)
+    logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
     await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
 
-    # Единый экран — редактируем query.message
     screen_msg: Message = query.message
 
-    # BACK -> MENU
     if data == "BACK:MENU":
-        # меню — лучше отдельным сообщением, чтобы не конфликтовать с edit_text текущего "экрана"
         await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
         return
 
-    # BACK -> SPORTS
     if data == "BACK:SPORTS":
         await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # BACK -> MATCHES
     if data == "BACK:MATCHES":
         last_text = context.user_data.get("last_matches_text")
         last_buttons = context.user_data.get("last_match_buttons") or []
         last_sport_key = context.user_data.get("last_sport_key")
 
         if not last_text and last_sport_key:
-            last_text = await call_agent_local(user_id, f"матчи сегодня {last_sport_key}")
+            reply = await call_agent_local(tg_user_id, f"матчи сегодня {last_sport_key}")
+            last_text = reply
+            last_buttons = extract_match_buttons(reply)
             context.user_data["last_matches_text"] = last_text
-            last_buttons = extract_match_buttons(last_text)
             context.user_data["last_match_buttons"] = last_buttons
 
         if last_text and last_buttons:
@@ -282,12 +277,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # SPORT -> список матчей
     if data.startswith("SPORT:"):
         sport_key = data.split(":", 1)[1].strip()
         context.user_data["last_sport_key"] = sport_key
 
-        reply = await call_agent_local(user_id, f"матчи сегодня {sport_key}")
+        reply = await call_agent_local(tg_user_id, f"матчи сегодня {sport_key}")
         match_buttons = extract_match_buttons(reply)
 
         context.user_data["last_matches_text"] = reply
@@ -299,16 +293,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
         return
 
-    # MATCH -> экран матча + хаб
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1].strip()
         context.user_data["active_match_id"] = match_id
 
-        reply = await call_agent_local(user_id, f"матч {match_id}")
+        reply = await call_agent_local(tg_user_id, f"матч {match_id}")
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    # UI actions
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -318,45 +310,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, match_id, mode, action = parts
         context.user_data["active_match_id"] = match_id
 
-        reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
+        reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+        return
+
+    if data == "PAY:PREMIUM":
+        # Сейчас skeleton: позже подключим Telegram Payments/YooKassa, но UX уже не меняется
+        await _edit_or_send(
+            screen_msg,
+            "🔓 Premium (скоро)\n\n"
+            "Мы уже подготовили архитектуру подписок.\n"
+            "Следующий шаг — подключить оплату (Telegram Payments / YooKassa) и вебхук.\n\n"
+            "Пока можно активировать Premium вручную через админ-команду (добавим).",
+            reply_markup=kb_premium(),
+        )
         return
 
     await _edit_or_send(screen_msg, "Не понял действие 🤔", reply_markup=MAIN_KB)
 
 
-# -----------------------------
-# Errors handler
-# -----------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled telegram error: %s", context.error)
 
 
-# -----------------------------
-# Application factory
-# -----------------------------
 def build_telegram_application() -> Application:
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("premium", premium_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     tg_app.add_error_handler(error_handler)
     return tg_app
 
 
-# -----------------------------
-# FastAPI mount (webhook-only)
-# -----------------------------
 def mount(fastapi_app: FastAPI) -> None:
-    """
-    Регистрирует /telegram/webhook и lifecycle-хуки.
-    НИКАКОГО polling.
-    """
     tg_app = build_telegram_application()
     fastapi_app.state.telegram_app = tg_app
 
     async def _startup() -> None:
+        from ..db import init_db
+        init_db()
+
         await tg_app.initialize()
         await tg_app.start()
 
