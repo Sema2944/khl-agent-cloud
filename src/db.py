@@ -8,26 +8,52 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
-# Force psycopg (v3) driver on Postgres
-if DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+def _normalize_database_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return "sqlite:///./app.db"
+
+    # Render часто отдаёт DATABASE_URL как postgres://...
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+
+    # Принудительно используем psycopg v3 на Postgres
+    if url.startswith("postgresql://") and "+psycopg" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    return url
+
+
+DATABASE_URL = _normalize_database_url(os.getenv("DATABASE_URL"))
+
+# SQLite options
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
     DATABASE_URL,
     echo=False,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    connect_args=connect_args,
     pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
 def init_db() -> None:
-    # Если используешь SQLModel:
+    """
+    Если используешь SQLModel/SQLAlchemy модели — раскомментируй нужное.
+    """
+    # Вариант SQLModel:
     # from sqlmodel import SQLModel
     # SQLModel.metadata.create_all(engine)
+
+    # Вариант SQLAlchemy declarative:
+    # from .models import Base
+    # Base.metadata.create_all(bind=engine)
+
     return
+
 
 @contextmanager
 def get_session() -> Generator:
