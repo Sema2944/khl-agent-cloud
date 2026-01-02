@@ -3,7 +3,7 @@ services:
     name: khl-agent-api
     runtime: python
     plan: free
-    buildCommand: pip install -e . && pip install python-telegram-bot==21.6
+    buildCommand: pip install -r requirements.txt
     startCommand: PYTHONPATH=. python scripts/serve.py
     envVars:
       - key: API_BASE
@@ -13,10 +13,10 @@ services:
     name: khl-agent-bot
     runtime: python
     plan: free
-    buildCommand: pip install -e . && pip install python-telegram-bot==21.6
+    buildCommand: pip install -r requirements.txt
     startCommand: PYTHONPATH=. python scripts/run_telegram.py
     envVars:
       - key: API_BASE
         value: https://khl-agent-api.onrender.com
       - key: TELEGRAM_BOT_TOKEN
-        sync: false   # токен добавим через панель Render
+        sync: false
