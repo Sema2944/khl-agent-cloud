@@ -1,75 +1,43 @@
 # src/models.py
 from __future__ import annotations
 
-from datetime import datetime, date
-from typing import Optional, Dict, Any
+from datetime import datetime
+from typing import Optional
 
-from sqlmodel import SQLModel, Field, Column
-from sqlalchemy import JSON, UniqueConstraint
+from sqlalchemy import UniqueConstraint
+from sqlmodel import SQLModel, Field
 
 
 class User(SQLModel, table=True):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("tg_user_id", name="uq_users_tg_user_id"),
+        {"extend_existing": True},
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    tg_user_id: int = Field(index=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    # удобный флаг (но НЕ источник истины)
-    tier: str = Field(default="free", index=True)  # "free" | "premium"
+    # Telegram
+    tg_user_id: int = Field(index=True, nullable=False)
 
-    __table_args__ = (UniqueConstraint("tg_user_id", name="uq_users_tg_user_id"),)
+    # Billing / access
+    is_premium: bool = Field(default=False, nullable=False)
+    premium_until: Optional[datetime] = Field(default=None, nullable=True)
 
+    # FREE -> 1 trial LIVE
+    trial_live_used: bool = Field(default=False, nullable=False)
 
-class Subscription(SQLModel, table=True):
-    __tablename__ = "subscriptions"
+    # Counters / limits (на будущее)
+    free_llm_calls_today: int = Field(default=0, nullable=False)
+    free_llm_day: Optional[str] = Field(default=None, nullable=True)  # YYYY-MM-DD
 
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True, foreign_key="users.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
-    provider: str = Field(default="manual", index=True)  # telegram | yookassa | manual
-    plan_code: str = Field(default="premium_month", index=True)
-
-    status: str = Field(default="inactive", index=True)  # active | inactive | canceled | expired | past_due
-    current_period_end: Optional[datetime] = Field(default=None, index=True)
-
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-
-
-class Entitlement(SQLModel, table=True):
-    """
-    Эффективные права/лимиты. Это то, на что опирается бизнес-логика.
-    Хочешь новый тариф/акцию — меняешь entitlements, код почти не трогаешь.
-    """
-    __tablename__ = "entitlements"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True, foreign_key="users.id")
-
-    # лимиты
-    ai_daily_limit: int = Field(default=10)
-    live_min_interval_sec: int = Field(default=30)  # минимальная пауза между LIVE-обновлениями
-
-    # фичи (просто включатели)
-    features: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
-
-    effective_from: datetime = Field(default_factory=datetime.utcnow, index=True)
-    effective_to: Optional[datetime] = Field(default=None, index=True)
-
-
-class UsageCounter(SQLModel, table=True):
-    """
-    Учет лимитов по дням.
-    """
-    __tablename__ = "usage_counters"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True, foreign_key="users.id")
-    day: date = Field(index=True)
-
-    ai_calls: int = Field(default=0)
-    live_calls: int = Field(default=0)
-
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
-
-    __table_args__ = (UniqueConstraint("user_id", "day", name="uq_usage_user_day"),)
+    @property
+    def can_live(self) -> bool:
+        # Premium всегда может
+        if self.is_premium:
+            return True
+        # Free может только если trial не использован
+        return not self.trial_live_used
