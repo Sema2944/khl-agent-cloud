@@ -1,36 +1,50 @@
 # src/db.py
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from typing import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlmodel import SQLModel
+
+logger = logging.getLogger(__name__)
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
-# На Render Postgres обычно приходит как postgresql://...
-# Для psycopg v3 нужен postgresql+psycopg://
+# --- Normalize Postgres URL to psycopg v3 driver ---
+# Render обычно даёт postgres://... (или postgresql://...)
+# SQLAlchemy 2 + psycopg3: postgresql+psycopg://...
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
     DATABASE_URL,
     echo=False,
+    connect_args=connect_args,
     pool_pre_ping=True,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    # Важно: импорт моделей ДО create_all, чтобы SQLModel увидел таблицы
-    from . import models  # noqa: F401
-
-    SQLModel.metadata.create_all(engine)
+    """
+    Создаёт таблицы (если используешь SQLModel).
+    Важно: НЕ валим весь сервис, если Postgres временно недоступен/не привязан.
+    """
+    try:
+        from sqlmodel import SQLModel
+        SQLModel.metadata.create_all(engine)
+        logger.info("DB init: create_all OK")
+    except Exception as e:
+        logger.exception("DB init failed (service will continue): %s", e)
 
 
 @contextmanager
