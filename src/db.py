@@ -14,11 +14,11 @@ def _normalize_database_url(url: str) -> str:
     if not url:
         return "sqlite:///./app.db"
 
-    # Render часто отдаёт DATABASE_URL как postgres://...
+    # Render иногда даёт postgres:// вместо postgresql://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
 
-    # Принудительно используем psycopg v3 на Postgres
+    # Принудительно используем psycopg v3 драйвер
     if url.startswith("postgresql://") and "+psycopg" not in url:
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -27,7 +27,6 @@ def _normalize_database_url(url: str) -> str:
 
 DATABASE_URL = _normalize_database_url(os.getenv("DATABASE_URL"))
 
-# SQLite options
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
@@ -41,17 +40,9 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """
-    Если используешь SQLModel/SQLAlchemy модели — раскомментируй нужное.
-    """
-    # Вариант SQLModel:
+    # Если используешь SQLModel:
     # from sqlmodel import SQLModel
     # SQLModel.metadata.create_all(engine)
-
-    # Вариант SQLAlchemy declarative:
-    # from .models import Base
-    # Base.metadata.create_all(bind=engine)
-
     return
 
 
