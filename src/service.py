@@ -26,26 +26,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent API")
 
-# ✅ ВАЖНО: монтируем Telegram webhook РАНЬШЕ startup,
-# чтобы маршрут /telegram/webhook был зарегистрирован до начала работы.
-try:
-    from .telegram_bot.app import mount as mount_telegram
-
-    mount_telegram(app)
-    logger.info("Telegram routes mounted.")
-except Exception as e:
-    # не падаем, чтобы API продолжал жить даже если телега не настроена
-    logger.exception("Failed to mount telegram webhook routes: %s", e)
-
 
 @app.get("/__health")
 def health():
     return {"ok": True}
 
 
-# -----------------------------
-# Healthcheck (Render)
-# -----------------------------
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ok", "service": "khl-agent-api"}
@@ -56,9 +42,6 @@ def favicon():
     return {}
 
 
-# -----------------------------
-# Pydantic модели
-# -----------------------------
 class QueryRequest(BaseModel):
     user_id: int
     message: Optional[str] = None
@@ -88,20 +71,21 @@ class BetSettle(BaseModel):
     result: str  # "win", "lose", "push"
 
 
-# -----------------------------
-# Startup
-# -----------------------------
 @app.on_event("startup")
 def on_startup():
+    # 1) DB init
     init_db()
-    logger.info(
-        "FastAPI сервис запущен (DB ok). Telegram webhook init is handled in telegram_bot/app.py startup hook."
-    )
+    logger.info("FastAPI startup: DB initialized.")
+
+    # 2) Telegram mount (после DB)
+    try:
+        from .telegram_bot.app import mount as mount_telegram
+        mount_telegram(app)
+        logger.info("Telegram routes mounted (startup).")
+    except Exception as e:
+        logger.exception("Failed to mount telegram webhook routes (startup): %s", e)
 
 
-# -----------------------------
-# Agent endpoint
-# -----------------------------
 @app.post("/agent/query", response_model=QueryResponse)
 async def agent_query(req: QueryRequest):
     text = req.text
@@ -125,9 +109,6 @@ async def agent_query(req: QueryRequest):
     return QueryResponse(reply=reply)
 
 
-# -----------------------------
-# Bets API
-# -----------------------------
 @app.get("/agent/last-bets")
 def api_last_bets(user_id: int, limit: int = 5, session: Session = Depends(get_session)):
     bets = get_last_bets(session, user_id, limit)
