@@ -11,8 +11,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: PYTHONPATH=. python scripts/serve.py
     envVars:
-      - key: API_BASE
-        value: https://khl-agent-api.onrender.com
       - key: DATABASE_URL
         fromDatabase:
           name: khl-db
@@ -25,8 +23,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: PYTHONPATH=. python scripts/run_telegram.py
     envVars:
-      - key: API_BASE
-        value: https://khl-agent-api.onrender.com
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
