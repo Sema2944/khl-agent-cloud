@@ -5,13 +5,32 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlmodel import SQLModel, Session, create_engine
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+# Render обычно даёт DATABASE_URL вида:
+# - postgres://user:pass@host:port/db
+# - postgresql://user:pass@host:port/db
+# Нам нужен драйвер psycopg v3:
+# - postgresql+psycopg://user:pass@host:port/db
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
-# Render может давать postgres:// — SQLAlchemy любит postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+def _normalize_db_url(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return "sqlite:///./app.db"
+
+    # Render legacy scheme
+    if u.startswith("postgres://"):
+        u = u.replace("postgres://", "postgresql://", 1)
+
+    # If it is postgres and no explicit driver -> force psycopg v3
+    if u.startswith("postgresql://") and "+psycopg" not in u:
+        u = u.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    return u
+
+DATABASE_URL = _normalize_db_url(DATABASE_URL)
 
 engine = create_engine(
     DATABASE_URL,
@@ -20,12 +39,18 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db() -> None:
-    SQLModel.metadata.create_all(engine)
-
+    # Если используешь SQLModel — раскомментируй:
+    # from sqlmodel import SQLModel
+    # SQLModel.metadata.create_all(engine)
+    return
 
 @contextmanager
-def get_session() -> Generator[Session, None, None]:
-    with Session(engine) as session:
-        yield session
+def get_session() -> Generator:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
