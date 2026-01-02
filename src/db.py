@@ -13,12 +13,17 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
-# --- Normalize Postgres URL to psycopg v3 driver ---
-# Render обычно даёт postgres://... (или postgresql://...)
-# SQLAlchemy 2 + psycopg3: postgresql+psycopg://...
+def _safe_url(u: str) -> str:
+    if "://" not in u:
+        return u
+    # грубо скрываем пароль
+    return u.replace("://", "://", 1).replace(":@", ":***@", 1)
+
+# normalize Render style
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# force psycopg v3 dialect
 if DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -35,14 +40,10 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """
-    Создаёт таблицы (если используешь SQLModel).
-    Важно: НЕ валим весь сервис, если Postgres временно недоступен/не привязан.
-    """
     try:
         from sqlmodel import SQLModel
         SQLModel.metadata.create_all(engine)
-        logger.info("DB init: create_all OK")
+        logger.info("DB init OK url=%s", _safe_url(DATABASE_URL))
     except Exception as e:
         logger.exception("DB init failed (service will continue): %s", e)
 
