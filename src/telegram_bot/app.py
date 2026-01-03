@@ -1,10 +1,10 @@
-# src/telegram_bot/app.py  (v6.3)
+# src/telegram_bot/app.py  (v6.3.1)
 from __future__ import annotations
 
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import (
@@ -69,7 +69,6 @@ SPORTS = [
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
 
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -119,9 +118,6 @@ def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Все AI-разборы идут через команду: ui match <id> <mode> <action>
-    """
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
@@ -150,14 +146,24 @@ def kb_premium() -> InlineKeyboardMarkup:
 
 
 def _premium_text(tg_user_id: int) -> str:
+    # предполагаем, что entitlements.py сам открывает сессию (мы это сделаем)
     ent = get_effective_entitlements(int(tg_user_id))
-    tier = ent.tier.upper()
+    tier = getattr(ent, "tier", "free").upper()
+
+    ai_daily_limit = getattr(ent, "ai_daily_limit", 0)
+    daily_ai_left = getattr(ent, "daily_ai_left", 0)
+
+    live_refresh_daily_limit = getattr(ent, "live_refresh_daily_limit", 0)
+    live_refresh_left = getattr(ent, "live_refresh_left", 0)
+
+    live_min_interval_sec = getattr(ent, "live_min_interval_sec", 0)
+
     return (
         "⭐ Premium\n\n"
         f"Текущий доступ: {tier}\n"
-        f"Лимит AI/день: {ent.ai_daily_limit} (осталось {ent.daily_ai_left})\n"
-        f"LIVE refresh/день: {ent.live_refresh_daily_limit} (осталось {ent.live_refresh_left})\n"
-        f"Минимальная пауза LIVE: {int(ent.live_min_interval_sec)} сек\n\n"
+        f"Лимит AI/день: {ai_daily_limit} (осталось {daily_ai_left})\n"
+        f"LIVE refresh/день: {live_refresh_daily_limit} (осталось {live_refresh_left})\n"
+        f"Минимальная пауза LIVE: {int(live_min_interval_sec)} сек\n\n"
         "Premium даёт:\n"
         "• LIVE без ограничений\n"
         "• больше AI-лимитов\n"
@@ -177,10 +183,6 @@ async def _edit_or_send(
     reply_markup=None,
     force_new: bool = False,
 ) -> None:
-    """
-    Пытаемся редактировать текущий message (единый "экран").
-    Если нельзя/ошибка — отправляем новое.
-    """
     text = (text or "").strip() or "…"
 
     if not force_new:
@@ -198,6 +200,16 @@ async def _edit_or_send(
         await msg.reply_text(text, reply_markup=reply_markup)
     except Exception:
         logger.exception("reply_text failed")
+
+
+async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
+    if not chat_id:
+        return
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        # typing не критично
+        return
 
 
 # -----------------------------
@@ -238,10 +250,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    tg_user_id = update.effective_user.id
-
-    # гарантируем юзера
     tg_user = update.effective_user
+
     get_or_create_user(
         tg_user.id,
         username=tg_user.username,
@@ -249,7 +259,7 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         last_name=tg_user.last_name,
     )
 
-    await update.message.reply_text(_premium_text(tg_user_id), reply_markup=kb_premium())
+    await update.message.reply_text(_premium_text(tg_user.id), reply_markup=kb_premium())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -261,7 +271,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text or ""
     norm = _norm_menu(text)
 
-    # создаём/обновляем юзера
     get_or_create_user(
         user_id,
         username=tg_user.username,
@@ -270,7 +279,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await _typing_safe(context, update.effective_chat.id if update.effective_chat else None)
 
     if norm == "матчи сегодня":
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
@@ -308,9 +317,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
-    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
+    await _typing_safe(context, query.message.chat_id)
 
-    # гарантируем юзера
     tg_user = query.from_user
     get_or_create_user(
         tg_user_id,
@@ -321,9 +329,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     screen_msg: Message = query.message
 
-    # BACK -> MENU (без лишнего "Меню ниже 👇")
     if data == "BACK:MENU":
-        await _edit_or_send(screen_msg, "Выбирай действие кнопками ниже 👇", reply_markup=MAIN_KB, force_new=True)
+        await _edit_or_send(
+            screen_msg,
+            "Выбирай действие кнопками ниже 👇",
+            reply_markup=MAIN_KB,
+            force_new=True,  # ReplyKeyboard не редактируется, поэтому новое сообщение
+        )
         return
 
     if data == "BACK:SPORTS":
@@ -371,7 +383,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    # UI actions + paywall for LIVE
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -381,24 +392,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, match_id, mode, action = parts
         context.user_data["active_match_id"] = match_id
 
-        # Paywall logic only for LIVE
+        # Paywall только для LIVE
         if mode == "live":
             ent = get_effective_entitlements(int(tg_user_id))
-            if action in {"overview", "refresh"}:
-                if action == "refresh" and not ent.can_live_refresh:
-                    await _edit_or_send(
-                        screen_msg,
-                        "🔒 Обновления LIVE ограничены на Free.\n\nОформи Premium, чтобы обновлять без лимитов.",
-                        reply_markup=kb_premium(),
-                    )
-                    return
-                if not ent.can_live:
-                    await _edit_or_send(
-                        screen_msg,
-                        "🔒 LIVE-анализ доступен в Premium.\n\nОформи Premium — получишь LIVE без ограничений.",
-                        reply_markup=kb_premium(),
-                    )
-                    return
+            can_live = bool(getattr(ent, "can_live", False))
+            can_live_refresh = bool(getattr(ent, "can_live_refresh", False))
+
+            if action == "refresh" and not can_live_refresh:
+                await _edit_or_send(
+                    screen_msg,
+                    "🔒 Обновления LIVE ограничены на Free.\n\nОформи Premium, чтобы обновлять без лимитов.",
+                    reply_markup=kb_premium(),
+                )
+                return
+
+            if not can_live:
+                await _edit_or_send(
+                    screen_msg,
+                    "🔒 LIVE-анализ доступен в Premium.\n\nОформи Premium — получишь LIVE без ограничений.",
+                    reply_markup=kb_premium(),
+                )
+                return
 
         reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
@@ -444,15 +458,17 @@ def build_telegram_application() -> Application:
 # -----------------------------
 def mount(fastapi_app: FastAPI) -> None:
     """
-    Регистрирует /telegram/webhook и lifecycle-хуки.
+    Регистрирует webhook endpoint и lifecycle-хуки.
     НИКАКОГО polling.
     """
     tg_app = build_telegram_application()
     fastapi_app.state.telegram_app = tg_app
+    fastapi_app.state.telegram_ready = False  # защита от ранних webhook
 
     async def _startup() -> None:
         await tg_app.initialize()
         await tg_app.start()
+        fastapi_app.state.telegram_ready = True
 
         if not PUBLIC_URL:
             logger.warning("PUBLIC_URL is not set -> webhook will NOT be configured automatically.")
@@ -460,6 +476,9 @@ def mount(fastapi_app: FastAPI) -> None:
 
         webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
         try:
+            # важная гигиена: убираем старый webhook и pending updates
+            await tg_app.bot.delete_webhook(drop_pending_updates=True)
+
             await tg_app.bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET or None,
@@ -470,6 +489,7 @@ def mount(fastapi_app: FastAPI) -> None:
             logger.exception("Failed to set telegram webhook: %s", e)
 
     async def _shutdown() -> None:
+        fastapi_app.state.telegram_ready = False
         try:
             await tg_app.stop()
         finally:
@@ -484,6 +504,10 @@ def mount(fastapi_app: FastAPI) -> None:
             got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if got != WEBHOOK_SECRET:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
+
+        if not getattr(fastapi_app.state, "telegram_ready", False):
+            # webhook может прилететь очень рано при деплое/рестарте
+            raise HTTPException(status_code=503, detail="Telegram app is starting")
 
         payload = await request.json()
         update = Update.de_json(payload, tg_app.bot)
