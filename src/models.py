@@ -11,8 +11,10 @@ from sqlalchemy import UniqueConstraint
 class User(SQLModel, table=True):
     """
     Единая таблица пользователей.
-    ВАЖНО: extend_existing=True защищает от повторной регистрации таблицы
-    при двойном импорте модулей (частая история на Render + FastAPI + Telegram).
+    ВАЖНО:
+    - extend_existing=True защищает от повторной регистрации таблицы при повторных импортам.
+    - tg_user_id сделан Optional, чтобы не падать на старых строках в БД (NULL).
+      При первом /start мы его заполним в user_store.get_or_create_user().
     """
     __tablename__ = "users"
     __table_args__ = (
@@ -22,7 +24,12 @@ class User(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    tg_user_id: int = Field(index=True)
+    # ✅ bankroll из bets_db (у тебя в SELECT он есть)
+    bank: float = Field(default=0.0)
+
+    # ✅ telegram id (у тебя его сейчас не хватает в БД)
+    tg_user_id: Optional[int] = Field(default=None, index=True)
+
     username: Optional[str] = Field(default=None)
     first_name: Optional[str] = Field(default=None)
     last_name: Optional[str] = Field(default=None)
@@ -31,7 +38,7 @@ class User(SQLModel, table=True):
     is_premium: bool = Field(default=False, index=True)
     premium_until: Optional[datetime] = Field(default=None, index=True)
 
-    # trial для LIVE (например: 1 раз бесплатный live)
+    # trial для LIVE
     trial_live_used: bool = Field(default=False)
 
     # служебное
@@ -40,9 +47,6 @@ class User(SQLModel, table=True):
 
 
 class Subscription(SQLModel, table=True):
-    """
-    Подписки (на будущее: YooKassa/Telegram Payments)
-    """
     __tablename__ = "subscriptions"
     __table_args__ = ({"extend_existing": True},)
 
@@ -55,16 +59,11 @@ class Subscription(SQLModel, table=True):
     started_at: datetime = Field(default_factory=datetime.utcnow, index=True)
     expires_at: Optional[datetime] = Field(default=None, index=True)
 
-    # идентификаторы платежей (опционально)
     payment_id: Optional[str] = Field(default=None, index=True)
     invoice_payload: Optional[str] = Field(default=None, index=True)
 
 
 class Entitlement(SQLModel, table=True):
-    """
-    Права/фичи (free/premium) — гибко, чтобы потом не переписывать.
-    Пример: feature='live', allowed=True
-    """
     __tablename__ = "entitlements"
     __table_args__ = (
         UniqueConstraint("user_id", "feature", name="uq_entitlements_user_feature"),
@@ -84,7 +83,7 @@ class Entitlement(SQLModel, table=True):
 class UsageCounter(SQLModel, table=True):
     """
     Счётчики использования (лимиты для FREE).
-    Например: key='live_requests_day', period='2026-01-03', count=3
+    period формата 'YYYY-MM-DD' (день) или 'YYYY-MM' (месяц).
     """
     __tablename__ = "usage_counters"
     __table_args__ = (
@@ -95,8 +94,8 @@ class UsageCounter(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(index=True)
 
-    key: str = Field(index=True)          # live_requests_day, ai_requests_day, ...
-    period: str = Field(index=True)       # 'YYYY-MM-DD' или 'YYYY-MM'
+    key: str = Field(index=True)      # live_requests_day, ai_requests_day, ...
+    period: str = Field(index=True)   # 'YYYY-MM-DD' или 'YYYY-MM'
     count: int = Field(default=0)
 
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
