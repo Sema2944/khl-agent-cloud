@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlmodel import SQLModel, Field
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import UniqueConstraint, BigInteger
 
 
 class User(SQLModel, table=True):
@@ -15,6 +15,7 @@ class User(SQLModel, table=True):
     - extend_existing=True защищает от повторной регистрации таблицы при повторных импортам.
     - tg_user_id сделан Optional, чтобы не падать на старых строках в БД (NULL).
       При первом /start мы его заполним в user_store.get_or_create_user().
+    - tg_user_id маппим в BIGINT, потому что Telegram ID может быть > 2^31-1.
     """
     __tablename__ = "users"
     __table_args__ = (
@@ -24,11 +25,15 @@ class User(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    # ✅ bankroll из bets_db (у тебя в SELECT он есть)
+    # ✅ bankroll из bets_db
     bank: float = Field(default=0.0)
 
-    # ✅ telegram id (у тебя его сейчас не хватает в БД)
-    tg_user_id: Optional[int] = Field(default=None, index=True)
+    # ✅ telegram id (BIGINT)
+    tg_user_id: Optional[int] = Field(
+        default=None,
+        index=True,
+        sa_type=BigInteger,
+    )
 
     username: Optional[str] = Field(default=None)
     first_name: Optional[str] = Field(default=None)
