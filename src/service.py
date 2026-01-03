@@ -42,6 +42,9 @@ def favicon():
     return {}
 
 
+# -----------------------------
+# Pydantic модели
+# -----------------------------
 class QueryRequest(BaseModel):
     user_id: int
     message: Optional[str] = None
@@ -71,21 +74,18 @@ class BetSettle(BaseModel):
     result: str  # "win", "lose", "push"
 
 
+# -----------------------------
+# Startup
+# -----------------------------
 @app.on_event("startup")
 def on_startup():
-    # 1) DB init
     init_db()
-    logger.info("FastAPI startup: DB initialized.")
-
-    # 2) Telegram mount (после DB)
-    try:
-        from .telegram_bot.app import mount as mount_telegram
-        mount_telegram(app)
-        logger.info("Telegram routes mounted (startup).")
-    except Exception as e:
-        logger.exception("Failed to mount telegram webhook routes (startup): %s", e)
+    logger.info("FastAPI startup: DB initialized. (Telegram runs as separate worker via polling)")
 
 
+# -----------------------------
+# Agent endpoint
+# -----------------------------
 @app.post("/agent/query", response_model=QueryResponse)
 async def agent_query(req: QueryRequest):
     text = req.text
@@ -109,6 +109,9 @@ async def agent_query(req: QueryRequest):
     return QueryResponse(reply=reply)
 
 
+# -----------------------------
+# Bets API
+# -----------------------------
 @app.get("/agent/last-bets")
 def api_last_bets(user_id: int, limit: int = 5, session: Session = Depends(get_session)):
     bets = get_last_bets(session, user_id, limit)
