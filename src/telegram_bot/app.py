@@ -1,10 +1,10 @@
-# src/telegram_bot/app.py  (v6.2)
+# src/telegram_bot/app.py  (v6.3)
 from __future__ import annotations
 
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import (
@@ -30,6 +30,9 @@ from ..entitlements import get_effective_entitlements
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------
+# ENV
+# -----------------------------
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
@@ -38,6 +41,9 @@ WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
+# -----------------------------
+# Главное меню (ReplyKeyboard)
+# -----------------------------
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["🏟 Матчи сегодня"],
@@ -48,6 +54,9 @@ MAIN_KB = ReplyKeyboardMarkup(
     one_time_keyboard=False,
 )
 
+# -----------------------------
+# Inline клавиатуры
+# -----------------------------
 SPORTS = [
     ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
@@ -59,6 +68,9 @@ SPORTS = [
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def _norm_menu(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"[^\w\sа-яё-]", " ", t, flags=re.IGNORECASE)
@@ -137,8 +149,15 @@ async def call_agent_local(user_id: int, message: str) -> str:
     return await run_dialog_agent(user_id=user_id, message=message)
 
 
-async def _edit_or_send(msg: Message, text: str, *, reply_markup=None, force_new: bool = False) -> None:
+async def _edit_or_send(
+    msg: Message,
+    text: str,
+    *,
+    reply_markup=None,
+    force_new: bool = False,
+) -> None:
     text = (text or "").strip() or "…"
+
     if not force_new:
         try:
             await msg.edit_text(text, reply_markup=reply_markup)
@@ -156,11 +175,16 @@ async def _edit_or_send(msg: Message, text: str, *, reply_markup=None, force_new
         logger.exception("reply_text failed")
 
 
+# -----------------------------
+# Handlers
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+
     # создаём юзера сразу
-    u = get_or_create_user(update.effective_user.id)
+    get_or_create_user(update.effective_user.id)
+
     await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
         reply_markup=MAIN_KB,
@@ -184,6 +208,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+
     u = get_or_create_user(update.effective_user.id)
     ent = get_effective_entitlements(u.id)
 
@@ -206,6 +231,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = update.message.text or ""
     norm = _norm_menu(text)
 
+    # ensure user exists
     get_or_create_user(user_id)
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
@@ -315,7 +341,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "PAY:PREMIUM":
-        # Сейчас skeleton: позже подключим Telegram Payments/YooKassa, но UX уже не меняется
         await _edit_or_send(
             screen_msg,
             "🔓 Premium (скоро)\n\n"
@@ -329,10 +354,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _edit_or_send(screen_msg, "Не понял действие 🤔", reply_markup=MAIN_KB)
 
 
+# -----------------------------
+# Errors
+# -----------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled telegram error: %s", context.error)
 
 
+# -----------------------------
+# Application factory
+# -----------------------------
 def build_telegram_application() -> Application:
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CommandHandler("start", start))
@@ -344,14 +375,21 @@ def build_telegram_application() -> Application:
     return tg_app
 
 
+# -----------------------------
+# FastAPI mount (webhook-only)
+# -----------------------------
 def mount(fastapi_app: FastAPI) -> None:
+    """
+    Webhook-only. Никакого polling.
+
+    Важно:
+    - НЕ вызываем init_db() отсюда, чтобы не было двойной инициализации.
+    - Логируем входящие webhook события, чтобы видно было, “доходит ли Telegram”.
+    """
     tg_app = build_telegram_application()
     fastapi_app.state.telegram_app = tg_app
 
     async def _startup() -> None:
-        from ..db import init_db
-        init_db()
-
         await tg_app.initialize()
         await tg_app.start()
 
@@ -384,9 +422,12 @@ def mount(fastapi_app: FastAPI) -> None:
         if WEBHOOK_SECRET:
             got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
             if got != WEBHOOK_SECRET:
+                logger.warning("Bad webhook secret token. got=%r", got)
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         payload = await request.json()
+        logger.info("Telegram webhook hit: keys=%s", list(payload.keys())[:10])
+
         update = Update.de_json(payload, tg_app.bot)
         await tg_app.process_update(update)
         return {"ok": True}
