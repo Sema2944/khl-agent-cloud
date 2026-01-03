@@ -21,6 +21,3 @@ services:
         value: https://khl-agent-api-9dw6.onrender.com
       - key: TELEGRAM_WEBHOOK_PATH
         value: /telegram/webhook
-      # (опционально) TELEGRAM_WEBHOOK_SECRET
-      # - key: TELEGRAM_WEBHOOK_SECRET
-      #   sync: false
