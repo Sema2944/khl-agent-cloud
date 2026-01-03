@@ -29,11 +29,16 @@ def _with_session(session: Optional[Session]):
           ...
     """
     if session is not None:
-        # прокидываем внешний session как контекст-менеджер-пустышку
         class _DummyCtx:
-            def __enter__(self): return session
-            def __exit__(self, exc_type, exc, tb): return False
+            def __enter__(self):  # noqa: D401
+                return session
+
+            def __exit__(self, exc_type, exc, tb):  # noqa: D401
+                return False
+
         return _DummyCtx()
+
+    # Session(engine) в sqlmodel поддерживает контекст-менеджер
     return Session(engine)
 
 
@@ -49,35 +54,47 @@ def get_or_create_user(
     last_name: Optional[str] = None,
 ) -> User:
     """
-    Всегда безопасно:
-    - если session не передали (Telegram handlers) -> откроем сами
-    - если передали (FastAPI Depends) -> используем её
+    ВАЖНО (архитектура без переписываний):
+    - Поддерживаем legacy схему, где раньше users.id == tg_user_id (и tg_user_id колонки не было).
+    - Теперь используем tg_user_id как primary идентификатор Telegram.
+    - Если нашли legacy-строку по id==tg_user_id -> привязываем tg_user_id и НЕ создаём дубликат.
+    - Если создаём нового -> задаём id=tg_user_id, чтобы bets/bank (если где-то завязаны) не разъехались.
     """
     tg_user_id = int(tg_user_id)
 
     with _with_session(session) as s:
+        # 1) Новый путь: ищем по tg_user_id (основной)
         u = s.exec(select(User).where(User.tg_user_id == tg_user_id)).first()
         if u:
-            # обновим профиль, если пришли данные
-            changed = False
-            if username is not None and username != u.username:
-                u.username = username
-                changed = True
-            if first_name is not None and first_name != u.first_name:
-                u.first_name = first_name
-                changed = True
-            if last_name is not None and last_name != u.last_name:
-                u.last_name = last_name
-                changed = True
-
-            u.updated_at = _now()
-            if changed:
-                s.add(u)
-            s.commit()
-            s.refresh(u)
+            _update_user_profile(
+                s,
+                u,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+            )
             return u
 
+        # 2) Legacy путь: раньше могли хранить tg id в users.id
+        legacy = s.exec(select(User).where(User.id == tg_user_id)).first()
+        if legacy:
+            # если legacy-строка ещё не привязана — привязываем
+            if legacy.tg_user_id is None:
+                legacy.tg_user_id = tg_user_id
+
+            _update_user_profile(
+                s,
+                legacy,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+            )
+            return legacy
+
+        # 3) Совсем новый пользователь: создаём запись
+        # Ключевая фишка: id=tg_user_id, чтобы сохранить совместимость с bets_db
         u = User(
+            id=tg_user_id,
             tg_user_id=tg_user_id,
             username=username,
             first_name=first_name,
@@ -91,10 +108,44 @@ def get_or_create_user(
         return u
 
 
+def _update_user_profile(
+    s: Session,
+    u: User,
+    *,
+    username: Optional[str],
+    first_name: Optional[str],
+    last_name: Optional[str],
+) -> None:
+    changed = False
+
+    if username is not None and username != u.username:
+        u.username = username
+        changed = True
+
+    if first_name is not None and first_name != u.first_name:
+        u.first_name = first_name
+        changed = True
+
+    if last_name is not None and last_name != u.last_name:
+        u.last_name = last_name
+        changed = True
+
+    u.updated_at = _now()
+    if changed:
+        s.add(u)
+    s.commit()
+    s.refresh(u)
+
+
 def get_user_by_tg_id(tg_user_id: int, *, session: Optional[Session] = None) -> Optional[User]:
     tg_user_id = int(tg_user_id)
     with _with_session(session) as s:
-        return s.exec(select(User).where(User.tg_user_id == tg_user_id)).first()
+        # основной путь
+        u = s.exec(select(User).where(User.tg_user_id == tg_user_id)).first()
+        if u:
+            return u
+        # legacy fallback
+        return s.exec(select(User).where(User.id == tg_user_id)).first()
 
 
 def set_user_premium(
@@ -141,7 +192,10 @@ def set_entitlement(
 
     with _with_session(session) as s:
         e = s.exec(
-            select(Entitlement).where(Entitlement.user_id == int(user_id), Entitlement.feature == feature)
+            select(Entitlement).where(
+                Entitlement.user_id == int(user_id),
+                Entitlement.feature == feature,
+            )
         ).first()
 
         if e:
@@ -169,7 +223,10 @@ def get_entitlement(user_id: int, feature: str, *, session: Optional[Session] = 
     feature = (feature or "").strip().lower()
     with _with_session(session) as s:
         return s.exec(
-            select(Entitlement).where(Entitlement.user_id == int(user_id), Entitlement.feature == feature)
+            select(Entitlement).where(
+                Entitlement.user_id == int(user_id),
+                Entitlement.feature == feature,
+            )
         ).first()
 
 
