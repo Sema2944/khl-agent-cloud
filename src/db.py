@@ -48,7 +48,7 @@ def _bootstrap_migrations_postgres() -> None:
     """
     Мини-миграции без Alembic (MVP):
     - добавляем недостающие колонки в users
-    - добавляем недостающие таблицы/индексы через create_all
+    - добавляем недостающие таблицы/индексы
     - фиксируем sequence users.id после ручных id (id=tg_user_id)
     """
     with engine.begin() as conn:
@@ -68,7 +68,8 @@ def _bootstrap_migrations_postgres() -> None:
             return  # create_all её создаст
 
         # 2) Добавляем колонки, если их нет
-        # tg_user_id
+
+        # tg_user_id (сразу BIGINT)
         conn.execute(
             text(
                 """
@@ -77,6 +78,18 @@ def _bootstrap_migrations_postgres() -> None:
                 """
             )
         )
+
+        # ✅ ВАЖНО: если колонка уже была INT — приводим к BIGINT (чтобы 5_027_679_117 помещался)
+        conn.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN tg_user_id TYPE BIGINT
+                USING tg_user_id::BIGINT
+                """
+            )
+        )
+
         # bank
         conn.execute(
             text(
@@ -86,6 +99,7 @@ def _bootstrap_migrations_postgres() -> None:
                 """
             )
         )
+
         # username/first_name/last_name (если раньше не было)
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT"""))
@@ -105,7 +119,7 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_is_premium ON users (is_premium)"""))
 
         # 4) UniqueConstraint на tg_user_id
-        # В Postgres проще сделать unique index (NULL допускается многократно)
+        # В Postgres UNIQUE индекс допускает много NULL — это ок для legacy строк
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tg_user_id ON users (tg_user_id)"""))
 
         # 5) Подтянуть sequence users.id (важно из-за ручных id=tg_user_id)
@@ -128,7 +142,7 @@ def _bootstrap_migrations_postgres() -> None:
 def init_db() -> None:
     """
     Создаёт таблицы, если их ещё нет.
-    Плюс: делает bootstrap-миграции для Postgres (без Alembic), чтобы не падать на старой схеме.
+    Плюс: bootstrap-миграции для Postgres (без Alembic), чтобы не падать на старой схеме.
     """
     try:
         # 1) создаём все таблицы, которых нет
