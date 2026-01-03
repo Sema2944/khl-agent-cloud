@@ -149,6 +149,22 @@ def kb_premium() -> InlineKeyboardMarkup:
     )
 
 
+def _premium_text(tg_user_id: int) -> str:
+    ent = get_effective_entitlements(int(tg_user_id))
+    tier = ent.tier.upper()
+    return (
+        "⭐ Premium\n\n"
+        f"Текущий доступ: {tier}\n"
+        f"Лимит AI/день: {ent.ai_daily_limit} (осталось {ent.daily_ai_left})\n"
+        f"LIVE refresh/день: {ent.live_refresh_daily_limit} (осталось {ent.live_refresh_left})\n"
+        f"Минимальная пауза LIVE: {int(ent.live_min_interval_sec)} сек\n\n"
+        "Premium даёт:\n"
+        "• LIVE без ограничений\n"
+        "• больше AI-лимитов\n"
+        "• расширенные фичи (дальше добавим)\n"
+    )
+
+
 async def call_agent_local(user_id: int, message: str) -> str:
     from ..parsing import run_dialog_agent
     return await run_dialog_agent(user_id=user_id, message=message)
@@ -184,32 +200,21 @@ async def _edit_or_send(
         logger.exception("reply_text failed")
 
 
-def _ensure_user(update: Update) -> int:
-    """
-    Создаём/обновляем пользователя в БД.
-    Возвращаем tg_user_id.
-    """
-    tg_user_id = int(update.effective_user.id)
-    u = update.effective_user
-    try:
-        get_or_create_user(
-            tg_user_id=tg_user_id,
-            username=getattr(u, "username", None),
-            first_name=getattr(u, "first_name", None),
-            last_name=getattr(u, "last_name", None),
-        )
-    except Exception:
-        logger.exception("Failed to get_or_create_user(tg_user_id=%s)", tg_user_id)
-    return tg_user_id
-
-
 # -----------------------------
 # Handlers
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    _ensure_user(update)
+
+    tg_user = update.effective_user
+    get_or_create_user(
+        tg_user.id,
+        username=tg_user.username,
+        first_name=tg_user.first_name,
+        last_name=tg_user.last_name,
+    )
+
     await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
         reply_markup=MAIN_KB,
@@ -233,62 +238,64 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    tg_user_id = _ensure_user(update)
-    ent = get_effective_entitlements(tg_user_id)
+    tg_user_id = update.effective_user.id
 
-    text = (
-        "⭐ Premium\n\n"
-        f"Текущий доступ: {ent.tier.upper()}\n"
-        f"AI лимит/день (PRE): {ent.ai_daily_limit}\n"
-        f"AI осталось сегодня: {ent.daily_ai_left}\n"
-        f"LIVE refresh лимит/день: {ent.live_refresh_daily_limit}\n"
-        f"LIVE refresh осталось: {ent.live_refresh_left}\n\n"
-        "Premium даёт больше лимитов и LIVE без ограничений.\n"
-        "Оплата подключается следующим шагом — кнопка уже готова."
+    # гарантируем юзера
+    tg_user = update.effective_user
+    get_or_create_user(
+        tg_user.id,
+        username=tg_user.username,
+        first_name=tg_user.first_name,
+        last_name=tg_user.last_name,
     )
-    await update.message.reply_text(text, reply_markup=kb_premium())
+
+    await update.message.reply_text(_premium_text(tg_user_id), reply_markup=kb_premium())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    tg_user_id = _ensure_user(update)
+    tg_user = update.effective_user
+    user_id = tg_user.id
     text = update.message.text or ""
     norm = _norm_menu(text)
 
-    logger.info("tg.handle_message user_id=%s text=%r", tg_user_id, text)
+    # создаём/обновляем юзера
+    get_or_create_user(
+        user_id,
+        username=tg_user.username,
+        first_name=tg_user.first_name,
+        last_name=tg_user.last_name,
+    )
+
+    logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    try:
-        if norm == "матчи сегодня":
-            await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
-            return
+    if norm == "матчи сегодня":
+        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        return
 
-        if norm in {"профиль", "мой профиль", "статы", "статистика"}:
-            reply = await call_agent_local(tg_user_id, "профиль")
-            await update.message.reply_text(reply, reply_markup=MAIN_KB)
-            return
-
-        if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
-            reply = await call_agent_local(tg_user_id, "стратегия")
-            await update.message.reply_text(reply, reply_markup=MAIN_KB)
-            return
-
-        if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
-            await help_cmd(update, context)
-            return
-
-        if norm in {"premium", "премиум", "⭐ premium"}:
-            await premium_cmd(update, context)
-            return
-
-        reply = await call_agent_local(tg_user_id, text)
+    if norm in {"профиль", "мой профиль", "статы", "статистика"}:
+        reply = await call_agent_local(user_id, "профиль")
         await update.message.reply_text(reply, reply_markup=MAIN_KB)
+        return
 
-    except Exception as e:
-        logger.exception("handle_message failed")
-        await update.message.reply_text(f"⚠️ Ошибка: {type(e).__name__}: {e}", reply_markup=MAIN_KB)
+    if norm in {"стратегия эксперта", "стратегия", "эксперт", "эксперт сегодня"}:
+        reply = await call_agent_local(user_id, "стратегия")
+        await update.message.reply_text(reply, reply_markup=MAIN_KB)
+        return
+
+    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
+        await help_cmd(update, context)
+        return
+
+    if norm in {"premium", "премиум", "⭐ premium"}:
+        await premium_cmd(update, context)
+        return
+
+    reply = await call_agent_local(user_id, text)
+    await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -297,101 +304,118 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     data = query.data or ""
-    tg_user_id = int(query.from_user.id)
+    tg_user_id = query.from_user.id
     await query.answer()
 
     logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
     await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
 
-    # Единый экран — редактируем query.message
+    # гарантируем юзера
+    tg_user = query.from_user
+    get_or_create_user(
+        tg_user_id,
+        username=tg_user.username,
+        first_name=tg_user.first_name,
+        last_name=tg_user.last_name,
+    )
+
     screen_msg: Message = query.message
 
-    try:
-        # BACK -> MENU
-        if data == "BACK:MENU":
-            await _edit_or_send(screen_msg, "Меню ниже 👇", reply_markup=MAIN_KB, force_new=True)
-            return
+    # BACK -> MENU (без лишнего "Меню ниже 👇")
+    if data == "BACK:MENU":
+        await _edit_or_send(screen_msg, "Выбирай действие кнопками ниже 👇", reply_markup=MAIN_KB, force_new=True)
+        return
 
-        # BACK -> SPORTS
-        if data == "BACK:SPORTS":
+    if data == "BACK:SPORTS":
+        await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
+        return
+
+    if data == "BACK:MATCHES":
+        last_text = context.user_data.get("last_matches_text")
+        last_buttons = context.user_data.get("last_match_buttons") or []
+        last_sport_key = context.user_data.get("last_sport_key")
+
+        if not last_text and last_sport_key:
+            last_text = await call_agent_local(tg_user_id, f"матчи сегодня {last_sport_key}")
+            last_buttons = extract_match_buttons(last_text)
+            context.user_data["last_matches_text"] = last_text
+            context.user_data["last_match_buttons"] = last_buttons
+
+        if last_text and last_buttons:
+            await _edit_or_send(screen_msg, last_text, reply_markup=kb_matches(last_buttons))
+        else:
             await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
+        return
+
+    if data.startswith("SPORT:"):
+        sport_key = data.split(":", 1)[1].strip()
+        context.user_data["last_sport_key"] = sport_key
+
+        reply = await call_agent_local(tg_user_id, f"матчи сегодня {sport_key}")
+        match_buttons = extract_match_buttons(reply)
+
+        context.user_data["last_matches_text"] = reply
+        context.user_data["last_match_buttons"] = match_buttons
+
+        if match_buttons:
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_matches(match_buttons))
+        else:
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
+        return
+
+    if data.startswith("MATCH:"):
+        match_id = data.split(":", 1)[1].strip()
+        context.user_data["active_match_id"] = match_id
+
+        reply = await call_agent_local(tg_user_id, f"матч {match_id}")
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+        return
+
+    # UI actions + paywall for LIVE
+    if data.startswith("UI:"):
+        parts = data.split(":")
+        if len(parts) != 4:
+            await _edit_or_send(screen_msg, "Некорректная команда UI.", reply_markup=MAIN_KB)
             return
 
-        # BACK -> MATCHES
-        if data == "BACK:MATCHES":
-            last_text = context.user_data.get("last_matches_text")
-            last_buttons = context.user_data.get("last_match_buttons") or []
-            last_sport_key = context.user_data.get("last_sport_key")
+        _, match_id, mode, action = parts
+        context.user_data["active_match_id"] = match_id
 
-            if not last_text and last_sport_key:
-                last_text = await call_agent_local(tg_user_id, f"матчи сегодня {last_sport_key}")
-                last_buttons = extract_match_buttons(last_text)
-                context.user_data["last_matches_text"] = last_text
-                context.user_data["last_match_buttons"] = last_buttons
+        # Paywall logic only for LIVE
+        if mode == "live":
+            ent = get_effective_entitlements(int(tg_user_id))
+            if action in {"overview", "refresh"}:
+                if action == "refresh" and not ent.can_live_refresh:
+                    await _edit_or_send(
+                        screen_msg,
+                        "🔒 Обновления LIVE ограничены на Free.\n\nОформи Premium, чтобы обновлять без лимитов.",
+                        reply_markup=kb_premium(),
+                    )
+                    return
+                if not ent.can_live:
+                    await _edit_or_send(
+                        screen_msg,
+                        "🔒 LIVE-анализ доступен в Premium.\n\nОформи Premium — получишь LIVE без ограничений.",
+                        reply_markup=kb_premium(),
+                    )
+                    return
 
-            if last_text and last_buttons:
-                await _edit_or_send(screen_msg, last_text, reply_markup=kb_matches(last_buttons))
-            else:
-                await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
-            return
+        reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+        return
 
-        # SPORT -> список матчей
-        if data.startswith("SPORT:"):
-            sport_key = data.split(":", 1)[1].strip()
-            context.user_data["last_sport_key"] = sport_key
+    if data == "PAY:PREMIUM":
+        await _edit_or_send(
+            screen_msg,
+            "🔓 Premium (скоро)\n\n"
+            "Архитектура подписок уже готова.\n"
+            "Следующий шаг — подключить оплату (Telegram Payments / YooKassa) и вебхук.\n\n"
+            "Пока Premium можно активировать вручную через админ-команду (добавим).",
+            reply_markup=kb_premium(),
+        )
+        return
 
-            reply = await call_agent_local(tg_user_id, f"матчи сегодня {sport_key}")
-            match_buttons = extract_match_buttons(reply)
-
-            context.user_data["last_matches_text"] = reply
-            context.user_data["last_match_buttons"] = match_buttons
-
-            if match_buttons:
-                await _edit_or_send(screen_msg, reply, reply_markup=kb_matches(match_buttons))
-            else:
-                await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
-            return
-
-        # MATCH -> экран матча + хаб
-        if data.startswith("MATCH:"):
-            match_id = data.split(":", 1)[1].strip()
-            context.user_data["active_match_id"] = match_id
-
-            reply = await call_agent_local(tg_user_id, f"матч {match_id}")
-            await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
-            return
-
-        # UI actions
-        if data.startswith("UI:"):
-            parts = data.split(":")
-            if len(parts) != 4:
-                await _edit_or_send(screen_msg, "Некорректная команда UI.", reply_markup=MAIN_KB)
-                return
-
-            _, match_id, mode, action = parts
-            context.user_data["active_match_id"] = match_id
-
-            reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
-            await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
-            return
-
-        # Premium pay button (skeleton)
-        if data == "PAY:PREMIUM":
-            await _edit_or_send(
-                screen_msg,
-                "🔓 Premium (скоро)\n\n"
-                "Мы уже подготовили архитектуру подписок.\n"
-                "Следующий шаг — подключить оплату (Telegram Payments / YooKassa) и вебхук.\n\n"
-                "Пока можно активировать Premium вручную через админ-команду (добавим).",
-                reply_markup=kb_premium(),
-            )
-            return
-
-        await _edit_or_send(screen_msg, "Не понял действие 🤔", reply_markup=MAIN_KB)
-
-    except Exception as e:
-        logger.exception("handle_callback failed")
-        await _edit_or_send(screen_msg, f"⚠️ Ошибка: {type(e).__name__}: {e}", reply_markup=MAIN_KB, force_new=True)
+    await _edit_or_send(screen_msg, "Не понял действие 🤔", reply_markup=MAIN_KB)
 
 
 # -----------------------------
