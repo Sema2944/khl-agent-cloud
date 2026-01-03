@@ -5,6 +5,7 @@ import os
 import logging
 from contextlib import contextmanager
 from typing import Generator
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -14,10 +15,27 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./app.db").strip()
 
-# 👉 Render Postgres требует sslmode=require
-if DATABASE_URL.startswith("postgresql://"):
-    if "sslmode=" not in DATABASE_URL:
-        DATABASE_URL += "?sslmode=require"
+def _normalize_db_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return "sqlite:///./app.db"
+
+    # SQLite
+    if url.startswith("sqlite"):
+        return url
+
+    # Render / Postgres: часто дают postgresql://
+    # Нам нужен psycopg v3: postgresql+psycopg://
+    if url.startswith("postgresql://") and "+psycopg" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # sslmode=require (для Render Postgres)
+    if url.startswith("postgresql+psycopg://") and "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+
+    return url
+
+DATABASE_URL = _normalize_db_url(DATABASE_URL)
 
 engine = create_engine(
     DATABASE_URL,
@@ -36,7 +54,7 @@ def init_db() -> None:
         SQLModel.metadata.create_all(engine)
         logger.info("DB initialized successfully.")
     except Exception as e:
-        # ⚠️ ВАЖНО: не роняем сервис, даже если БД временно недоступна
+        # не роняем сервис из-за БД
         logger.exception("DB init failed (service will continue): %s", e)
 
 @contextmanager
