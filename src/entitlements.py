@@ -1,92 +1,91 @@
 # src/entitlements.py
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from .db import engine
-from .models import User, UsageCounter
+from .user_store import (
+    get_or_create_user,
+    get_usage,
+)
 
 # -----------------------------
-# ENV limits (меняются без кода)
+# Result model
 # -----------------------------
-FREE_DAILY_AI_PRE_LIMIT = int((os.getenv("FREE_DAILY_AI_PRE_LIMIT") or "10").strip())
-FREE_DAILY_LIVE_REFRESH_LIMIT = int((os.getenv("FREE_DAILY_LIVE_REFRESH_LIMIT") or "3").strip())
-
-# ключи usage
-USAGE_AI_PRE = "ai_pre"
-USAGE_LIVE_REFRESH = "live_refresh"
-
-
 @dataclass
 class EffectiveEntitlements:
     tier: str                 # "free" | "premium"
     is_premium: bool
+
+    # features
     can_live: bool
     can_live_refresh: bool
+
+    # limits
     ai_daily_limit: int
     daily_ai_left: int
-    live_refresh_daily_limit: int
-    live_refresh_left: int
-    live_min_interval_sec: int  # на будущее (UI/бот может показывать)
+    live_min_interval_sec: int  # для UX (в будущем)
 
 
-def _today_period() -> str:
-    # UsageCounter.period у тебя строка — делаем YYYY-MM-DD
+# -----------------------------
+# Helpers
+# -----------------------------
+def _today_str() -> str:
     return date.today().isoformat()
 
 
-def _get_usage(session: Session, user_id: int, key: str, period: str) -> int:
-    row = session.exec(
-        select(UsageCounter).where(
-            UsageCounter.user_id == int(user_id),
-            UsageCounter.key == key,
-            UsageCounter.period == period,
-        )
-    ).first()
-    return int(row.count) if row else 0
+def _with_session(session: Optional[Session]):
+    """
+    Если session=None -> открываем свою.
+    """
+    if session is not None:
+        class _DummyCtx:
+            def __enter__(self):  # noqa: D401
+                return session
+            def __exit__(self, exc_type, exc, tb):  # noqa: D401
+                return False
+        return _DummyCtx()
+
+    return Session(engine)
 
 
+# -----------------------------
+# Public API
+# -----------------------------
 def get_effective_entitlements(
     tg_user_id: int,
     *,
     session: Optional[Session] = None,
 ) -> EffectiveEntitlements:
     """
-    Единственная функция для определения доступа.
+    Единая политика доступа (free / premium), рассчитана так,
+    чтобы потом не переписывать код при подключении подписок.
 
-    Premium:
-      - безлимит: live, refresh, ai_pre
-
-    Free:
-      - live: 1 trial (trial_live_used=False)
-      - refresh: лимит/день (FREE_DAILY_LIVE_REFRESH_LIMIT)
-      - ai_pre: лимит/день (FREE_DAILY_AI_PRE_LIMIT)
-
-    Важно: session опционален, чтобы одинаково работало из Telegram и API.
+    Политика по умолчанию:
+    - Premium:
+        - полный доступ
+        - лимиты "бесконечные"
+    - Free:
+        - pre-ai: дневной лимит (пример 10)
+        - live: 1 trial (если trial_live_used=False)
+        - live refresh: дневной лимит (пример 3)
+        - live_min_interval_sec: минимальная пауза для UX (пример 25 сек)
     """
-    close_session = False
-    if session is None:
-        session = Session(engine)
-        close_session = True
+    tg_user_id = int(tg_user_id)
+    today = _today_str()
 
-    try:
-        user = session.exec(select(User).where(User.tg_user_id == int(tg_user_id))).first()
-        if user is None:
-            # создаём минимального юзера
-            user = User(tg_user_id=int(tg_user_id))
-            session.add(user)
-            session.commit()
-            session.refresh(user)
+    with _with_session(session) as s:
+        # всегда гарантируем наличие user
+        u = get_or_create_user(tg_user_id, session=s)
 
         # -----------------------------
         # PREMIUM
         # -----------------------------
-        if bool(user.is_premium):
+        if bool(u.is_premium):
             return EffectiveEntitlements(
                 tier="premium",
                 is_premium=True,
@@ -94,40 +93,33 @@ def get_effective_entitlements(
                 can_live_refresh=True,
                 ai_daily_limit=10**9,
                 daily_ai_left=10**9,
-                live_refresh_daily_limit=10**9,
-                live_refresh_left=10**9,
                 live_min_interval_sec=0,
             )
 
         # -----------------------------
-        # FREE
+        # FREE defaults
         # -----------------------------
-        period = _today_period()
+        ai_daily_limit = 10
+        used_ai_pre = get_usage(u.id, "ai_pre", period=today, session=s)
+        daily_ai_left = max(0, ai_daily_limit - used_ai_pre)
 
-        used_ai = _get_usage(session, user.id, USAGE_AI_PRE, period)
-        ai_left = max(0, int(FREE_DAILY_AI_PRE_LIMIT) - int(used_ai))
+        # live: 1 trial
+        can_live = not bool(u.trial_live_used)
 
-        used_refresh = _get_usage(session, user.id, USAGE_LIVE_REFRESH, period)
-        refresh_left = max(0, int(FREE_DAILY_LIVE_REFRESH_LIMIT) - int(used_refresh))
+        # live refresh: e.g. 3/day
+        refresh_limit = 3
+        used_refresh = get_usage(u.id, "live_refresh", period=today, session=s)
+        can_live_refresh = used_refresh < refresh_limit
 
-        # LIVE trial: 1 раз бесплатно
-        can_live = not bool(user.trial_live_used)
-
-        # refresh разрешаем только если осталось
-        can_live_refresh = refresh_left > 0
+        # UX throttle hint (не gate, просто отображение/логика)
+        live_min_interval_sec = 25
 
         return EffectiveEntitlements(
             tier="free",
             is_premium=False,
             can_live=can_live,
             can_live_refresh=can_live_refresh,
-            ai_daily_limit=int(FREE_DAILY_AI_PRE_LIMIT),
-            daily_ai_left=int(ai_left),
-            live_refresh_daily_limit=int(FREE_DAILY_LIVE_REFRESH_LIMIT),
-            live_refresh_left=int(refresh_left),
-            live_min_interval_sec=3,  # free обычно медленнее; можно потом вынести в ENV
+            ai_daily_limit=ai_daily_limit,
+            daily_ai_left=daily_ai_left,
+            live_min_interval_sec=live_min_interval_sec,
         )
-
-    finally:
-        if close_session:
-            session.close()
