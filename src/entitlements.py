@@ -1,79 +1,133 @@
 # src/entitlements.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import date
 from typing import Optional
 
 from sqlmodel import Session, select
 
-from .models import User, Entitlement, UsageCounter
+from .db import engine
+from .models import User, UsageCounter
+
+# -----------------------------
+# ENV limits (меняются без кода)
+# -----------------------------
+FREE_DAILY_AI_PRE_LIMIT = int((os.getenv("FREE_DAILY_AI_PRE_LIMIT") or "10").strip())
+FREE_DAILY_LIVE_REFRESH_LIMIT = int((os.getenv("FREE_DAILY_LIVE_REFRESH_LIMIT") or "3").strip())
+
+# ключи usage
+USAGE_AI_PRE = "ai_pre"
+USAGE_LIVE_REFRESH = "live_refresh"
 
 
 @dataclass
 class EffectiveEntitlements:
+    tier: str                 # "free" | "premium"
     is_premium: bool
     can_live: bool
     can_live_refresh: bool
+    ai_daily_limit: int
     daily_ai_left: int
+    live_refresh_daily_limit: int
+    live_refresh_left: int
+    live_min_interval_sec: int  # на будущее (UI/бот может показывать)
 
 
-def get_effective_entitlements(session: Session, tg_user_id: int) -> EffectiveEntitlements:
+def _today_period() -> str:
+    # UsageCounter.period у тебя строка — делаем YYYY-MM-DD
+    return date.today().isoformat()
+
+
+def _get_usage(session: Session, user_id: int, key: str, period: str) -> int:
+    row = session.exec(
+        select(UsageCounter).where(
+            UsageCounter.user_id == int(user_id),
+            UsageCounter.key == key,
+            UsageCounter.period == period,
+        )
+    ).first()
+    return int(row.count) if row else 0
+
+
+def get_effective_entitlements(
+    tg_user_id: int,
+    *,
+    session: Optional[Session] = None,
+) -> EffectiveEntitlements:
     """
-    Политика:
-    - Premium: полный доступ.
-    - Free: live = только trial 1 раз (или можно дать лимиты),
-            live_refresh ограничиваем,
-            pre-ai ограничиваем по дневному лимиту.
-    """
-    user = session.exec(select(User).where(User.tg_user_id == tg_user_id)).first()
-    if user is None:
-        user = User(tg_user_id=tg_user_id)
-        session.add(user)
-        session.commit()
-        session.refresh(user)
+    Единственная функция для определения доступа.
 
-    if user.is_premium:
+    Premium:
+      - безлимит: live, refresh, ai_pre
+
+    Free:
+      - live: 1 trial (trial_live_used=False)
+      - refresh: лимит/день (FREE_DAILY_LIVE_REFRESH_LIMIT)
+      - ai_pre: лимит/день (FREE_DAILY_AI_PRE_LIMIT)
+
+    Важно: session опционален, чтобы одинаково работало из Telegram и API.
+    """
+    close_session = False
+    if session is None:
+        session = Session(engine)
+        close_session = True
+
+    try:
+        user = session.exec(select(User).where(User.tg_user_id == int(tg_user_id))).first()
+        if user is None:
+            # создаём минимального юзера
+            user = User(tg_user_id=int(tg_user_id))
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+
+        # -----------------------------
+        # PREMIUM
+        # -----------------------------
+        if bool(user.is_premium):
+            return EffectiveEntitlements(
+                tier="premium",
+                is_premium=True,
+                can_live=True,
+                can_live_refresh=True,
+                ai_daily_limit=10**9,
+                daily_ai_left=10**9,
+                live_refresh_daily_limit=10**9,
+                live_refresh_left=10**9,
+                live_min_interval_sec=0,
+            )
+
+        # -----------------------------
+        # FREE
+        # -----------------------------
+        period = _today_period()
+
+        used_ai = _get_usage(session, user.id, USAGE_AI_PRE, period)
+        ai_left = max(0, int(FREE_DAILY_AI_PRE_LIMIT) - int(used_ai))
+
+        used_refresh = _get_usage(session, user.id, USAGE_LIVE_REFRESH, period)
+        refresh_left = max(0, int(FREE_DAILY_LIVE_REFRESH_LIMIT) - int(used_refresh))
+
+        # LIVE trial: 1 раз бесплатно
+        can_live = not bool(user.trial_live_used)
+
+        # refresh разрешаем только если осталось
+        can_live_refresh = refresh_left > 0
+
         return EffectiveEntitlements(
-            is_premium=True,
-            can_live=True,
-            can_live_refresh=True,
-            daily_ai_left=10**9,
+            tier="free",
+            is_premium=False,
+            can_live=can_live,
+            can_live_refresh=can_live_refresh,
+            ai_daily_limit=int(FREE_DAILY_AI_PRE_LIMIT),
+            daily_ai_left=int(ai_left),
+            live_refresh_daily_limit=int(FREE_DAILY_LIVE_REFRESH_LIMIT),
+            live_refresh_left=int(refresh_left),
+            live_min_interval_sec=3,  # free обычно медленнее; можно потом вынести в ENV
         )
 
-    # FREE — пример лимитов
-    today = date.today()
-
-    # дневной лимит на pre-ai (пример: 10)
-    daily_limit = 10
-    c = session.exec(
-        select(UsageCounter).where(
-            UsageCounter.user_id == user.id,
-            UsageCounter.key == "ai_pre",
-            UsageCounter.period_start == today,
-        )
-    ).first()
-    used = c.count if c else 0
-    daily_ai_left = max(0, daily_limit - used)
-
-    # LIVE доступ: 1 trial
-    can_live = (not user.trial_live_used)
-
-    # refresh: free можно запретить вообще или дать, например, 3 в день
-    refresh_limit = 3
-    rc = session.exec(
-        select(UsageCounter).where(
-            UsageCounter.user_id == user.id,
-            UsageCounter.key == "live_refresh",
-            UsageCounter.period_start == today,
-        )
-    ).first()
-    rused = rc.count if rc else 0
-    can_live_refresh = rused < refresh_limit
-
-    return EffectiveEntitlements(
-        is_premium=False,
-        can_live=can_live,
-        can_live_refresh=can_live_refresh,
-        daily_ai_left=daily_ai_left,
-    )
+    finally:
+        if close_session:
+            session.close()
