@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlmodel import SQLModel, Field, Session, select
+from sqlalchemy import BigInteger
 
 
 # ---------- МОДЕЛИ В БД ----------
@@ -15,11 +16,11 @@ class User(SQLModel, table=True):
     Пользователь бота.
 
     id — это тот же user_id, который приходит из Telegram/клиента.
-    bank — текущий банкролл (может быть None, если ещё не задан).
+    ВАЖНО: Telegram user_id может быть > 2^31-1 => нужен BIGINT.
     """
     __tablename__ = "users"
 
-    id: int = Field(primary_key=True, index=True)
+    id: int = Field(primary_key=True, index=True, sa_type=BigInteger)
     bank: Optional[float] = Field(default=None)
 
 
@@ -31,7 +32,8 @@ class Bet(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
 
-    user_id: int = Field(index=True)
+    # ВАЖНО: тоже BIGINT, потому что хранит Telegram user_id
+    user_id: int = Field(index=True, sa_type=BigInteger)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     raw_text: str
@@ -63,6 +65,7 @@ class UserStats:
 # ---------- ОПЕРАЦИИ С ПОЛЬЗОВАТЕЛЕМ / БАНКОМ ----------
 
 def get_or_create_user(session: Session, user_id: int) -> User:
+    user_id = int(user_id)
     statement = select(User).where(User.id == user_id)
     user: User | None = session.exec(statement).one_or_none()
 
@@ -113,6 +116,7 @@ def add_bet(
     event: Optional[str] = None,
     outcome: Optional[str] = None,
 ) -> Bet:
+    user_id = int(user_id)
     get_or_create_user(session, user_id)
 
     bet = Bet(
@@ -130,6 +134,7 @@ def add_bet(
 
 
 def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
+    user_id = int(user_id)
     statement = (
         select(Bet)
         .where(Bet.user_id == user_id)
@@ -140,12 +145,16 @@ def get_last_bets(session: Session, user_id: int, limit: int = 5) -> List[Bet]:
 
 
 def get_all_bets(session: Session, user_id: int) -> List[Bet]:
+    user_id = int(user_id)
     statement = select(Bet).where(Bet.user_id == user_id)
     return list(session.exec(statement))
 
 
 def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Optional[Bet]:
-    result = result.lower().strip()
+    user_id = int(user_id)
+    bet_id = int(bet_id)
+
+    result = (result or "").lower().strip()
     if result in ("win", "выигрыш", "выиграл", "выиграла", "выиграли"):
         norm_result = "win"
     elif result in ("lose", "loss", "проигрыш", "проиграл", "проиграла", "проиграли"):
@@ -184,6 +193,7 @@ def settle_bet(session: Session, user_id: int, bet_id: int, result: str) -> Opti
 
 
 def get_user_stats(session: Session, user_id: int) -> UserStats:
+    user_id = int(user_id)
     statement = select(Bet).where(Bet.user_id == user_id)
     bets = list(session.exec(statement))
 
