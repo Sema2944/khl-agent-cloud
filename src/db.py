@@ -48,7 +48,8 @@ def _bootstrap_migrations_postgres() -> None:
     """
     Мини-миграции без Alembic (MVP):
     - добавляем недостающие колонки в users
-    - добавляем недостающие таблицы/индексы
+    - приводим типы к BIGINT там, где нужны Telegram ID
+    - добавляем индексы
     - фиксируем sequence users.id после ручных id (id=tg_user_id)
     """
     with engine.begin() as conn:
@@ -68,8 +69,7 @@ def _bootstrap_migrations_postgres() -> None:
             return  # create_all её создаст
 
         # 2) Добавляем колонки, если их нет
-
-        # tg_user_id (сразу BIGINT)
+        # tg_user_id
         conn.execute(
             text(
                 """
@@ -79,13 +79,25 @@ def _bootstrap_migrations_postgres() -> None:
             )
         )
 
-        # ✅ ВАЖНО: если колонка уже была INT — приводим к BIGINT (чтобы 5_027_679_117 помещался)
+        # ✅ ВАЖНО: привести tg_user_id к BIGINT даже если колонка была создана как INT
         conn.execute(
             text(
                 """
                 ALTER TABLE users
                 ALTER COLUMN tg_user_id TYPE BIGINT
                 USING tg_user_id::BIGINT
+                """
+            )
+        )
+
+        # ✅ ВАЖНО: привести users.id к BIGINT (иначе tg_id 5e9 не влезет)
+        # Это критично, если ты используешь стратегию id=tg_user_id.
+        conn.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN id TYPE BIGINT
+                USING id::BIGINT
                 """
             )
         )
@@ -100,7 +112,7 @@ def _bootstrap_migrations_postgres() -> None:
             )
         )
 
-        # username/first_name/last_name (если раньше не было)
+        # username/first_name/last_name
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT"""))
@@ -118,12 +130,10 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id)"""))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_is_premium ON users (is_premium)"""))
 
-        # 4) UniqueConstraint на tg_user_id
-        # В Postgres UNIQUE индекс допускает много NULL — это ок для legacy строк
+        # 4) UniqueConstraint на tg_user_id (unique index)
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tg_user_id ON users (tg_user_id)"""))
 
         # 5) Подтянуть sequence users.id (важно из-за ручных id=tg_user_id)
-        # Если id не serial/identity — команда может не сработать, но мы это ловим.
         try:
             conn.execute(
                 text(
@@ -154,7 +164,6 @@ def init_db() -> None:
 
         logger.info("DB initialized successfully.")
     except Exception as e:
-        # не валим сервис насмерть — чтобы API/бот могли жить даже при проблемах DB
         logger.exception("DB init failed (service will continue): %s", e)
 
 
