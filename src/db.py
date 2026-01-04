@@ -43,6 +43,25 @@ def _is_postgres() -> bool:
     return DATABASE_URL.startswith("postgresql")
 
 
+def _col_exists(conn, table: str, col: str) -> bool:
+    return bool(
+        conn.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema='public'
+                      AND table_name=:t
+                      AND column_name=:c
+                )
+                """
+            ),
+            {"t": table, "c": col},
+        ).scalar()
+    )
+
+
 def _bootstrap_migrations_postgres() -> None:
     """
     Мини-миграции без Alembic (MVP):
@@ -70,6 +89,9 @@ def _bootstrap_migrations_postgres() -> None:
 
         # tg_user_id
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_user_id BIGINT"""))
+
+        # ВАЖНО: после ADD COLUMN — приводим тип (если legacy был INTEGER)
+        # NULL-safe: NULL::BIGINT ок
         conn.execute(
             text(
                 """
@@ -132,7 +154,7 @@ def _bootstrap_migrations_postgres() -> None:
             )
         ).scalar()
 
-        if bets_exists:
+        if bets_exists and _col_exists(conn, "bets", "user_id"):
             conn.execute(
                 text(
                     """
@@ -156,7 +178,7 @@ def _bootstrap_migrations_postgres() -> None:
             )
         ).scalar()
 
-        if usage_exists:
+        if usage_exists and _col_exists(conn, "usage_counters", "user_id"):
             conn.execute(
                 text(
                     """
