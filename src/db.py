@@ -7,7 +7,7 @@ from typing import Generator
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, Session  # <-- важно: sqlmodel.Session
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,8 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# ✅ ВАЖНО: делаем фабрику с class_=sqlmodel.Session, чтобы был .exec()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=Session)
 
 
 def _is_postgres() -> bool:
@@ -62,36 +63,39 @@ def _col_exists(conn, table: str, col: str) -> bool:
     )
 
 
-def _bootstrap_migrations_postgres() -> None:
-    """
-    Мини-миграции без Alembic (MVP):
-    - добавляем недостающие колонки в users
-    - приводим типы к BIGINT там, где нужны Telegram ID
-    - приводим usage_counters.user_id к BIGINT
-    - добавляем индексы
-    - фиксируем sequence users.id после ручных id (id=tg_user_id)
-    """
-    with engine.begin() as conn:
-        # ---------- users ----------
-        users_exists = conn.execute(
+def _table_exists(conn, table: str) -> bool:
+    return bool(
+        conn.execute(
             text(
                 """
                 SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema='public' AND table_name='users'
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name=:t
                 ) AS exists
                 """
-            )
+            ),
+            {"t": table},
         ).scalar()
+    )
 
-        if not users_exists:
+
+def _bootstrap_migrations_postgres() -> None:
+    """
+    Мини-миграции без Alembic (MVP):
+    - users: tg_user_id BIGINT, id BIGINT + индексы
+    - bets.user_id BIGINT
+    - usage_counters.user_id BIGINT
+    - чинит users_id_seq (если он был создан как INTEGER)
+    - фиксирует setval users_id_seq (если sequence вообще используется)
+    """
+    with engine.begin() as conn:
+        # ---------- users ----------
+        if not _table_exists(conn, "users"):
             return  # create_all её создаст
 
         # tg_user_id
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_user_id BIGINT"""))
-
-        # ВАЖНО: после ADD COLUMN — приводим тип (если legacy был INTEGER)
-        # NULL-safe: NULL::BIGINT ок
         conn.execute(
             text(
                 """
@@ -102,7 +106,7 @@ def _bootstrap_migrations_postgres() -> None:
             )
         )
 
-        # users.id тоже должен быть BIGINT (ты используешь id=tg_user_id)
+        # users.id -> BIGINT (важно для id=tg_user_id)
         conn.execute(
             text(
                 """
@@ -143,18 +147,7 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tg_user_id ON users (tg_user_id)"""))
 
         # ---------- bets ----------
-        bets_exists = conn.execute(
-            text(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema='public' AND table_name='bets'
-                ) AS exists
-                """
-            )
-        ).scalar()
-
-        if bets_exists and _col_exists(conn, "bets", "user_id"):
+        if _table_exists(conn, "bets") and _col_exists(conn, "bets", "user_id"):
             conn.execute(
                 text(
                     """
@@ -167,18 +160,7 @@ def _bootstrap_migrations_postgres() -> None:
             conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_bets_user_id ON bets (user_id)"""))
 
         # ---------- usage_counters ----------
-        usage_exists = conn.execute(
-            text(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema='public' AND table_name='usage_counters'
-                ) AS exists
-                """
-            )
-        ).scalar()
-
-        if usage_exists and _col_exists(conn, "usage_counters", "user_id"):
+        if _table_exists(conn, "usage_counters") and _col_exists(conn, "usage_counters", "user_id"):
             conn.execute(
                 text(
                     """
@@ -190,20 +172,28 @@ def _bootstrap_migrations_postgres() -> None:
             )
             conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_usage_counters_user_id ON usage_counters (user_id)"""))
 
-        # ---------- sequence users.id ----------
+        # ---------- users_id_seq: сделать BIGINT (если существует) ----------
+        # Если sequence остался integer — setval будет падать при MAX(id) > 2^31-1
         try:
-            conn.execute(
-                text(
-                    """
-                    SELECT setval(
-                        pg_get_serial_sequence('users','id'),
-                        GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1)
+            seq = conn.execute(text("""SELECT pg_get_serial_sequence('users','id')""")).scalar()
+            if seq:
+                conn.execute(text(f"""ALTER SEQUENCE {seq} AS BIGINT"""))
+                # на всякий случай максималку тоже "в 64-bit"
+                conn.execute(text(f"""ALTER SEQUENCE {seq} MAXVALUE 9223372036854775807"""))
+
+                # ---------- setval ----------
+                conn.execute(
+                    text(
+                        f"""
+                        SELECT setval(
+                            '{seq}',
+                            GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1)
+                        )
+                        """
                     )
-                    """
                 )
-            )
         except Exception as e:
-            logger.warning("users.id sequence setval skipped: %s", e)
+            logger.warning("users.id sequence fix skipped: %s", e)
 
 
 def init_db() -> None:
@@ -222,9 +212,8 @@ def init_db() -> None:
         logger.exception("DB init failed (service will continue): %s", e)
 
 
-# ✅ ВАЖНО: НЕ @contextmanager.
-# FastAPI Depends и твой parsing.py ожидают generator (yield), а не GeneratorContextManager.
-def get_session() -> Generator:
+# ✅ FastAPI Depends ожидает generator (yield)
+def get_session() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
