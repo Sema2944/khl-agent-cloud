@@ -4,8 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlmodel import SQLModel, Field
-from sqlalchemy import UniqueConstraint, BigInteger
+from sqlalchemy import BigInteger, UniqueConstraint
+from sqlmodel import Field, SQLModel
 
 
 class User(SQLModel, table=True):
@@ -26,7 +26,7 @@ class User(SQLModel, table=True):
     # ✅ BIGINT PK (под стратегию id=tg_user_id)
     id: Optional[int] = Field(default=None, primary_key=True, sa_type=BigInteger)
 
-    # ✅ bankroll из bets_db (у тебя в SELECT он есть)
+    # ✅ bankroll из bets_db
     bank: float = Field(default=0.0)
 
     # ✅ telegram id (уникальный)
@@ -53,7 +53,9 @@ class Subscription(SQLModel, table=True):
     __table_args__ = ({"extend_existing": True},)
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True)
+
+    # ✅ Telegram user_id / users.id -> BIGINT
+    user_id: int = Field(index=True, sa_type=BigInteger)
 
     provider: str = Field(default="telegram")  # telegram | yookassa | manual
     status: str = Field(default="active", index=True)  # active|canceled|expired|pending
@@ -73,7 +75,9 @@ class Entitlement(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True)
+
+    # ✅ Telegram user_id / users.id -> BIGINT
+    user_id: int = Field(index=True, sa_type=BigInteger)
 
     feature: str = Field(index=True)  # live | prematch | expert | etc
     allowed: bool = Field(default=True)
@@ -94,7 +98,9 @@ class UsageCounter(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int = Field(index=True)
+
+    # ✅ Telegram user_id / users.id -> BIGINT (иначе integer out of range на лимитах)
+    user_id: int = Field(index=True, sa_type=BigInteger)
 
     key: str = Field(index=True)      # live_requests_day, ai_requests_day, ...
     period: str = Field(index=True)   # 'YYYY-MM-DD' или 'YYYY-MM'
