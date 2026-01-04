@@ -11,11 +11,11 @@ from sqlalchemy import UniqueConstraint, BigInteger
 class User(SQLModel, table=True):
     """
     Единая таблица пользователей.
+
     ВАЖНО:
+    - id и tg_user_id = BIGINT, потому что Telegram user_id может быть > 2^31-1
+      (например 5027679117) и не влезает в INTEGER.
     - extend_existing=True защищает от повторной регистрации таблицы при повторных импортам.
-    - tg_user_id сделан Optional, чтобы не падать на старых строках в БД (NULL).
-      При первом /start мы его заполним в user_store.get_or_create_user().
-    - tg_user_id маппим в BIGINT, потому что Telegram ID может быть > 2^31-1.
     """
     __tablename__ = "users"
     __table_args__ = (
@@ -23,17 +23,14 @@ class User(SQLModel, table=True):
         {"extend_existing": True},
     )
 
-    id: Optional[int] = Field(default=None, primary_key=True)
+    # ✅ BIGINT PK (под стратегию id=tg_user_id)
+    id: Optional[int] = Field(default=None, primary_key=True, sa_type=BigInteger)
 
-    # ✅ bankroll из bets_db
+    # ✅ bankroll из bets_db (у тебя в SELECT он есть)
     bank: float = Field(default=0.0)
 
-    # ✅ telegram id (BIGINT)
-    tg_user_id: Optional[int] = Field(
-        default=None,
-        index=True,
-        sa_type=BigInteger,
-    )
+    # ✅ telegram id (уникальный)
+    tg_user_id: Optional[int] = Field(default=None, index=True, sa_type=BigInteger)
 
     username: Optional[str] = Field(default=None)
     first_name: Optional[str] = Field(default=None)
@@ -87,7 +84,7 @@ class Entitlement(SQLModel, table=True):
 
 class UsageCounter(SQLModel, table=True):
     """
-    Счётчики использования (лимиты для FREE).
+    Счётчики использования (лимиты FREE).
     period формата 'YYYY-MM-DD' (день) или 'YYYY-MM' (месяц).
     """
     __tablename__ = "usage_counters"
