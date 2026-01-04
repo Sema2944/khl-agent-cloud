@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
 from typing import Generator
 
 from sqlalchemy import create_engine, text
@@ -49,11 +48,12 @@ def _bootstrap_migrations_postgres() -> None:
     Мини-миграции без Alembic (MVP):
     - добавляем недостающие колонки в users
     - приводим типы к BIGINT там, где нужны Telegram ID
+    - приводим usage_counters.user_id к BIGINT
     - добавляем индексы
     - фиксируем sequence users.id после ручных id (id=tg_user_id)
     """
     with engine.begin() as conn:
-        # 1) Проверим, есть ли таблица users
+        # ---------- users ----------
         users_exists = conn.execute(
             text(
                 """
@@ -68,11 +68,8 @@ def _bootstrap_migrations_postgres() -> None:
         if not users_exists:
             return  # create_all её создаст
 
-        # 2) Добавляем колонки, если их нет
-        # tg_user_id (Telegram ID)
+        # tg_user_id
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_user_id BIGINT"""))
-
-        # ✅ ВАЖНО: если колонка была создана как INTEGER/другой тип — приводим к BIGINT
         conn.execute(
             text(
                 """
@@ -83,8 +80,7 @@ def _bootstrap_migrations_postgres() -> None:
             )
         )
 
-        # ✅ ВАЖНО: users.id тоже должен быть BIGINT, потому что ты используешь id=tg_user_id
-        # (и потому что bets.user_id ссылается на Telegram ID)
+        # users.id тоже должен быть BIGINT (ты используешь id=tg_user_id)
         conn.execute(
             text(
                 """
@@ -119,14 +115,12 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
 
-        # 3) Индексы users (idempotent)
+        # индексы users
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id)"""))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_is_premium ON users (is_premium)"""))
-
-        # 4) Unique на tg_user_id (NULL допускается многократно)
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tg_user_id ON users (tg_user_id)"""))
 
-        # 5) bets.user_id -> BIGINT (Telegram user_id)
+        # ---------- bets ----------
         bets_exists = conn.execute(
             text(
                 """
@@ -150,7 +144,31 @@ def _bootstrap_migrations_postgres() -> None:
             )
             conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_bets_user_id ON bets (user_id)"""))
 
-        # 6) Подтянуть sequence users.id (важно из-за ручных id=tg_user_id)
+        # ---------- usage_counters ----------
+        usage_exists = conn.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name='usage_counters'
+                ) AS exists
+                """
+            )
+        ).scalar()
+
+        if usage_exists:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE usage_counters
+                    ALTER COLUMN user_id TYPE BIGINT
+                    USING user_id::BIGINT
+                    """
+                )
+            )
+            conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_usage_counters_user_id ON usage_counters (user_id)"""))
+
+        # ---------- sequence users.id ----------
         try:
             conn.execute(
                 text(
@@ -169,23 +187,21 @@ def _bootstrap_migrations_postgres() -> None:
 def init_db() -> None:
     """
     Создаёт таблицы, если их ещё нет.
-    Плюс: делает bootstrap-миграции для Postgres (без Alembic), чтобы не падать на старой схеме.
+    Плюс: делает bootstrap-миграции для Postgres (без Alembic).
     """
     try:
-        # 1) создаём все таблицы, которых нет
         SQLModel.metadata.create_all(engine)
 
-        # 2) если Postgres — догоняем схему для legacy
         if _is_postgres():
             _bootstrap_migrations_postgres()
 
         logger.info("DB initialized successfully.")
     except Exception as e:
-        # не валим сервис насмерть — чтобы API/бот могли жить даже при проблемах DB
         logger.exception("DB init failed (service will continue): %s", e)
 
 
-@contextmanager
+# ✅ ВАЖНО: НЕ @contextmanager.
+# FastAPI Depends и твой parsing.py ожидают generator (yield), а не GeneratorContextManager.
 def get_session() -> Generator:
     db = SessionLocal()
     try:
