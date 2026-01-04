@@ -69,17 +69,10 @@ def _bootstrap_migrations_postgres() -> None:
             return  # create_all её создаст
 
         # 2) Добавляем колонки, если их нет
-        # tg_user_id
-        conn.execute(
-            text(
-                """
-                ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS tg_user_id BIGINT
-                """
-            )
-        )
+        # tg_user_id (Telegram ID)
+        conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_user_id BIGINT"""))
 
-        # ✅ ВАЖНО: привести tg_user_id к BIGINT даже если колонка была создана как INT
+        # ✅ ВАЖНО: если колонка была создана как INTEGER/другой тип — приводим к BIGINT
         conn.execute(
             text(
                 """
@@ -90,8 +83,8 @@ def _bootstrap_migrations_postgres() -> None:
             )
         )
 
-        # ✅ ВАЖНО: привести users.id к BIGINT (иначе tg_id 5e9 не влезет)
-        # Это критично, если ты используешь стратегию id=tg_user_id.
+        # ✅ ВАЖНО: users.id тоже должен быть BIGINT, потому что ты используешь id=tg_user_id
+        # (и потому что bets.user_id ссылается на Telegram ID)
         conn.execute(
             text(
                 """
@@ -126,14 +119,38 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
 
-        # 3) Индексы (idempotent)
+        # 3) Индексы users (idempotent)
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id)"""))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_users_is_premium ON users (is_premium)"""))
 
-        # 4) UniqueConstraint на tg_user_id (unique index)
+        # 4) Unique на tg_user_id (NULL допускается многократно)
         conn.execute(text("""CREATE UNIQUE INDEX IF NOT EXISTS uq_users_tg_user_id ON users (tg_user_id)"""))
 
-        # 5) Подтянуть sequence users.id (важно из-за ручных id=tg_user_id)
+        # 5) bets.user_id -> BIGINT (Telegram user_id)
+        bets_exists = conn.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name='bets'
+                ) AS exists
+                """
+            )
+        ).scalar()
+
+        if bets_exists:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE bets
+                    ALTER COLUMN user_id TYPE BIGINT
+                    USING user_id::BIGINT
+                    """
+                )
+            )
+            conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_bets_user_id ON bets (user_id)"""))
+
+        # 6) Подтянуть sequence users.id (важно из-за ручных id=tg_user_id)
         try:
             conn.execute(
                 text(
@@ -152,7 +169,7 @@ def _bootstrap_migrations_postgres() -> None:
 def init_db() -> None:
     """
     Создаёт таблицы, если их ещё нет.
-    Плюс: bootstrap-миграции для Postgres (без Alembic), чтобы не падать на старой схеме.
+    Плюс: делает bootstrap-миграции для Postgres (без Alembic), чтобы не падать на старой схеме.
     """
     try:
         # 1) создаём все таблицы, которых нет
@@ -164,6 +181,7 @@ def init_db() -> None:
 
         logger.info("DB initialized successfully.")
     except Exception as e:
+        # не валим сервис насмерть — чтобы API/бот могли жить даже при проблемах DB
         logger.exception("DB init failed (service will continue): %s", e)
 
 
