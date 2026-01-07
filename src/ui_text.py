@@ -2,512 +2,315 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional
 
+
+# ============================================================
+# ЕДИНЫЙ СТИЛЬ ТЕКСТОВ ДЛЯ UI (MVP → production friendly)
+# Цель:
+# - меньше “раздражающих” сообщений
+# - единая структура экранов
+# - компактные paywall/ошибки
+# - безопасный дисклеймер (аналитика ≠ рекомендация)
+# ============================================================
 
 DISCLAIMER = "ℹ️ Аналитический материал. Не является рекомендацией."
 
 
-def _safe(s: Optional[str]) -> str:
+def _cap(s: str) -> str:
     return (s or "").strip()
 
 
-def _fmt_dt_msk(date_str: Optional[str] = None, time_str: Optional[str] = None) -> str:
-    """
-    Простой форматтер. Ты можешь уже отдавать date/time готовыми строками.
-    """
-    ds = _safe(date_str)
-    ts = _safe(time_str)
-    if ds and ts:
-        return f"🗓 {ds} • ⏱ {ts} (МСК)"
-    if ds:
-        return f"🗓 {ds} (МСК)"
-    return ""
+def _join(*parts: str) -> str:
+    lines: list[str] = []
+    for p in parts:
+        p = _cap(p)
+        if not p:
+            continue
+        lines.extend(p.splitlines())
+    # убираем лишние пустые строки по краям
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
-@dataclass
-class MatchCard:
+def _section(title: str, bullets: list[str], *, max_items: int = 6) -> str:
+    bullets = [b.strip() for b in (bullets or []) if b and b.strip()]
+    if not bullets:
+        return ""
+    bullets = bullets[:max_items]
+    lines = [title]
+    lines += [f"• {b}" for b in bullets]
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MatchMeta:
+    sport: str
+    title: str
+    league: str
     match_id: str
-    home: str
-    away: str
-    league: str = ""
-    date_str: Optional[str] = None  # "2026-01-07"
-    time_str: Optional[str] = None  # "19:30"
-
-
-@dataclass
-class LiveState:
-    live_time: str = "—"          # "57’" / "12:34" / "2P 08:11"
-    score: str = "—"              # "1–0"
-    pace: Optional[str] = None
-    edge: Optional[str] = None
-    chances: Optional[str] = None
-
-
-@dataclass
-class PreSignals:
-    context_1: Optional[str] = None
-    style_1: Optional[str] = None
-    risk_1: Optional[str] = None
-
-    ml_hint: Optional[str] = None
-    total_hint: Optional[str] = None
-    hcp_hint: Optional[str] = None
-
-
-@dataclass
-class ScenarioBlock:
-    a_trigger: Optional[str] = None
-    a_inplay: Optional[str] = None
-    a_breaker: Optional[str] = None
-
-    b_trigger: Optional[str] = None
-    b_inplay: Optional[str] = None
-    b_breaker: Optional[str] = None
-
-    total_confirm: Optional[str] = None
-    hcp_confirm: Optional[str] = None
-
-
-@dataclass
-class TotalBlock:
-    pace: Optional[str] = None
-    scoring_model: Optional[str] = None
-    risk_window: Optional[str] = None
-
-    early_event_effect: Optional[str] = None
-    dry_phase_effect: Optional[str] = None
-    rotation_effect: Optional[str] = None
-
-    link_1: Optional[str] = None
-    link_2: Optional[str] = None
-
-
-@dataclass
-class HandicapBlock:
-    edge_side: Optional[str] = None
-    edge_strength: Optional[str] = None
-    edge_visual: Optional[str] = None
-
-    consistency_note: Optional[str] = None
-    total_alignment: Optional[str] = None
-
-
-@dataclass
-class LinksBlock:
-    # Можно расширять — сейчас текст самодостаточный
-    pass
 
 
 # -----------------------------
-# 0) Матч
+# Экран: Матч (хаб)
 # -----------------------------
-def text_match(card: MatchCard) -> str:
-    dt_line = _fmt_dt_msk(card.date_str, card.time_str)
-    header = f"🏟 {card.home} — {card.away}"
-    if _safe(card.league):
-        header += f" ({card.league})"
-
-    parts = [
-        header,
-        dt_line,
+def match_hub(meta: MatchMeta) -> str:
+    return _join(
+        f"🏟 {meta.title} ({meta.league})",
         "",
-        "Выбери, что открыть:",
-        "• 📊 Обзор рынков — быстрый снимок и ключевые риски",
-        "• 🧠 1X2 / Тотал / Фора — сценарии и что “вшито” в линию",
-        "• 🔗 Связки — как рынки подтверждают один сценарий",
-        "• 🟢 LIVE — динамика матча (Premium)",
+        "Выбери раздел:",
+        "• Pre — логика линии до матча",
+        "• LIVE — разбор по ходу матча",
         "",
         DISCLAIMER,
-    ]
-    # выкидываем пустые строки (кроме намеренных)
-    return "\n".join([p for p in parts if p is not None])
-
-
-# -----------------------------
-# 1) Pre overview
-# -----------------------------
-def text_pre_overview(card: MatchCard, s: Optional[PreSignals] = None, *, fallback: bool = False) -> str:
-    title = f"📊 Обзор рынков\n{card.home} — {card.away}"
-    if _safe(card.league):
-        title += f" ({card.league})"
-
-    if fallback or s is None:
-        return "\n".join(
-            [
-                title,
-                "",
-                "Быстрый ориентир:",
-                "• Рынки чаще всего “закладывают” ожидаемый темп и преимущество одной из сторон.",
-                "• Без свежих данных точность ниже — держим фокус на рисках.",
-                "",
-                "Риски:",
-                "• Неизвестные составы/ротация",
-                "• Ранний гол меняет сценарий",
-                "• Высокая чувствительность к удалению/травме",
-                "",
-                "Что дальше:",
-                "• 🧠 1X2 — сценарий по исходу",
-                "• 🧠 Тотал — логика темпа",
-                "• 🧠 Фора — где перекос",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    # подставляем мягкие дефолты, чтобы текст всегда был красивый
-    context_1 = _safe(s.context_1) or "кто и за счёт чего должен вести сценарий"
-    style_1 = _safe(s.style_1) or "темп и стиль команды / матч-ап"
-    risk_1 = _safe(s.risk_1) or "главные факторы, которые ломают план игры"
-
-    ml_hint = _safe(s.ml_hint) or "показывает “кто ведёт сценарий”"
-    total_hint = _safe(s.total_hint) or "про темп и количество моментов"
-    hcp_hint = _safe(s.hcp_hint) or "проверка силы преимущества"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "Что важно перед матчем:",
-            f"• Контекст: {context_1}",
-            f"• Темп/стиль: {style_1}",
-            f"• Уязвимости: {risk_1}",
-            "",
-            "Как читать линию:",
-            f"• 1X2: {ml_hint}",
-            f"• Тотал: {total_hint}",
-            f"• Фора: {hcp_hint}",
-            "",
-            "Что дальше:",
-            "• Если ждёшь осторожный матч → открой 🧠 Тотал",
-            "• Если важен “кто заберёт сценарий” → 🧠 1X2",
-            "• Если ищешь перекос → 🧠 Фора / 🔗 Связки",
-            "",
-            DISCLAIMER,
-        ]
     )
 
 
 # -----------------------------
-# 2) Pre 1X2
+# Pre: overview
 # -----------------------------
-def text_pre_1x2(card: MatchCard, sc: Optional[ScenarioBlock] = None, *, fallback: bool = False) -> str:
-    title = f"🧠 1X2 — сценарии матча\n{card.home} — {card.away}"
-
-    if fallback or sc is None:
-        return "\n".join(
-            [
-                title,
-                "",
-                "Как читать:",
-                "• 1X2 отвечает на вопрос “кто ведёт сценарий”.",
-                "• Если рынок ждёт доминирование — это обычно видно и в форе.",
-                "• Если рынок ждёт вязкую игру — это чаще подтверждается тоталом.",
-                "",
-                "Что дальше:",
-                "• 🧠 Фора — проверка силы сценария",
-                "• 🧠 Тотал — проверка темпа",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    a_trigger = _safe(sc.a_trigger) or "фаворит быстро забирает инициативу"
-    a_inplay = _safe(sc.a_inplay) or "давление, серии атак, контроль темпа"
-    a_breaker = _safe(sc.a_breaker) or "ранний гол в другую сторону / красная / травма"
-
-    b_trigger = _safe(sc.b_trigger) or "матч не раскрывается, темп сдержанный"
-    b_inplay = _safe(sc.b_inplay) or "мало моментов, много позиционной игры"
-    b_breaker = _safe(sc.b_breaker) or "быстрый обмен голами, игра ломается"
-
-    total_confirm = _safe(sc.total_confirm) or "темп подтверждает выбранный сценарий"
-    hcp_confirm = _safe(sc.hcp_confirm) or "фора согласована с силой преимущества"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "Сценарий А (через фаворита):",
-            f"• Что должно случиться: {a_trigger}",
-            f"• Как это выглядит в игре: {a_inplay}",
-            f"• Что ломает сценарий: {a_breaker}",
-            "",
-            "Сценарий B (через андердога/ничью):",
-            f"• Что должно случиться: {b_trigger}",
-            f"• Как это выглядит: {b_inplay}",
-            f"• Что ломает: {b_breaker}",
-            "",
-            "Проверка через другие рынки:",
-            f"• Тотал подтверждает: {total_confirm}",
-            f"• Фора подтверждает: {hcp_confirm}",
-            "",
-            DISCLAIMER,
-        ]
+def pre_overview(meta: MatchMeta) -> str:
+    return _join(
+        f"📊 Pre-обзор • {meta.title} ({meta.league})",
+        "",
+        "Что смотреть в линии:",
+        "• кто «тащит» ожидания (фаворит/андердог) и почему",
+        "• где рынок ждёт голы/очки (темп и характер матча)",
+        "• как связаны 1X2, тотал и фора",
+        "",
+        "Выбери рынок ниже: 1X2 / Тотал / Фора / Связки",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 3) Pre Total
+# Pre: 1X2
 # -----------------------------
-def text_pre_total(card: MatchCard, t: Optional[TotalBlock] = None, *, fallback: bool = False) -> str:
-    title = f"🧠 Тотал — логика темпа\n{card.home} — {card.away}"
+def pre_moneyline(meta: MatchMeta, *, home: Optional[float] = None, draw: Optional[float] = None, away: Optional[float] = None) -> str:
+    odds_block = ""
+    if home is not None and away is not None:
+        if draw is None:
+            odds_block = f"Коэффициенты: П1 {home} • П2 {away}"
+        else:
+            odds_block = f"Коэффициенты: П1 {home} • X {draw} • П2 {away}"
 
-    if fallback or t is None:
-        return "\n".join(
-            [
-                title,
-                "",
-                "Ориентир:",
-                "• Тотал — это ставка на темп и количество моментов.",
-                "• Главный риск — раннее событие (гол/удаление), которое меняет план игры.",
-                "",
-                "Что дальше:",
-                "• 🟢 LIVE-обзор (Premium) — когда темп уже виден",
-                "• 🔗 Связки — сверка сценария",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    pace = _safe(t.pace) or "средний / выше среднего"
-    scoring_model = _safe(t.scoring_model) or "через качество моментов, а не только количество"
-    risk_window = _safe(t.risk_window) or "первые 10–15 минут и концовка тайма"
-
-    early = _safe(t.early_event_effect) or "линия часто перестраивается в сторону темпа"
-    dry = _safe(t.dry_phase_effect) or "тотал может “подтягиваться” вниз без моментов"
-    rot = _safe(t.rotation_effect) or "смена темпа через замены/ротацию"
-
-    link_1 = _safe(t.link_1) or "если 1X2 перекошен — тотал чаще поддерживает сценарий фаворита"
-    link_2 = _safe(t.link_2) or "если фора агрессивная — тотал чаще выше"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "Какой матч “вшит” в линию:",
-            f"• Ожидаемый темп: {pace}",
-            f"• Модель гола/очков: {scoring_model}",
-            f"• Окно риска: {risk_window}",
-            "",
-            "Триггеры движения тотала:",
-            f"• Ранний гол/очко → {early}",
-            f"• Затяжная “сухая” фаза → {dry}",
-            f"• Замены/ротация → {rot}",
-            "",
-            "Проверка связками:",
-            f"• {link_1}",
-            f"• {link_2}",
-            "",
-            DISCLAIMER,
-        ]
+    return _join(
+        f"🧠 Pre: 1X2 • {meta.title} ({meta.league})",
+        odds_block,
+        "",
+        "Смысл рынка:",
+        "• 1X2 — «кто сильнее» с учётом контекста и ожиданий",
+        "",
+        "Как читать движение:",
+        "• к фавориту — рынок усиливает вероятность доминирования",
+        "• к андердогу — рынок закладывает сопротивление/равный темп",
+        "",
+        "На что обратить внимание:",
+        "• перекос в одну сторону без поддержки тотала/форы",
+        "• резкие изменения ближе к старту (новости/состав/мотивация)",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 4) Pre Handicap
+# Pre: Total
 # -----------------------------
-def text_pre_handicap(card: MatchCard, h: Optional[HandicapBlock] = None, *, fallback: bool = False) -> str:
-    title = f"🧠 Фора — где перекос\n{card.home} — {card.away}"
+def pre_total(meta: MatchMeta, *, total_value: Optional[float] = None, over: Optional[float] = None, under: Optional[float] = None) -> str:
+    odds_block = ""
+    if total_value is not None:
+        if over is not None and under is not None:
+            odds_block = f"Линия: ТБ/ТМ {total_value} • Б {over} • М {under}"
+        else:
+            odds_block = f"Линия: тотал {total_value}"
 
-    if fallback or h is None:
-        return "\n".join(
-            [
-                title,
-                "",
-                "Ориентир:",
-                "• Фора показывает, насколько рынок уверен в преимуществе.",
-                "• Чем агрессивнее фора — тем важнее темп и вероятность раннего преимущества.",
-                "",
-                "Что дальше:",
-                "• 🧠 1X2 — подтверждение сценария",
-                "• 🧠 Тотал — подтверждение темпа",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    edge_side = _safe(h.edge_side) or "одной из сторон"
-    edge_strength = _safe(h.edge_strength) or "умеренное"
-    edge_visual = _safe(h.edge_visual) or "должно быть видно по инициативе и моментам"
-
-    cons = _safe(h.consistency_note) or "если 1X2 и фора расходятся — это зона риска"
-    align = _safe(h.total_alignment) or "тотал должен поддерживать выбранный темп"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "Что означает текущая фора:",
-            f"• Рынок ждёт преимущество: {edge_side}",
-            f"• Насколько оно “сильное”: {edge_strength}",
-            f"• Как это должно выглядеть: {edge_visual}",
-            "",
-            "Где чаще ошибается рынок:",
-            "• Переоценка “имени” vs формы",
-            "• Недооценка стиля (темп/матч-ап)",
-            "• Раннее событие ломает распределение",
-            "",
-            "Проверка:",
-            f"• 1X2 ↔ фора: {cons}",
-            f"• Тотал ↔ сценарий: {align}",
-            "",
-            DISCLAIMER,
-        ]
+    return _join(
+        f"🧠 Pre: Тотал • {meta.title} ({meta.league})",
+        odds_block,
+        "",
+        "Смысл рынка:",
+        "• тотал — ожидание темпа и количества моментов/владения",
+        "",
+        "Как читать движение:",
+        "• тотал вверх — рынок ждёт более открытый сценарий",
+        "• тотал вниз — ждут осторожность/низкий темп/плотную оборону",
+        "",
+        "Проверка на адекватность:",
+        "• тотал вверх + фаворит укрепляется → сценарий «доминирование и голы/очки»",
+        "• тотал вверх, но 1X2 не двигается → рынок ждёт обоюдоострый матч",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 5) Pre Links
+# Pre: Handicap
 # -----------------------------
-def text_pre_links(card: MatchCard) -> str:
-    title = f"🔗 Связки рынков\n{card.home} — {card.away}"
-    return "\n".join(
-        [
-            title,
-            "",
-            "1) Если фаворит “реальный”",
-            "• 1X2 сдвигается → фора становится агрессивнее",
-            "• тотал чаще растёт, если фаворит играет в темп",
-            "",
-            "2) Если матч “вязкий”",
-            "• тотал вниз",
-            "• 1X2 чаще ближе к равному",
-            "• фора становится осторожнее",
-            "",
-            "3) Если ждём разнос",
-            "• фора усиливается",
-            "• тотал растёт",
-            "• LIVE подтверждает темп уже в первые минуты",
-            "",
-            "Что делать:",
-            "• Выбери одну гипотезу (вязкий / темповый / разнос) и сверяй рынки между собой.",
-            "• Если рынки противоречат — это зона риска.",
-            "",
-            DISCLAIMER,
-        ]
+def pre_handicap(meta: MatchMeta, *, team: Optional[str] = None, handicap_value: Optional[float] = None, odds: Optional[float] = None) -> str:
+    odds_block = ""
+    if handicap_value is not None:
+        team_label = "хозяева" if (team == "home") else ("гости" if (team == "away") else "команда")
+        if odds is not None:
+            odds_block = f"Линия: фора {team_label} {handicap_value} • кф {odds}"
+        else:
+            odds_block = f"Линия: фора {team_label} {handicap_value}"
+
+    return _join(
+        f"🧠 Pre: Фора • {meta.title} ({meta.league})",
+        odds_block,
+        "",
+        "Смысл рынка:",
+        "• фора — «насколько» один сильнее другого в ожидаемом сценарии",
+        "",
+        "Как читать движение:",
+        "• фора в минус усиливается — рынок ждёт преимущество/контроль",
+        "• фора смягчается — ждут более равный матч или «качели»",
+        "",
+        "Сигналы, что сценарий меняется:",
+        "• 1X2 двигается, а фора стоит — сомнения в разнице классов",
+        "• фора двигается сильнее, чем 1X2 — рынок «перекладывает» ожидания в разницу",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 6) LIVE overview
+# Pre: Links (связки рынков)
 # -----------------------------
-def text_live_overview(card: MatchCard, live: LiveState, *, fallback: bool = False) -> str:
-    title = f"🟢 LIVE-обзор\n{card.home} — {card.away}\n⏱ {live.live_time} • Счёт: {live.score}"
-
-    if fallback or not (_safe(live.pace) or _safe(live.edge) or _safe(live.chances)):
-        return "\n".join(
-            [
-                title,
-                "",
-                "Пока без уверенных сигналов:",
-                "• Подтверди темп: где и как идёт игра",
-                "• Подтверди инициативу: серии атак/моменты",
-                "• Отметь “слом сценария”: гол/удаление/травма",
-                "",
-                "Нажми 🔄 Обновить LIVE через 30–60 сек — появится больше сигналов.",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    pace = _safe(live.pace) or "—"
-    edge = _safe(live.edge) or "—"
-    chances = _safe(live.chances) or "—"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "Что видно по игре сейчас:",
-            f"• Темп: {pace}",
-            f"• Давление/инициатива: {edge}",
-            f"• Качество моментов: {chances}",
-            "",
-            "Ключевые риски:",
-            "• Резкое изменение темпа после гола/удаления",
-            "• Просадка концентрации в концовках",
-            "",
-            "Что логично проверять в рынках:",
-            "• 1X2: кто реально держит сценарий",
-            "• Тотал: темп подтверждается моментами или только владением",
-            "• Фора: преимущество устойчивое или “на волне”",
-            "",
-            DISCLAIMER,
-        ]
+def pre_links(meta: MatchMeta) -> str:
+    return _join(
+        f"🔗 Связки рынков • {meta.title} ({meta.league})",
+        "",
+        "Идея:",
+        "• рынки описывают один сценарий разными словами",
+        "",
+        "Частые связки:",
+        "• фаворит усиливается + тотал вверх → доминирование и темп",
+        "• фаворит усиливается + тотал вниз → контроль, но аккуратно",
+        "• андердог укрепляется + тотал вверх → обоюдоострая игра",
+        "• тотал вниз + фора смягчается → осторожный и равный матч",
+        "",
+        "Как использовать:",
+        "• если один рынок «кричит», а остальные молчат — это повод задуматься о причине",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 7) LIVE full
+# LIVE: overview (коротко)
 # -----------------------------
-def text_live_full(card: MatchCard, live: LiveState, *, fallback: bool = False) -> str:
-    title = f"🟢 LIVE (полный)\n{card.home} — {card.away}\n⏱ {live.live_time} • Счёт: {live.score}"
-
-    if fallback:
-        return "\n".join(
-            [
-                title,
-                "",
-                "1) Структура матча",
-                "• Кто навязывает стиль: —",
-                "• Где преимущество: —",
-                "• Что изменилось за последние минуты: —",
-                "",
-                "2) Триггеры на ближайшие 5–10 минут",
-                "• Гол/удаление полностью перестраивает темп",
-                "• Серия атак часто даёт движение линии быстрее статистики",
-                "",
-                "3) Рынки и логика",
-                "• 1X2: кто держит сценарий",
-                "• Тотал: темп подтверждается моментами",
-                "• Фора: устойчивость преимущества",
-                "",
-                DISCLAIMER,
-            ]
-        )
-
-    # даже если у тебя пока мало данных — лучше дать “структуру”, чем “AI недоступен”
-    pace = _safe(live.pace) or "темп оцени по серии атак и переходам"
-    edge = _safe(live.edge) or "посмотри, кто чаще проводит атаки в опасных зонах"
-    chances = _safe(live.chances) or "оценка по моментам/ударам из опасных позиций"
-
-    return "\n".join(
-        [
-            title,
-            "",
-            "1) Структура матча",
-            f"• Темп: {pace}",
-            f"• Инициатива: {edge}",
-            f"• Моменты: {chances}",
-            "",
-            "2) Триггеры на ближайшие 5–10 минут",
-            "• Смена темпа после гола/паузы/замен",
-            "• Накопление моментов → рост вероятности события",
-            "",
-            "3) Рынки и логика",
-            "• 1X2: лидер сценария сейчас",
-            "• Тотал: подтверждение темпа моментами",
-            "• Фора: устойчивость преимущества",
-            "",
-            DISCLAIMER,
-        ]
+def live_overview(meta: MatchMeta) -> str:
+    return _join(
+        f"🟢 LIVE-обзор • {meta.title} ({meta.league})",
+        "",
+        "Что меняется в LIVE:",
+        "• темп (ускорение/замедление)",
+        "• структура (кто контролирует мяч/территорию/инициативу)",
+        "• реакция на ключевые события (гол, удаление, тайм-аут)",
+        "",
+        "Нажми «LIVE (полный)» — дам разбор сценариев и связок.",
+        "",
+        DISCLAIMER,
     )
 
 
 # -----------------------------
-# 8) Paywall LIVE (мягкий)
+# LIVE: full (глубже, но без чисел)
 # -----------------------------
-def text_live_paywall() -> str:
-    return "\n".join(
-        [
-            "🔒 LIVE доступен в Premium.",
-            "",
-            "Что ты получаешь:",
-            "• LIVE-обзор и полный разбор",
-            "• обновления по кнопке 🔄 без лимитов",
-            "• расширенные связки рынков",
-            "",
-            "Нажми «⭐ Premium» — покажу условия.",
-        ]
+def live_full(meta: MatchMeta) -> str:
+    return _join(
+        f"🟢 LIVE (полный) • {meta.title} ({meta.league})",
+        "",
+        "Сценарий матча сейчас:",
+        "• кто навязывает рисунок",
+        "• насколько игра «открытая» или «закрытая»",
+        "",
+        "Логика линии (без чисел):",
+        "• тотал: вверх / вниз / ровно — по темпу и качеству моментов",
+        "• фора: усиливается / смягчается — по контролю и устойчивости преимущества",
+        "",
+        "Риски интерпретации:",
+        "• один эпизод может временно исказить линию",
+        "• «шум» от серий моментов без реального перелома",
+        "",
+        DISCLAIMER,
+    )
+
+
+# -----------------------------
+# Throttle / мягкие ошибки
+# -----------------------------
+def soft_throttle() -> str:
+    return _join(
+        "⏳ Слишком часто.",
+        "Дай пару секунд — и нажми ещё раз.",
+    )
+
+
+def ai_fallback_pre(meta: Optional[MatchMeta] = None) -> str:
+    title = "📊 Обзор рынков"
+    if meta:
+        title = f"📊 Pre-обзор • {meta.title} ({meta.league})"
+    return _join(
+        title,
+        "",
+        "Сейчас AI недоступен — показываю базовую структуру.",
+        "",
+        "Что обычно важно:",
+        "• 1X2 — баланс сил и ожиданий",
+        "• тотал — темп и открытость",
+        "• фора — ожидаемая разница",
+        "",
+        DISCLAIMER,
+    )
+
+
+def ai_fallback_live(meta: Optional[MatchMeta] = None) -> str:
+    title = "🟢 LIVE-обзор"
+    if meta:
+        title = f"🟢 LIVE-обзор • {meta.title} ({meta.league})"
+    return _join(
+        title,
+        "",
+        "Сейчас AI недоступен — даю краткую памятку LIVE.",
+        "",
+        "Что отслеживать:",
+        "• темп и структура",
+        "• устойчивость преимущества",
+        "• реакция на ключевые события",
+        "",
+        DISCLAIMER,
+    )
+
+
+# -----------------------------
+# Paywall (без раздражения)
+# -----------------------------
+def paywall_live() -> str:
+    return _join(
+        "🟢 LIVE доступен в Premium.",
+        "",
+        "Откроется:",
+        "• LIVE-обзор и LIVE (полный)",
+        "• обновления без лимитов",
+        "",
+        "Нажми «Активировать Premium».",
+        "",
+        DISCLAIMER,
+    )
+
+
+def paywall_live_refresh() -> str:
+    return _join(
+        "🔄 Обновления LIVE ограничены на Free.",
+        "",
+        "В Premium — обновления без лимитов.",
+        "Нажми «Активировать Premium».",
+        "",
+        DISCLAIMER,
     )
