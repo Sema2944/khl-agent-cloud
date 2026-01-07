@@ -1,16 +1,16 @@
-# src/telegram_bot/app.py  (v6.3.1 + fixes)
+# src/telegram_bot/app.py  (v6.3.1 + stale-callback guard)
 from __future__ import annotations
 
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,  # ✅ чтобы скрывать MAIN_KB в inline-экранах
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Message,
@@ -69,7 +69,6 @@ SPORTS = [
 # ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
-
 
 # -----------------------------
 # Helpers
@@ -148,6 +147,7 @@ def kb_premium() -> InlineKeyboardMarkup:
 
 
 def _premium_text(tg_user_id: int) -> str:
+    # предполагаем, что entitlements.py сам открывает сессию (мы это сделаем)
     ent = get_effective_entitlements(int(tg_user_id))
     tier = getattr(ent, "tier", "free").upper()
 
@@ -209,27 +209,8 @@ async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
+        # typing не критично
         return
-
-
-async def _enter_inline_screen(update: Update, text: str, inline_kb: InlineKeyboardMarkup) -> None:
-    """
-    ✅ Убираем ReplyKeyboard (MAIN_KB), чтобы она не "проскакивала" поверх inline-экранов.
-    Фокус: отправляем сообщение с ReplyKeyboardRemove(), затем мгновенно редактируем и вешаем inline.
-    Это один экран для пользователя, без лишнего меню снизу.
-    """
-    if not update.message:
-        return
-
-    # 1) убрать ReplyKeyboard
-    m = await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
-
-    # 2) повесить inline на то же сообщение (быстро и без "лишних" сообщений)
-    try:
-        await m.edit_text(text, reply_markup=inline_kb)
-    except Exception:
-        # если по какой-то причине edit не удался — просто отправим inline отдельным сообщением
-        await update.message.reply_text(text, reply_markup=inline_kb)
 
 
 # -----------------------------
@@ -279,7 +260,6 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         last_name=tg_user.last_name,
     )
 
-    # premium экран оставляем с MAIN_KB (это "главный" экран)
     await update.message.reply_text(_premium_text(tg_user.id), reply_markup=kb_premium())
 
 
@@ -303,8 +283,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _typing_safe(context, update.effective_chat.id if update.effective_chat else None)
 
     if norm == "матчи сегодня":
-        # ✅ убираем MAIN_KB и переходим в inline-навигацию
-        await _enter_inline_screen(update, "🏟 Выбери спорт:", kb_sports())
+        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
     if norm in {"профиль", "мой профиль", "статы", "статистика"}:
@@ -334,6 +313,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query or not query.message:
         return
 
+    # ✅ Защита от "старых" inline-кнопок (клики по сообщениям вчера/неделю назад и т.п.)
+    try:
+        msg_dt = getattr(query.message, "date", None)  # UTC datetime
+        if msg_dt and msg_dt.tzinfo is not None:
+            age_sec = (datetime.now(timezone.utc) - msg_dt).total_seconds()
+            if age_sec > 10 * 60:  # 10 минут
+                await query.answer("Эта кнопка устарела. Открой меню заново 🙂", show_alert=False)
+                await query.message.reply_text(
+                    "Выбирай действие кнопками ниже 👇",
+                    reply_markup=MAIN_KB,
+                )
+                return
+    except Exception:
+        pass
+
     data = query.data or ""
     tg_user_id = query.from_user.id
     await query.answer()
@@ -352,12 +346,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     screen_msg: Message = query.message
 
     if data == "BACK:MENU":
-        # ✅ возвращаем MAIN_KB (ReplyKeyboard нельзя "edit", поэтому новое сообщение)
         await _edit_or_send(
             screen_msg,
             "Выбирай действие кнопками ниже 👇",
             reply_markup=MAIN_KB,
-            force_new=True,
+            force_new=True,  # ReplyKeyboard не редактируется, поэтому новое сообщение
         )
         return
 
@@ -499,6 +492,7 @@ def mount(fastapi_app: FastAPI) -> None:
 
         webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
         try:
+            # важная гигиена: убираем старый webhook и pending updates
             await tg_app.bot.delete_webhook(drop_pending_updates=True)
 
             await tg_app.bot.set_webhook(
@@ -528,6 +522,7 @@ def mount(fastapi_app: FastAPI) -> None:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         if not getattr(fastapi_app.state, "telegram_ready", False):
+            # webhook может прилететь очень рано при деплое/рестарте
             raise HTTPException(status_code=503, detail="Telegram app is starting")
 
         payload = await request.json()
