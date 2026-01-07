@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v7.0 - UX polish: match/overview + clean LIVE paywall)
+# src/telegram_bot/app.py  (v6.3.2)
 from __future__ import annotations
 
 import logging
@@ -69,7 +69,6 @@ SPORTS = [
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
 
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -81,10 +80,6 @@ def _norm_menu(text: str) -> str:
 
 
 def extract_match_buttons(text: str) -> list[tuple[str, str]]:
-    """
-    Парсим список матчей из ответа агента.
-    Возвращаем список (match_id, title).
-    """
     buttons: list[tuple[str, str]] = []
     for line in (text or "").splitlines():
         m = ID_RE.search(line)
@@ -98,23 +93,6 @@ def extract_match_buttons(text: str) -> list[tuple[str, str]]:
     return buttons
 
 
-def _disclaimer() -> str:
-    return "ℹ️ Аналитический материал. Не является рекомендацией."
-
-
-def _wrap_screen(title: str, body: str, *, footer: bool = True) -> str:
-    body = (body or "").strip()
-    title = (title or "").strip()
-    parts = []
-    if title:
-        parts.append(f"{title}\n")
-    if body:
-        parts.append(body)
-    if footer:
-        parts.append(f"\n\n{_disclaimer()}")
-    return "\n".join(parts).strip() or "…"
-
-
 def kb_sports() -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     buf: list[InlineKeyboardButton] = []
@@ -125,7 +103,7 @@ def kb_sports() -> InlineKeyboardMarkup:
             buf = []
     if buf:
         rows.append(buf)
-    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -140,18 +118,17 @@ def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    # “Хаб матча”: обзор рынков + блок прематч + блок LIVE
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📊 Обзор рынков", callback_data=f"UI:{match_id}:pre:overview")],
+            [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
             [
                 InlineKeyboardButton("🧠 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
                 InlineKeyboardButton("🧠 Тотал", callback_data=f"UI:{match_id}:pre:total"),
             ],
             [InlineKeyboardButton("🧠 Фора", callback_data=f"UI:{match_id}:pre:handicap")],
             [
-                InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{match_id}:live:overview"),
-                InlineKeyboardButton("🔄 LIVE обновить", callback_data=f"UI:{match_id}:live:refresh"),
+                InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{match_id}:live:overview"),
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"UI:{match_id}:live:refresh"),
             ],
             [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
             [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
@@ -162,45 +139,36 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
 def kb_premium() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("⭐ Оформить Premium", callback_data="PAY:PREMIUM")],
-            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
-        ]
-    )
-
-
-def kb_live_paywall(match_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⭐ Оформить Premium", callback_data="PAY:PREMIUM")],
-            [InlineKeyboardButton("⬅️ К матчу", callback_data=f"MATCH:{match_id}")],
-            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+            [InlineKeyboardButton("💳 Оформить Premium", callback_data="PAY:PREMIUM:START")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
         ]
     )
 
 
 def _premium_text(tg_user_id: int) -> str:
-    ent = get_effective_entitlements(int(tg_user_id))
-    tier = getattr(ent, "tier", "free").upper()
-
-    ai_daily_limit = getattr(ent, "ai_daily_limit", 0)
-    daily_ai_left = getattr(ent, "daily_ai_left", 0)
-
-    live_refresh_daily_limit = getattr(ent, "live_refresh_daily_limit", 0)
-    live_refresh_left = getattr(ent, "live_refresh_left", 0)
-
-    live_min_interval_sec = getattr(ent, "live_min_interval_sec", 0)
+    # (на будущее) метрики можно снова вывести аккуратно, но пока делаем “продуктовый” экран
+    _ = get_effective_entitlements(int(tg_user_id))  # прогреваем/валидируем доступ
 
     return (
-        "⭐ Premium\n\n"
-        f"Текущий доступ: {tier}\n"
-        f"AI/день: {daily_ai_left}/{ai_daily_limit}\n"
-        f"LIVE refresh/день: {live_refresh_left}/{live_refresh_daily_limit}\n"
-        f"Пауза между LIVE: {int(live_min_interval_sec)} сек\n\n"
-        "Что даст Premium:\n"
-        "• LIVE без ограничений\n"
-        "• больше AI-лимитов\n"
-        "• расширенные фичи (добавим)\n"
-    ).strip()
+        "🔓 Premium\n\n"
+        "Premium — это доступ к расширенной аналитике матчей.\n\n"
+        "В подписку входит:\n\n"
+        "🟢 LIVE-анализ\n"
+        "• Изменения темпа и структуры матча\n"
+        "• Реакции команд на голы и ключевые события\n"
+        "• Обновления без лимитов\n\n"
+        "🧠 Глубина рынков\n"
+        "• 1X2 — сценарии развития матча\n"
+        "• Тотал — логика движения линии\n"
+        "• Фора — поиск перекосов\n\n"
+        "🔗 Связки рынков\n"
+        "• Как рынки отражают один сценарий\n"
+        "• Почему линия меняется именно так\n\n"
+        "Формат подписки:\n"
+        "• 30 дней доступа\n"
+        "• Можно отменить в любой момент\n\n"
+        "ℹ️ Аналитический материал. Не является рекомендацией."
+    )
 
 
 async def call_agent_local(user_id: int, message: str) -> str:
@@ -243,27 +211,20 @@ async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int
         return
 
 
-def _save_match_map(context: ContextTypes.DEFAULT_TYPE, match_buttons: list[tuple[str, str]]) -> None:
+def _touch_user(update: Update) -> None:
     """
-    Сохраняем map match_id->title в user_data, чтобы красиво подписывать экран матча.
+    ЕДИНЫЙ безопасный вызов get_or_create_user().
+    Важно: user_store.get_or_create_user принимает username/first_name/last_name только keyword-only.
     """
-    mp = {mid: title for mid, title in (match_buttons or [])}
-    context.user_data["match_title_map"] = mp
-
-
-def _get_match_title(context: ContextTypes.DEFAULT_TYPE, match_id: str) -> Optional[str]:
-    mp = context.user_data.get("match_title_map") or {}
-    return mp.get(match_id)
-
-
-def _paywall_live_text() -> str:
-    return (
-        "🔒 LIVE доступен в Premium\n\n"
-        "Что получишь:\n"
-        "• LIVE-обзор и обновления\n"
-        "• меньше ограничений\n\n"
-        "Хочешь — подключим Premium."
-    ).strip()
+    tg = update.effective_user
+    if not tg:
+        return
+    get_or_create_user(
+        tg.id,
+        username=tg.username,
+        first_name=tg.first_name,
+        last_name=tg.last_name,
+    )
 
 
 # -----------------------------
@@ -273,14 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    tg_user = update.effective_user
-    # ВАЖНО: user_store.get_or_create_user принимает только tg_user_id позиционно, остальное — keyword-only
-    get_or_create_user(
-        tg_user.id,
-        username=tg_user.username,
-        first_name=tg_user.first_name,
-        last_name=tg_user.last_name,
-    )
+    _touch_user(update)
 
     await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
@@ -292,16 +246,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(
-        _wrap_screen(
-            "🧠 AI Аналитика",
-            "Как пользоваться:\n"
-            "1) 🏟 Матчи сегодня\n"
-            "2) спорт → матч\n"
-            "3) в матче нажми: 📊 Обзор рынков или 🧠 1X2/Тотал/Фора\n"
-            "4) LIVE: 🟢 LIVE-обзор или 🔄 LIVE обновить\n\n"
-            "Диагностика: llm ping, env, version, last_error",
-            footer=False,
-        ),
+        "Как пользоваться:\n"
+        "1) 🏟 Матчи сегодня\n"
+        "2) спорт → матч\n"
+        "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
+        "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
+        "Диагностика: llm ping, env, version, last_error",
         reply_markup=MAIN_KB,
     )
 
@@ -310,15 +260,9 @@ async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message:
         return
 
+    _touch_user(update)
     tg_user = update.effective_user
-    get_or_create_user(
-        tg_user.id,
-        username=tg_user.username,
-        first_name=tg_user.first_name,
-        last_name=tg_user.last_name,
-    )
-
-    await update.message.reply_text(_premium_text(tg_user.id), reply_markup=kb_premium())
+    await update.message.reply_text(_premium_text(int(tg_user.id)), reply_markup=kb_premium())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,21 +270,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     tg_user = update.effective_user
-    user_id = tg_user.id
+    user_id = int(tg_user.id) if tg_user else 0
     text = update.message.text or ""
     norm = _norm_menu(text)
 
-    get_or_create_user(
-        user_id,
-        username=tg_user.username,
-        first_name=tg_user.first_name,
-        last_name=tg_user.last_name,
-    )
+    _touch_user(update)
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await _typing_safe(context, update.effective_chat.id if update.effective_chat else None)
 
-    # Жёсткая маршрутизация меню (чтобы не было “странных” ответов от агента)
     if norm == "матчи сегодня":
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
@@ -359,11 +297,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await help_cmd(update, context)
         return
 
-    if norm in {"premium", "премиум"}:
+    if norm in {"premium", "премиум", "⭐ premium"}:
         await premium_cmd(update, context)
         return
 
-    # Любой другой текст — в агента
     reply = await call_agent_local(user_id, text)
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
@@ -374,12 +311,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     data = query.data or ""
-    tg_user_id = query.from_user.id
+    tg_user_id = int(query.from_user.id)
     await query.answer()
 
     logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
     await _typing_safe(context, query.message.chat_id)
 
+    # обновляем профиль пользователя
     tg_user = query.from_user
     get_or_create_user(
         tg_user_id,
@@ -391,7 +329,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     screen_msg: Message = query.message
 
     if data == "BACK:MENU":
-        # ReplyKeyboard не редактируется, поэтому шлём новое сообщение
+        # ReplyKeyboard нельзя “приклеить” к edit_message_text, поэтому просто шлём новое сообщение.
         await _edit_or_send(
             screen_msg,
             "Выбирай действие кнопками ниже 👇",
@@ -414,7 +352,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             last_buttons = extract_match_buttons(last_text)
             context.user_data["last_matches_text"] = last_text
             context.user_data["last_match_buttons"] = last_buttons
-            _save_match_map(context, last_buttons)
 
         if last_text and last_buttons:
             await _edit_or_send(screen_msg, last_text, reply_markup=kb_matches(last_buttons))
@@ -426,13 +363,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sport_key = data.split(":", 1)[1].strip()
         context.user_data["last_sport_key"] = sport_key
 
-        # Здесь только список матчей. Никаких LIVE/обзоров.
         reply = await call_agent_local(tg_user_id, f"матчи сегодня {sport_key}")
         match_buttons = extract_match_buttons(reply)
 
         context.user_data["last_matches_text"] = reply
         context.user_data["last_match_buttons"] = match_buttons
-        _save_match_map(context, match_buttons)
 
         if match_buttons:
             await _edit_or_send(screen_msg, reply, reply_markup=kb_matches(match_buttons))
@@ -444,78 +379,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         match_id = data.split(":", 1)[1].strip()
         context.user_data["active_match_id"] = match_id
 
-        # Берём title матча (если есть) и делаем аккуратную шапку
-        title = _get_match_title(context, match_id)
-        raw = await call_agent_local(tg_user_id, f"матч {match_id}")
-
-        header = "🏟 Матч"
-        if title:
-            header = f"🏟 {title}"
-
-        text_out = _wrap_screen(header, raw, footer=True)
-        await _edit_or_send(screen_msg, text_out, reply_markup=kb_match_hub(match_id))
+        reply = await call_agent_local(tg_user_id, f"матч {match_id}")
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
-            await _edit_or_send(screen_msg, "Некорректная команда.", reply_markup=MAIN_KB)
+            await _edit_or_send(screen_msg, "Некорректная команда UI.", reply_markup=MAIN_KB)
             return
 
         _, match_id, mode, action = parts
         context.user_data["active_match_id"] = match_id
 
-        # -------- PAYWALL: только для LIVE --------
+        # Paywall только для LIVE
         if mode == "live":
             ent = get_effective_entitlements(int(tg_user_id))
             can_live = bool(getattr(ent, "can_live", False))
             can_live_refresh = bool(getattr(ent, "can_live_refresh", False))
 
-            if not can_live:
-                await _edit_or_send(
-                    screen_msg,
-                    _paywall_live_text(),
-                    reply_markup=kb_live_paywall(match_id),
-                )
-                return
-
             if action == "refresh" and not can_live_refresh:
                 await _edit_or_send(
                     screen_msg,
-                    "🔒 Лимит LIVE-обновлений исчерпан (Free).\n\nОформи Premium — и обновляй без ограничений.",
-                    reply_markup=kb_live_paywall(match_id),
+                    "🔒 Обновления LIVE доступны в Premium.\n\n"
+                    "Оформи Premium — получишь обновления без лимитов.",
+                    reply_markup=kb_premium(),
                 )
                 return
 
-        # -------- Контент --------
-        raw = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+            if not can_live:
+                await _edit_or_send(
+                    screen_msg,
+                    "🔒 LIVE-анализ доступен в Premium.\n\n"
+                    "Оформи Premium — получишь LIVE без ограничений.",
+                    reply_markup=kb_premium(),
+                )
+                return
 
-        title = _get_match_title(context, match_id)
-        if mode == "pre" and action == "overview":
-            head = "📊 Обзор рынков"
-        elif mode == "live" and action == "overview":
-            head = "🟢 LIVE-обзор"
-        elif mode == "live" and action == "refresh":
-            head = "🔄 LIVE обновление"
-        else:
-            head = "🧠 Разбор"
-
-        if title:
-            head = f"{head}\n{title}"
-
-        text_out = _wrap_screen(head, raw, footer=True)
-        await _edit_or_send(screen_msg, text_out, reply_markup=kb_match_hub(match_id))
+        reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    if data == "PAY:PREMIUM":
+    # ---- Premium flow ----
+    if data == "PAY:PREMIUM:START":
         await _edit_or_send(
             screen_msg,
-            (
-                "⭐ Premium (скоро)\n\n"
-                "Оплата будет подключена (Telegram Payments / YooKassa).\n"
-                "Пока можно активировать вручную через админ-команду.\n\n"
-                "Если хочешь — добавим команду активации для теста."
-            ),
+            "🚧 Premium скоро будет доступен\n\n"
+            "Мы подключаем оплату (Telegram Payments / YooKassa).\n\n"
+            "Как только оплата станет доступна — ты сможешь оформить подписку прямо здесь.",
             reply_markup=kb_premium(),
         )
         return
@@ -540,7 +451,7 @@ def build_telegram_application() -> Application:
     tg_app.add_handler(CommandHandler("premium", premium_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    tg_app.add_error_handler(error_handler)  # важно, чтобы не было "No error handlers"
+    tg_app.add_error_handler(error_handler)  # ✅ важно
     return tg_app
 
 
