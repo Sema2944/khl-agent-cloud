@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v6.3.2)
+# src/telegram_bot/app.py  (v7.0 product UX)
 from __future__ import annotations
 
 import logging
@@ -65,9 +65,93 @@ SPORTS = [
     ("esports", "🎮 Киберспорт"),
 ]
 
-# ожидаем строки типа:
+# Ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
+
+# -----------------------------
+# Copy / Product texts
+# -----------------------------
+DISCLAIMER_LINE = "ℹ️ Аналитический материал. Не является рекомендацией."
+
+
+def _txt_pick_sport() -> str:
+    return "🏟 Матчи сегодня\n\nВыбери вид спорта 👇"
+
+
+def _txt_match_card(match_title: str, league: str, match_id: str, mode_label: str = "PRE") -> str:
+    # match_title: "Зенит — Спартак"
+    # league: "РПЛ"
+    # mode_label: "PRE" or "LIVE"
+    status = "🟡 PRE" if mode_label.upper() == "PRE" else "🟢 LIVE"
+    return (
+        f"🏟 {match_title} ({league})\n"
+        f"{status}\n\n"
+        "Выбери раздел 👇\n\n"
+        f"id: `{match_id}`\n\n"
+        f"{DISCLAIMER_LINE}"
+    )
+
+
+def _txt_market_overview(match_title: str, league: str, is_fallback: bool = False) -> str:
+    if is_fallback:
+        return (
+            f"📊 Обзор рынков\n"
+            f"{match_title} ({league})\n\n"
+            "Сейчас доступен базовый обзор (без глубокой AI-аналитики).\n\n"
+            "Что смотреть:\n"
+            "• 1X2: где рынок ждёт фаворита\n"
+            "• Тотал: ожидаемый темп/результативность\n"
+            "• Фора: перекосы линии относительно силы команд\n\n"
+            f"{DISCLAIMER_LINE}"
+        )
+    return (
+        f"📊 Обзор рынков\n"
+        f"{match_title} ({league})\n\n"
+        "Коротко по рынкам:\n"
+        "• 1X2 — базовый сценарий и перекосы\n"
+        "• Тотал — ожидания по темпу/голам\n"
+        "• Фора — где рынок «перегнул»\n\n"
+        f"{DISCLAIMER_LINE}"
+    )
+
+
+def _txt_premium() -> str:
+    return (
+        "🔓 Premium\n\n"
+        "Premium — это аналитика, которая помогает понять матч, а не просто смотреть линию.\n\n"
+        "В подписку входит:\n\n"
+        "🟢 LIVE-анализ\n"
+        "• темп и структура матча\n"
+        "• реакции на голы/ключевые события\n"
+        "• обновления без лимитов\n\n"
+        "🧠 Глубина рынков\n"
+        "• 1X2 — сценарии матча\n"
+        "• Тотал — логика движения линии\n"
+        "• Фора — поиск перекосов\n\n"
+        "🔗 Связки рынков\n"
+        "• как рынки отражают один сценарий\n"
+        "• почему линия меняется именно так\n\n"
+        "Формат:\n"
+        "• 30 дней доступа\n"
+        "• можно отменить в любой момент\n\n"
+        f"{DISCLAIMER_LINE}"
+    )
+
+
+def _txt_live_paywall_preview(match_title: str, league: str) -> str:
+    return (
+        f"🟢 LIVE-обзор\n"
+        f"{match_title} ({league})\n\n"
+        "Доступен базовый LIVE-превью.\n"
+        "Полный LIVE-анализ и обновления без лимитов — в Premium.\n\n"
+        "Что даёт Premium в LIVE:\n"
+        "• изменения темпа и структуры\n"
+        "• как рынок реагирует на события\n"
+        "• частые обновления\n\n"
+        f"{DISCLAIMER_LINE}"
+    )
+
 
 # -----------------------------
 # Helpers
@@ -103,7 +187,7 @@ def kb_sports() -> InlineKeyboardMarkup:
             buf = []
     if buf:
         rows.append(buf)
-    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -139,41 +223,27 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
 def kb_premium() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💳 Оформить Premium", callback_data="PAY:PREMIUM:START")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+            [InlineKeyboardButton("🔓 Оформить Premium", callback_data="PAY:PREMIUM")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
         ]
-    )
-
-
-def _premium_text(tg_user_id: int) -> str:
-    # (на будущее) метрики можно снова вывести аккуратно, но пока делаем “продуктовый” экран
-    _ = get_effective_entitlements(int(tg_user_id))  # прогреваем/валидируем доступ
-
-    return (
-        "🔓 Premium\n\n"
-        "Premium — это доступ к расширенной аналитике матчей.\n\n"
-        "В подписку входит:\n\n"
-        "🟢 LIVE-анализ\n"
-        "• Изменения темпа и структуры матча\n"
-        "• Реакции команд на голы и ключевые события\n"
-        "• Обновления без лимитов\n\n"
-        "🧠 Глубина рынков\n"
-        "• 1X2 — сценарии развития матча\n"
-        "• Тотал — логика движения линии\n"
-        "• Фора — поиск перекосов\n\n"
-        "🔗 Связки рынков\n"
-        "• Как рынки отражают один сценарий\n"
-        "• Почему линия меняется именно так\n\n"
-        "Формат подписки:\n"
-        "• 30 дней доступа\n"
-        "• Можно отменить в любой момент\n\n"
-        "ℹ️ Аналитический материал. Не является рекомендацией."
     )
 
 
 async def call_agent_local(user_id: int, message: str) -> str:
     from ..parsing import run_dialog_agent
     return await run_dialog_agent(user_id=user_id, message=message)
+
+
+def _safe_user(update_user) -> None:
+    # строго keyword-only, чтобы не ловить TypeError
+    if not update_user:
+        return
+    get_or_create_user(
+        int(update_user.id),
+        username=update_user.username,
+        first_name=update_user.first_name,
+        last_name=update_user.last_name,
+    )
 
 
 async def _edit_or_send(
@@ -211,30 +281,13 @@ async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int
         return
 
 
-def _touch_user(update: Update) -> None:
-    """
-    ЕДИНЫЙ безопасный вызов get_or_create_user().
-    Важно: user_store.get_or_create_user принимает username/first_name/last_name только keyword-only.
-    """
-    tg = update.effective_user
-    if not tg:
-        return
-    get_or_create_user(
-        tg.id,
-        username=tg.username,
-        first_name=tg.first_name,
-        last_name=tg.last_name,
-    )
-
-
 # -----------------------------
 # Handlers
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-
-    _touch_user(update)
+    _safe_user(update.effective_user)
 
     await update.message.reply_text(
         "✅ Я на связи.\n\nВыбирай действие кнопками ниже 👇",
@@ -245,13 +298,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+
     await update.message.reply_text(
         "Как пользоваться:\n"
         "1) 🏟 Матчи сегодня\n"
         "2) спорт → матч\n"
-        "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
+        "3) в матче: 📊 Обзор / 🧠 1X2 / 🧠 Тотал / 🧠 Фора\n"
         "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
-        "Диагностика: llm ping, env, version, last_error",
+        "Команды: llm ping, env, version, last_error",
         reply_markup=MAIN_KB,
     )
 
@@ -259,10 +313,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def premium_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-
-    _touch_user(update)
-    tg_user = update.effective_user
-    await update.message.reply_text(_premium_text(int(tg_user.id)), reply_markup=kb_premium())
+    _safe_user(update.effective_user)
+    await update.message.reply_text(_txt_premium(), reply_markup=kb_premium())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,17 +322,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     tg_user = update.effective_user
-    user_id = int(tg_user.id) if tg_user else 0
+    _safe_user(tg_user)
+
+    user_id = int(tg_user.id)
     text = update.message.text or ""
     norm = _norm_menu(text)
-
-    _touch_user(update)
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text)
     await _typing_safe(context, update.effective_chat.id if update.effective_chat else None)
 
+    # ✅ Продуктовое правило: "Матчи сегодня" всегда -> выбор спорта (сброс контекста)
     if norm == "матчи сегодня":
-        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        # сброс контекста навигации
+        context.user_data.pop("last_matches_text", None)
+        context.user_data.pop("last_match_buttons", None)
+        context.user_data.pop("last_sport_key", None)
+        context.user_data.pop("active_match_id", None)
+
+        await update.message.reply_text(_txt_pick_sport(), reply_markup=kb_sports())
+        return
+
+    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
+        await help_cmd(update, context)
+        return
+
+    if norm in {"premium", "премиум", "⭐ premium"}:
+        await premium_cmd(update, context)
         return
 
     if norm in {"профиль", "мой профиль", "статы", "статистика"}:
@@ -293,14 +360,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(reply, reply_markup=MAIN_KB)
         return
 
-    if norm in {"ai аналитика", "аналитика", "ии аналитика"}:
-        await help_cmd(update, context)
-        return
-
-    if norm in {"premium", "премиум", "⭐ premium"}:
-        await premium_cmd(update, context)
-        return
-
+    # Остальные сообщения — в агента
     reply = await call_agent_local(user_id, text)
     await update.message.reply_text(reply, reply_markup=MAIN_KB)
 
@@ -317,29 +377,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
     await _typing_safe(context, query.message.chat_id)
 
-    # обновляем профиль пользователя
-    tg_user = query.from_user
-    get_or_create_user(
-        tg_user_id,
-        username=tg_user.username,
-        first_name=tg_user.first_name,
-        last_name=tg_user.last_name,
-    )
-
+    _safe_user(query.from_user)
     screen_msg: Message = query.message
 
     if data == "BACK:MENU":
-        # ReplyKeyboard нельзя “приклеить” к edit_message_text, поэтому просто шлём новое сообщение.
         await _edit_or_send(
             screen_msg,
             "Выбирай действие кнопками ниже 👇",
             reply_markup=MAIN_KB,
-            force_new=True,
+            force_new=True,  # ReplyKeyboard нельзя нормально “редактировать”
         )
         return
 
     if data == "BACK:SPORTS":
-        await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
+        await _edit_or_send(screen_msg, _txt_pick_sport(), reply_markup=kb_sports())
         return
 
     if data == "BACK:MATCHES":
@@ -356,7 +407,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if last_text and last_buttons:
             await _edit_or_send(screen_msg, last_text, reply_markup=kb_matches(last_buttons))
         else:
-            await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
+            await _edit_or_send(screen_msg, _txt_pick_sport(), reply_markup=kb_sports())
         return
 
     if data.startswith("SPORT:"):
@@ -379,20 +430,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         match_id = data.split(":", 1)[1].strip()
         context.user_data["active_match_id"] = match_id
 
+        # Получаем ответ агента (он уже умеет “матч <id>”)
         reply = await call_agent_local(tg_user_id, f"матч {match_id}")
-        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+
+        # Попробуем вытащить “Зенит — Спартак (РПЛ)” из текста, иначе fallback
+        title = "Матч"
+        league = "Лига"
+        m = re.search(r"(.+?)\s*\((.+?)\)", reply)
+        if m:
+            title = m.group(1).strip()
+            league = m.group(2).strip()
+
+        card = _txt_match_card(title, league, match_id, mode_label="PRE")
+        await _edit_or_send(screen_msg, card, reply_markup=kb_match_hub(match_id))
         return
 
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
-            await _edit_or_send(screen_msg, "Некорректная команда UI.", reply_markup=MAIN_KB)
+            await _edit_or_send(screen_msg, "Некорректная команда.", reply_markup=MAIN_KB)
             return
 
         _, match_id, mode, action = parts
         context.user_data["active_match_id"] = match_id
 
-        # Paywall только для LIVE
+        # Получаем базовый матч-текст (для вытаскивания title/league)
+        base = await call_agent_local(tg_user_id, f"матч {match_id}")
+        title = "Матч"
+        league = "Лига"
+        m = re.search(r"(.+?)\s*\((.+?)\)", base)
+        if m:
+            title = m.group(1).strip()
+            league = m.group(2).strip()
+
+        # ---- LIVE Paywall (мягкий) ----
         if mode == "live":
             ent = get_effective_entitlements(int(tg_user_id))
             can_live = bool(getattr(ent, "can_live", False))
@@ -401,8 +472,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if action == "refresh" and not can_live_refresh:
                 await _edit_or_send(
                     screen_msg,
-                    "🔒 Обновления LIVE доступны в Premium.\n\n"
-                    "Оформи Premium — получишь обновления без лимитов.",
+                    _txt_live_paywall_preview(title, league),
                     reply_markup=kb_premium(),
                 )
                 return
@@ -410,23 +480,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if not can_live:
                 await _edit_or_send(
                     screen_msg,
-                    "🔒 LIVE-анализ доступен в Premium.\n\n"
-                    "Оформи Premium — получишь LIVE без ограничений.",
+                    _txt_live_paywall_preview(title, league),
                     reply_markup=kb_premium(),
                 )
                 return
 
-        reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+        # ---- PRE / LIVE allowed: прокидываем в агента ----
+        if action == "overview":
+            # если AI у тебя иногда падает — лучше вернуть аккуратный fallback из агента
+            reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+            if "AI временно недоступен" in (reply or ""):
+                reply = _txt_market_overview(title, league, is_fallback=True)
+        else:
+            reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
+
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
-    # ---- Premium flow ----
-    if data == "PAY:PREMIUM:START":
+    if data == "PAY:PREMIUM":
+        # Пока оплаты нет — делаем спокойный “next step”, без раздражения
         await _edit_or_send(
             screen_msg,
-            "🚧 Premium скоро будет доступен\n\n"
-            "Мы подключаем оплату (Telegram Payments / YooKassa).\n\n"
-            "Как только оплата станет доступна — ты сможешь оформить подписку прямо здесь.",
+            "🔓 Premium\n\n"
+            "Следующий шаг — подключить оплату (Telegram Payments / YooKassa).\n"
+            "После оплаты LIVE откроется автоматически.\n\n"
+            "Пока можно активировать вручную (админ-команда — добавим).\n\n"
+            f"{DISCLAIMER_LINE}",
             reply_markup=kb_premium(),
         )
         return
@@ -451,7 +530,7 @@ def build_telegram_application() -> Application:
     tg_app.add_handler(CommandHandler("premium", premium_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    tg_app.add_error_handler(error_handler)  # ✅ важно
+    tg_app.add_error_handler(error_handler)
     return tg_app
 
 
