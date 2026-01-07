@@ -19,6 +19,20 @@ from . import bets_db
 from .expert_db import ExpertStrategy
 from .llm_client import analyze_with_llm_cached
 
+# ✅ NEW: эталонные тексты UI (без "AI недоступен")
+from .ui_text import (
+    MatchCard,
+    LiveState,
+    text_match,
+    text_pre_overview,
+    text_pre_1x2,
+    text_pre_total,
+    text_pre_handicap,
+    text_pre_links,
+    text_live_overview,
+    text_live_full,
+)
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------
@@ -148,6 +162,33 @@ DEMO_MARKETS = {
         "data": {"type": "handicap", "team": "home", "value": -1.5, "odds": 2.35},
     },
 }
+
+
+# -----------------------------
+# UI helpers (card)
+# -----------------------------
+def _split_title(title: str) -> tuple[str, str]:
+    t = (title or "").strip()
+    if "—" in t:
+        a, b = t.split("—", 1)
+        return a.strip(), b.strip()
+    if "-" in t:
+        a, b = t.split("-", 1)
+        return a.strip(), b.strip()
+    return t, ""
+
+
+def _card_from_match(m: dict) -> MatchCard:
+    home, away = _split_title(m.get("title", ""))
+    return MatchCard(
+        match_id=str(m.get("id", "")),
+        home=home or "Команда 1",
+        away=away or "Команда 2",
+        league=str(m.get("league", "")),
+        # date_str/time_str пока не храним в DEMO_MATCHES — можно добавить позже
+        date_str=None,
+        time_str=None,
+    )
 
 
 # -----------------------------
@@ -325,15 +366,8 @@ def _format_match_screen(match_id: str) -> str:
     m = _find_match(match_id)
     if not m:
         return "Матч не найден (MVP демо)."
-
-    lines = [
-        "🏟 Матч",
-        f"{m['title']} — {m['league']}",
-        f"id: {_md_escape(m['id'])}",
-        "",
-        "Выбери действие кнопками ниже 👇",
-    ]
-    return "\n".join(lines)
+    card = _card_from_match(m)
+    return text_match(card)
 
 
 def _format_market(match_id: str, market_key: str) -> str:
@@ -366,7 +400,7 @@ def _format_market(match_id: str, market_key: str) -> str:
             f"Кф: {data['odds']}",
         ]
     lines.append("")
-    lines.append("Дисклеймер: это аналитика, не рекомендация к ставкам.")
+    lines.append("ℹ️ Аналитический материал. Не является рекомендацией.")
     return "\n".join(lines)
 
 
@@ -442,16 +476,41 @@ def _build_ui_prompt(
     return "\n".join(base)
 
 
-def _render_ui_json(analysis: Any, mode: str) -> str:
-    if not isinstance(analysis, dict):
-        return (
-            "AI временно недоступен — показываю базовую справку.\n\n"
-            "Риски\n"
-            "• Недостаточно данных для детального разбора.\n\n"
-            "Аналитический материал, не является рекомендацией."
-        )
+def _render_ui_json(
+    analysis: Any,
+    *,
+    mode: str,
+    action: str,
+    card: MatchCard,
+    used_fallback: bool,
+) -> str:
+    """
+    ✅ Главное: НИКАКИХ "AI недоступен".
+    Если analysis не dict или used_fallback=True → отдаём красивые эталонные тексты из ui_text.py
+    """
+    mode_l = (mode or "pre").lower()
+    action_l = (action or "overview").lower()
 
-    title = str(analysis.get("title") or ("🟢 LIVE-обзор" if (mode or "").lower() == "live" else "📊 Обзор рынков")).strip()
+    if used_fallback or not isinstance(analysis, dict):
+        if mode_l == "live":
+            live = LiveState(live_time="—", score="—")
+            if action_l in {"full", "deep"}:
+                return text_live_full(card, live, fallback=True)
+            return text_live_overview(card, live, fallback=True)
+
+        # pre
+        if action_l == "moneyline":
+            return text_pre_1x2(card, fallback=True)
+        if action_l == "total":
+            return text_pre_total(card, fallback=True)
+        if action_l == "handicap":
+            return text_pre_handicap(card, fallback=True)
+        if action_l in {"links", "bundle", "bundles"}:
+            return text_pre_links(card)
+        return text_pre_overview(card, fallback=True)
+
+    # ---- если LLM вернул нормальный JSON, рендерим компактно (как раньше), но без токсичных фраз ----
+    title = str(analysis.get("title") or ("🟢 LIVE-обзор" if mode_l == "live" else "📊 Обзор рынков")).strip()
     lines: list[str] = [title]
 
     if analysis.get("summary"):
@@ -498,9 +557,9 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
         for r in risks[:6]:
             lines.append(f"• {r}")
 
-    disclaimer = str(analysis.get("disclaimer") or "Аналитический материал, не является рекомендацией.").strip()
+    # единый дисклеймер внизу
     lines.append("")
-    lines.append(disclaimer)
+    lines.append("ℹ️ Аналитический материал. Не является рекомендацией.")
     return "\n".join(lines)
 
 
@@ -515,6 +574,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     if not m:
         return "Матч не найден (MVP демо)."
 
+    card = _card_from_match(m)
     cur_snap = _line_snapshot_for_mode(mode)
 
     prev_snap = None
@@ -533,7 +593,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     h = _hash_cache_key(m["id"], mode, action, cur_snap, prev_snap)
     suffix = f":r{_now_ts()}" if force_refresh else ""
-    cache_key = f"v6:ui:{m['id']}:{mode}:{action}:{h}{suffix}"
+    cache_key = f"v7:ui:{m['id']}:{mode}:{action}:{h}{suffix}"
 
     schema = "ui_live" if (mode or "").lower() == "live" else "ui_pre"
     analysis, meta = await analyze_with_llm_cached(
@@ -549,7 +609,15 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         "LLM meta(ui): %s",
         {k: (meta or {}).get(k) for k in ("provider", "elapsed_ms", "used_fallback", "last_error", "cache")},
     )
-    return _render_ui_json(analysis, mode=mode)
+
+    used_fallback = bool((meta or {}).get("used_fallback"))
+    return _render_ui_json(
+        analysis,
+        mode=mode,
+        action=action,
+        card=card,
+        used_fallback=used_fallback,
+    )
 
 
 # -----------------------------
@@ -581,10 +649,17 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
     if "фора" in s or "handicap" in s:
         return ("pre", "handicap")
 
+    # ✅ связки
+    if "связк" in s or "links" in s or "bundle" in s:
+        return ("pre", "links")
+
     # live
-    if "обнов" in s and "live" in s:
+    if ("обнов" in s and "live" in s) or ("обнов" in s and "лайв" in s):
         return ("live", "refresh")
     if "live" in s or "лайв" in s:
+        # если ты добавишь кнопку "LIVE полный" — просто мапни на ("live","full")
+        if "полный" in s or "full" in s or "deep" in s:
+            return ("live", "full")
         return ("live", "overview")
 
     return None
@@ -652,7 +727,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # Diagnostics
     # -----------------------------
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2025-12-27 v6 (md-safe + last_error + click-map + throttling)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-07 v7 (ui_text templates + no 'AI недоступен')")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -808,6 +883,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         "• мой банк 100000\n\n"
         "Диагностика:\n"
         "• llm ping / env / version / last_error\n\n"
-        "Дисклеймер: сервис даёт аналитику, а не рекомендации к ставкам."
+        "ℹ️ Аналитический материал. Не является рекомендацией."
     )
     return _md_safe_text(help_text)
