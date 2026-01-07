@@ -1,10 +1,9 @@
-# src/telegram_bot/app.py  (v6.3.1 + stale-callback guard)
+# src/telegram_bot/app.py  (v6.3.2)
 from __future__ import annotations
 
 import logging
 import os
 import re
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -56,6 +55,13 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 # -----------------------------
+# Inline helpers
+# -----------------------------
+def Button(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text, callback_data=data)
+
+
+# -----------------------------
 # Inline клавиатуры
 # -----------------------------
 SPORTS = [
@@ -69,6 +75,7 @@ SPORTS = [
 # ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
+
 
 # -----------------------------
 # Helpers
@@ -95,44 +102,56 @@ def extract_match_buttons(text: str) -> list[tuple[str, str]]:
 
 
 def kb_sports() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    buf: list[InlineKeyboardButton] = []
-    for key, label in SPORTS:
-        buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
-        if len(buf) == 2:
-            rows.append(buf)
-            buf = []
-    if buf:
-        rows.append(buf)
-    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        [
+            [Button("🏒 Хоккей", "SPORT:hockey"), Button("⚽ Футбол", "SPORT:football")],
+            [Button("🏀 Баскетбол", "SPORT:basketball"), Button("🎾 Теннис", "SPORT:tennis")],
+            [Button("🎮 Киберспорт", "SPORT:esports")],
+            [Button("🏠 В меню", "BACK:MENU")],
+        ]
+    )
 
 
 def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
+    rows: list[list[InlineKeyboardButton]] = [
+        [Button(title, f"MATCH:{match_id}")]
         for match_id, title in match_buttons
     ]
-    rows.append([InlineKeyboardButton("⬅️ Назад к видам спорта", callback_data="BACK:SPORTS")])
-    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    rows.append([Button("⬅️ Назад к видам спорта", "BACK:SPORTS")])
+    rows.append([Button("🏠 В меню", "BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
+    # Хаб матча (pre): без "Обновить"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
+            [Button("📊 Обзор", f"UI:{match_id}:pre:overview")],
             [
-                InlineKeyboardButton("🧠 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
-                InlineKeyboardButton("🧠 Тотал", callback_data=f"UI:{match_id}:pre:total"),
+                Button("🧠 1X2", f"UI:{match_id}:pre:moneyline"),
+                Button("🧠 Тотал", f"UI:{match_id}:pre:total"),
             ],
-            [InlineKeyboardButton("🧠 Фора", callback_data=f"UI:{match_id}:pre:handicap")],
+            [Button("🧠 Фора", f"UI:{match_id}:pre:handicap")],
+            [Button("🟢 LIVE", f"UI:{match_id}:live:overview")],
+            [Button("⬅️ К матчам", "BACK:MATCHES")],
+            [Button("🏠 В меню", "BACK:MENU")],
+        ]
+    )
+
+
+def kb_live(match_id: str) -> InlineKeyboardMarkup:
+    # LIVE-экран: здесь "🔄 Обновить" + апселл
+    return InlineKeyboardMarkup(
+        [
             [
-                InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{match_id}:live:overview"),
-                InlineKeyboardButton("🔄 Обновить", callback_data=f"UI:{match_id}:live:refresh"),
+                Button("🧠 1X2", f"UI:{match_id}:pre:moneyline"),
+                Button("🧠 Тотал", f"UI:{match_id}:pre:total"),
             ],
-            [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
-            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+            [Button("🧠 Фора", f"UI:{match_id}:pre:handicap")],
+            [Button("🔄 Обновить", f"UI:{match_id}:live:refresh")],
+            [Button("⭐ Premium", "PAY:PREMIUM")],
+            [Button("⬅️ К матчам", "BACK:MATCHES")],
+            [Button("🏠 В меню", "BACK:MENU")],
         ]
     )
 
@@ -140,14 +159,13 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
 def kb_premium() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔓 Активировать Premium", callback_data="PAY:PREMIUM")],
-            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+            [Button("🔓 Открыть Premium", "PAY:PREMIUM")],
+            [Button("⬅️ В меню", "BACK:MENU")],
         ]
     )
 
 
 def _premium_text(tg_user_id: int) -> str:
-    # предполагаем, что entitlements.py сам открывает сессию (мы это сделаем)
     ent = get_effective_entitlements(int(tg_user_id))
     tier = getattr(ent, "tier", "free").upper()
 
@@ -209,7 +227,6 @@ async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
-        # typing не критично
         return
 
 
@@ -242,7 +259,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1) 🏟 Матчи сегодня\n"
         "2) спорт → матч\n"
         "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
-        "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
+        "4) LIVE: 🟢 LIVE → 🔄 Обновить\n\n"
         "Диагностика: llm ping, env, version, last_error",
         reply_markup=MAIN_KB,
     )
@@ -312,21 +329,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     if not query or not query.message:
         return
-
-    # ✅ Защита от "старых" inline-кнопок (клики по сообщениям вчера/неделю назад и т.п.)
-    try:
-        msg_dt = getattr(query.message, "date", None)  # UTC datetime
-        if msg_dt and msg_dt.tzinfo is not None:
-            age_sec = (datetime.now(timezone.utc) - msg_dt).total_seconds()
-            if age_sec > 10 * 60:  # 10 минут
-                await query.answer("Эта кнопка устарела. Открой меню заново 🙂", show_alert=False)
-                await query.message.reply_text(
-                    "Выбирай действие кнопками ниже 👇",
-                    reply_markup=MAIN_KB,
-                )
-                return
-    except Exception:
-        pass
 
     data = query.data or ""
     tg_user_id = query.from_user.id
@@ -431,7 +433,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
         reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
-        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+
+        # ✅ ВАЖНО: разные клавиатуры для pre/live
+        if mode == "live":
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_live(match_id))
+        else:
+            await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
     if data == "PAY:PREMIUM":
