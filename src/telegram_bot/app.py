@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v6.3.2)
+# src/telegram_bot/app.py  (v6.4.0)
 from __future__ import annotations
 
 import logging
@@ -44,22 +44,16 @@ if not BOT_TOKEN:
 # -----------------------------
 # Главное меню (ReplyKeyboard)
 # -----------------------------
+# Вариант "любой": добавили 📅 Фокус дня (вовлекающий дневной цикл)
 MAIN_KB = ReplyKeyboardMarkup(
     [
-        ["🏟 Матчи сегодня"],
+        ["🏟 Матчи сегодня", "📅 Фокус дня"],
         ["🧠 AI Аналитика", "👤 Стратегия эксперта"],
         ["📊 Профиль", "⭐ Premium"],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
-
-# -----------------------------
-# Inline helpers
-# -----------------------------
-def Button(text: str, data: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(text, callback_data=data)
-
 
 # -----------------------------
 # Inline клавиатуры
@@ -75,7 +69,6 @@ SPORTS = [
 # ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
-
 
 # -----------------------------
 # Helpers
@@ -102,56 +95,46 @@ def extract_match_buttons(text: str) -> list[tuple[str, str]]:
 
 
 def kb_sports() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [Button("🏒 Хоккей", "SPORT:hockey"), Button("⚽ Футбол", "SPORT:football")],
-            [Button("🏀 Баскетбол", "SPORT:basketball"), Button("🎾 Теннис", "SPORT:tennis")],
-            [Button("🎮 Киберспорт", "SPORT:esports")],
-            [Button("🏠 В меню", "BACK:MENU")],
-        ]
-    )
+    rows: list[list[InlineKeyboardButton]] = []
+    buf: list[InlineKeyboardButton] = []
+    for key, label in SPORTS:
+        buf.append(InlineKeyboardButton(label, callback_data=f"SPORT:{key}"))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
+    rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
-        [Button(title, f"MATCH:{match_id}")]
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"MATCH:{match_id}")]
         for match_id, title in match_buttons
     ]
-    rows.append([Button("⬅️ Назад к видам спорта", "BACK:SPORTS")])
-    rows.append([Button("🏠 В меню", "BACK:MENU")])
+    rows.append([InlineKeyboardButton("⬅️ Назад к видам спорта", callback_data="BACK:SPORTS")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    # Хаб матча (pre): без "Обновить"
+    # ✅ Вариант "любой": добавили первый крючок — "Что здесь интересно?"
     return InlineKeyboardMarkup(
         [
-            [Button("📊 Обзор", f"UI:{match_id}:pre:overview")],
+            [InlineKeyboardButton("🔥 Что здесь интересно?", callback_data=f"UI:{match_id}:pre:summary")],
+            [InlineKeyboardButton("📊 Обзор", callback_data=f"UI:{match_id}:pre:overview")],
             [
-                Button("🧠 1X2", f"UI:{match_id}:pre:moneyline"),
-                Button("🧠 Тотал", f"UI:{match_id}:pre:total"),
+                InlineKeyboardButton("🧠 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
+                InlineKeyboardButton("🧠 Тотал", callback_data=f"UI:{match_id}:pre:total"),
             ],
-            [Button("🧠 Фора", f"UI:{match_id}:pre:handicap")],
-            [Button("🟢 LIVE", f"UI:{match_id}:live:overview")],
-            [Button("⬅️ К матчам", "BACK:MATCHES")],
-            [Button("🏠 В меню", "BACK:MENU")],
-        ]
-    )
-
-
-def kb_live(match_id: str) -> InlineKeyboardMarkup:
-    # LIVE-экран: здесь "🔄 Обновить" + апселл
-    return InlineKeyboardMarkup(
-        [
+            [InlineKeyboardButton("🧠 Фора", callback_data=f"UI:{match_id}:pre:handicap")],
             [
-                Button("🧠 1X2", f"UI:{match_id}:pre:moneyline"),
-                Button("🧠 Тотал", f"UI:{match_id}:pre:total"),
+                InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{match_id}:live:overview"),
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"UI:{match_id}:live:refresh"),
             ],
-            [Button("🧠 Фора", f"UI:{match_id}:pre:handicap")],
-            [Button("🔄 Обновить", f"UI:{match_id}:live:refresh")],
-            [Button("⭐ Premium", "PAY:PREMIUM")],
-            [Button("⬅️ К матчам", "BACK:MATCHES")],
-            [Button("🏠 В меню", "BACK:MENU")],
+            [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
         ]
     )
 
@@ -159,8 +142,8 @@ def kb_live(match_id: str) -> InlineKeyboardMarkup:
 def kb_premium() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [Button("🔓 Открыть Premium", "PAY:PREMIUM")],
-            [Button("⬅️ В меню", "BACK:MENU")],
+            [InlineKeyboardButton("🔓 Активировать Premium", callback_data="PAY:PREMIUM")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
         ]
     )
 
@@ -230,6 +213,17 @@ async def _typing_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int
         return
 
 
+def _focus_day_text() -> str:
+    # Заглушка (можно позже завести в агента: "фокус дня")
+    return (
+        "📅 Фокус дня\n\n"
+        "Сегодняшняя идея:\n"
+        "• Не спеши с LIVE до 10–15 минуты — сначала оцени темп и состав.\n"
+        "• Если линия резко поехала без явных причин — это сигнал к осторожности.\n\n"
+        "Хочешь — открой матч и нажми «🔥 Что здесь интересно?»."
+    )
+
+
 # -----------------------------
 # Handlers
 # -----------------------------
@@ -258,8 +252,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Как пользоваться:\n"
         "1) 🏟 Матчи сегодня\n"
         "2) спорт → матч\n"
-        "3) в матче нажми: 📊 Обзор или 🧠 1X2/Тотал/Фора\n"
-        "4) LIVE: 🟢 LIVE → 🔄 Обновить\n\n"
+        "3) в матче нажми: 🔥 Что здесь интересно? или 📊 Обзор / 🧠 1X2/Тотал/Фора\n"
+        "4) LIVE: 🟢 LIVE или 🔄 Обновить\n\n"
         "Диагностика: llm ping, env, version, last_error",
         reply_markup=MAIN_KB,
     )
@@ -301,6 +295,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if norm == "матчи сегодня":
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
+        return
+
+    # ✅ новая кнопка в главном меню
+    if norm in {"фокус дня", "фокус", "сегодня в фокусе"}:
+        # можно заменить на: reply = await call_agent_local(user_id, "фокус дня")
+        await update.message.reply_text(_focus_day_text(), reply_markup=MAIN_KB)
         return
 
     if norm in {"профиль", "мой профиль", "статы", "статистика"}:
@@ -352,7 +352,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             screen_msg,
             "Выбирай действие кнопками ниже 👇",
             reply_markup=MAIN_KB,
-            force_new=True,  # ReplyKeyboard не редактируется, поэтому новое сообщение
+            force_new=True,  # ReplyKeyboard не редактируется -> новое сообщение
         )
         return
 
@@ -432,13 +432,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
                 return
 
+        # ✅ Новый action: pre:summary (крючок)
         reply = await call_agent_local(tg_user_id, f"ui match {match_id} {mode} {action}")
-
-        # ✅ ВАЖНО: разные клавиатуры для pre/live
-        if mode == "live":
-            await _edit_or_send(screen_msg, reply, reply_markup=kb_live(match_id))
-        else:
-            await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
+        await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
     if data == "PAY:PREMIUM":
@@ -529,7 +525,6 @@ def mount(fastapi_app: FastAPI) -> None:
                 raise HTTPException(status_code=403, detail="Bad webhook secret")
 
         if not getattr(fastapi_app.state, "telegram_ready", False):
-            # webhook может прилететь очень рано при деплое/рестарте
             raise HTTPException(status_code=503, detail="Telegram app is starting")
 
         payload = await request.json()
