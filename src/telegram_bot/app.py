@@ -58,12 +58,14 @@ MAIN_KB = ReplyKeyboardMarkup(
 # Inline клавиатуры
 # -----------------------------
 SPORTS = [
-    ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
+    ("ice-hockey", "🏒 Хоккей"),
     ("basketball", "🏀 Баскетбол"),
     ("tennis", "🎾 Теннис"),
+    ("table-tennis", "🏓 Настольный теннис"),
     ("esports", "🎮 Киберспорт"),
 ]
+
 
 # ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
