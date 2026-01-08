@@ -37,9 +37,12 @@ if not LLM_PROMPT_PREFIX:
     )
 
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
-_ACTIVE_SPORT_BY_USER: Dict[int, str] = {}  # важно для API матчей
-_LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
+_ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
+_LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
+
+# кеш матчей "сегодня" по пользователю: match_id -> meta
+_MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
 API_SPORTS_LABELS = {
     "football": "⚽ Футбол",
@@ -48,22 +51,6 @@ API_SPORTS_LABELS = {
     "tennis": "🎾 Теннис",
     "table-tennis": "🏓 Настольный теннис",
     "esports": "🎮 Киберспорт",
-}
-
-# демо рынки (пока)
-DEMO_MARKETS = {
-    "moneyline": {
-        "label": "1X2 / Moneyline",
-        "data": {"type": "moneyline", "home": 1.85, "draw": 3.90, "away": 2.10},
-    },
-    "total": {
-        "label": "Тотал (Over/Under)",
-        "data": {"type": "total", "value": 5.5, "over": 1.87, "under": 1.95},
-    },
-    "handicap": {
-        "label": "Фора (Handicap)",
-        "data": {"type": "handicap", "team": "home", "value": -1.5, "odds": 2.35},
-    },
 }
 
 
@@ -77,10 +64,6 @@ def _now_ts() -> int:
 
 def _msk_today_date():
     return datetime.now(MSK).date()
-
-
-def _norm_id(x: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (x or "").lower())
 
 
 def _md_escape(s: str) -> str:
@@ -241,9 +224,9 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 
 
 # -----------------------------
-# API: матчи сегодня
+# API: матчи / матч / odds
 # -----------------------------
-async def _format_matches_today_api(sport_slug: str) -> str:
+async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     from .integrations.sport_api import SportAPIClient, SportAPIError
 
     sport_slug = (sport_slug or "").strip().lower()
@@ -274,6 +257,17 @@ async def _format_matches_today_api(sport_slug: str) -> str:
             "Не удалось получить матчи (ошибка сервера)."
         )
 
+    # кешируем матчи (чтобы потом по MATCH:<id> понять sport/league/title)
+    _MATCH_CACHE_BY_USER[user_id] = {}
+    for m in matches:
+        _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
+            "sport": m.sport_slug,
+            "title": m.title,
+            "league": m.league,
+            "status": m.status,
+            "start_time": m.start_time,
+        }
+
     lines = [f"🏟 Матчи сегодня (по МСК) — {title}", f"Дата: {today.isoformat()}", ""]
 
     if not matches:
@@ -289,44 +283,138 @@ async def _format_matches_today_api(sport_slug: str) -> str:
     return "\n".join(lines)
 
 
-# -----------------------------
-# Матч экран (пока MVP)
-# -----------------------------
-def _format_match_screen(match_id: str) -> str:
-    return "\n".join(
-        [
-            "🏟 Матч",
-            f"id: {_md_escape(match_id)}",
-            "",
-            "Выбери действие кнопками ниже 👇",
-        ]
-    )
+def _fmt_status_ru(status: str) -> str:
+    s = (status or "").strip().lower()
+    if not s:
+        return "—"
+    map_ru = {
+        "not_started": "не начался",
+        "scheduled": "по расписанию",
+        "live": "LIVE",
+        "inprogress": "LIVE",
+        "in_progress": "LIVE",
+        "finished": "завершён",
+        "ended": "завершён",
+        "canceled": "отменён",
+        "cancelled": "отменён",
+        "postponed": "перенесён",
+    }
+    return map_ru.get(s, status)
 
 
-# -----------------------------
-# UI / LLM (как было)
-# -----------------------------
-def _line_snapshot_for_mode(mode: str) -> Dict[str, Any]:
-    mode = (mode or "pre").lower()
-    ml = DEMO_MARKETS["moneyline"]["data"]
-    total = DEMO_MARKETS["total"]["data"]
-    hc = DEMO_MARKETS["handicap"]["data"]
+def _format_match_hub_text(
+    match_id: str,
+    *,
+    title: str,
+    league: str,
+    sport_slug: str,
+    status: str,
+    start_time: str,
+) -> str:
+    lines: list[str] = []
+    lines.append("🏟 Матч")
+    lines.append(f"{title}")
+    if league:
+        lines.append(f"Лига: {league}")
+    lines.append(f"Вид спорта: {API_SPORTS_LABELS.get(sport_slug, sport_slug)}")
+    if status:
+        lines.append(f"Статус: {_fmt_status_ru(status)}")
+    if start_time:
+        lines.append(f"Старт: {start_time}")
+    lines.append(f"id: {_md_escape(match_id)}")
+    lines.append("")
+    lines.append("Выбери действие кнопками ниже 👇")
+    lines.append("")
+    lines.append("ℹ️ Аналитический материал. Не является рекомендацией.")
+    return "\n".join(lines)
 
-    if mode == "live":
-        return {
-            "total_main": {"value": float(total["value"])},
-            "handicap_main": {"team": hc["team"], "value": float(hc["value"])},
-        }
+
+async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
+    """
+    Возвращает: sport_slug, title, league, status, start_time
+    1) пробуем кеш пользователя
+    2) если нет — пробуем последний выбранный sport
+    3) если и его нет — просто возвращаем минимально
+    """
+    match_id = str(match_id).strip()
+    cached = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(match_id)
+    if cached:
+        return dict(cached, id=match_id)
+
+    sport = (_ACTIVE_SPORT_BY_USER.get(user_id) or "").strip().lower()
+    if sport:
+        try:
+            from .integrations.sport_api import SportAPIClient
+
+            api = SportAPIClient()
+            d = await api.match_details(sport, match_id)
+            return {
+                "id": match_id,
+                "sport": d.sport_slug,
+                "title": d.title,
+                "league": d.league,
+                "status": d.status,
+                "start_time": d.start_time,
+            }
+        except Exception:
+            # не валим UX — просто без деталей
+            pass
 
     return {
-        "moneyline": {"home": float(ml["home"]), "draw": float(ml["draw"]), "away": float(ml["away"])},
-        "total_main": {"value": float(total["value"]), "over": float(total["over"]), "under": float(total["under"])},
-        "handicap_main": {"team": hc["team"], "value": float(hc["value"]), "odds": float(hc["odds"])},
+        "id": match_id,
+        "sport": sport or "",
+        "title": f"Матч {match_id}",
+        "league": "",
+        "status": "",
+        "start_time": "",
     }
 
 
+async def _line_snapshot_from_api(user_id: int, match_id: str, mode: str) -> Dict[str, Any]:
+    """
+    Реальный снапшот для LLM:
+    - pre: можно числа/коэфы
+    - live: числа запрещены -> оставляем direction/структуру (но сырые данные всё равно можно хранить в raw)
+    """
+    ctx = await _get_match_context(user_id, match_id)
+    sport = (ctx.get("sport") or "").strip().lower()
+    if not sport:
+        # если спорт не знаем — fallback пустой
+        return {"raw": {"note": "sport unknown"}}
+
+    from .integrations.sport_api import SportAPIClient
+
+    api = SportAPIClient()
+    snap = await api.match_odds(sport, match_id)
+
+    # pre — отдаём нормализованные поля
+    if (mode or "").lower() != "live":
+        out: Dict[str, Any] = {"raw": snap.raw or {}}
+        if snap.moneyline:
+            out["moneyline"] = snap.moneyline
+        if snap.total_main:
+            out["total_main"] = snap.total_main
+        if snap.handicap_main:
+            out["handicap_main"] = snap.handicap_main
+        return out
+
+    # live — избегаем чисел в prompt? (правило у нас в prompt: LIVE без чисел в ответе).
+    # Но в JSON снапшоте числа могут быть. На всякий случай в live оставим только структуру.
+    out_live = {"raw": snap.raw or {}}
+    if snap.total_main:
+        out_live["total_main"] = {"present": True}
+    if snap.handicap_main:
+        out_live["handicap_main"] = {"present": True, "team": snap.handicap_main.get("team")}
+    if snap.moneyline:
+        out_live["moneyline"] = {"present": True}
+    return out_live
+
+
+# -----------------------------
+# UI / LLM
+# -----------------------------
 def _build_ui_prompt(
-    match_id: str,
+    match_meta: Dict[str, Any],
     mode: str,
     action: str,
     prev_snap: Optional[Dict[str, Any]],
@@ -334,6 +422,12 @@ def _build_ui_prompt(
 ) -> str:
     mode = (mode or "pre").lower()
     action = (action or "overview").lower()
+
+    title = str(match_meta.get("title") or "Матч").strip()
+    league = str(match_meta.get("league") or "").strip()
+    sport = str(match_meta.get("sport") or "").strip()
+    match_id = str(match_meta.get("id") or "").strip()
+    status = str(match_meta.get("status") or "").strip()
 
     base = [
         LLM_PROMPT_PREFIX,
@@ -344,20 +438,23 @@ def _build_ui_prompt(
         "- В LIVE не показывай коэффициенты и числа — только направление и логику",
         "- Ответ короткий. Списками.",
         "",
+        f"Матч: {title}" + (f" ({league})" if league else ""),
+        f"sport: {sport}",
+        f"status: {status}",
         f"match_id: {match_id}",
         f"mode: {mode}",
         f"action: {action}",
         "",
-        f"Текущий снапшот линии (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
+        f"Текущий снапшот линии/рынков (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
     ]
     if prev_snap:
-        base.append(f"Предыдущий снапшот линии (JSON): {json.dumps(prev_snap, ensure_ascii=False)}")
+        base.append(f"Предыдущий снапшот (JSON): {json.dumps(prev_snap, ensure_ascii=False)}")
 
     if mode == "live":
         base += [
             "",
             "Верни СТРОГО JSON (без markdown) с полями:",
-            '{"title": "...", "context": ["..."], "markets": [{"name":"Total|Handicap","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
+            '{"title": "...", "context": ["..."], "markets": [{"name":"1X2|Total|Handicap","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
         ]
     else:
         base += [
@@ -370,12 +467,13 @@ def _build_ui_prompt(
 
 
 def _render_ui_json(analysis: Any, mode: str) -> str:
+    # спокойный fallback (без “AI недоступен” в лоб и без раздражения)
     if not isinstance(analysis, dict):
+        title = "🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор рынков"
         return (
-            "📊 Обзор рынков\n\n"
-            "AI временно недоступен — показываю базовую справку.\n\n"
-            "Риски\n"
-            "• Недостаточно данных для детального разбора.\n\n"
+            f"{title}\n\n"
+            "Сейчас нет достаточных данных для аккуратного разбора.\n"
+            "Попробуй позже или нажми «🔄 Обновить LIVE».\n\n"
             "ℹ️ Аналитический материал. Не является рекомендацией."
         )
 
@@ -409,12 +507,12 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     if mk:
         lines.append("")
         lines.append("Ключевые рынки")
-        for item in mk[:3]:
+        for item in mk[:4]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "Market"))
             direction = str(item.get("direction", "unknown"))
-            logic = str(item.get("logic", ""))
+            logic = str(item.get("logic", "")).strip()
             lines.append(f"— {name}: {direction}")
             if logic:
                 lines.append(f"  {logic}")
@@ -439,22 +537,31 @@ def _hash_cache_key(match_id: str, mode: str, action: str, cur_snap: Dict[str, A
 
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
-    cur_snap = _line_snapshot_for_mode(mode)
+    match_meta = await _get_match_context(user_id, match_id)
+
+    # реальный снапшот из API
+    try:
+        cur_snap = await _line_snapshot_from_api(user_id, match_id, mode)
+    except Exception:
+        logger.exception("odds snapshot failed")
+        cur_snap = {"raw": {"note": "odds snapshot unavailable"}}
 
     prev_snap = None
     force_refresh = False
+
     if (mode or "").lower() == "live":
         k = _snap_key(user_id, match_id)
-        prev_snap = (_LIVE_SNAPSHOT_BY_USER_MATCH.get(k) or {}).get("line")
+        prev_snap = (_LIVE_SNAPSHOT_BY_USER_MATCH.get(k) or {}).get("snap")
+
         if action == "refresh":
-            _LIVE_SNAPSHOT_BY_USER_MATCH[k] = {"ts": _now_ts(), "line": cur_snap}
+            _LIVE_SNAPSHOT_BY_USER_MATCH[k] = {"ts": _now_ts(), "snap": cur_snap}
             action = "overview"
             force_refresh = True
 
-    prompt = _build_ui_prompt(match_id, mode, action, prev_snap, cur_snap)
+    prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
     h = _hash_cache_key(match_id, mode, action, cur_snap, prev_snap)
     suffix = f":r{_now_ts()}" if force_refresh else ""
-    cache_key = f"v7:ui:{match_id}:{mode}:{action}:{h}{suffix}"
+    cache_key = f"v8:ui:{match_id}:{mode}:{action}:{h}{suffix}"
 
     schema = "ui_live" if (mode or "").lower() == "live" else "ui_pre"
     analysis, meta = await analyze_with_llm_cached(
@@ -468,6 +575,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     return _render_ui_json(analysis, mode=mode)
 
 
+# -----------------------------
+# Click map
+# -----------------------------
 def _extract_click_label(text_raw: str) -> str:
     m = re.match(r"клик\s*:\s*(.+)$", (text_raw or "").strip(), flags=re.IGNORECASE)
     if m:
@@ -478,6 +588,7 @@ def _extract_click_label(text_raw: str) -> str:
 def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
     s = (label or "").strip().lower()
 
+    # prematch
     if "обзор" in s:
         return ("pre", "overview")
     if "1x2" in s or "moneyline" in s:
@@ -486,8 +597,11 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
         return ("pre", "total")
     if "фора" in s or "handicap" in s:
         return ("pre", "handicap")
+    if "связк" in s:
+        return ("pre", "links")
 
-    if "обнов" in s and "live" in s:
+    # live
+    if "обнов" in s and ("live" in s or "лайв" in s):
         return ("live", "refresh")
     if "live" in s or "лайв" in s:
         return ("live", "overview")
@@ -495,10 +609,15 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+# -----------------------------
+# Diagnostics
+# -----------------------------
 def _format_env_status() -> str:
     keys = [
         "SPORT_API_BASE",
         "SPORT_API_KEY",
+        "SPORT_API_KEY_HEADER",
+        "SPORT_API_KEY_PREFIX",
         "OPENAI_API_KEY",
         "TELEGRAM_BOT_TOKEN",
         "PUBLIC_URL",
@@ -549,8 +668,9 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     logger.info("run_dialog_agent: user_id=%s, norm=%r", user_id, norm)
 
+    # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-08 v7 (no ui_text imports + API matches)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-08 v8 (match hub + real API odds snapshots)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -567,10 +687,12 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         )
         return _md_safe_text(s)
 
+    # normalize "Клик:"
     if norm.startswith("клик:"):
         text_raw = text_raw.split(":", 1)[1].strip()
         norm = text_raw.lower().strip()
 
+    # ui callback (inline)
     if norm.startswith("ui match"):
         parts = text_raw.split()
         if len(parts) < 5:
@@ -583,13 +705,16 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         reply = await _run_ui_llm(user_id=user_id, match_id=match_id, mode=mode, action=action)
         return _md_safe_text(reply)
 
+    # admin strategy
     if norm.startswith("админ"):
         _, msg = _try_admin_update_strategy(user_id, text_raw)
         return _md_safe_text(msg)
 
+    # strategy
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _md_safe_text(_format_expert_strategy_for_today())
 
+    # matches today (API)
     if norm.startswith("матчи сегодня"):
         sport = text_raw.split("матчи сегодня", 1)[1].strip(" :\n\t")
         if not sport:
@@ -599,32 +724,47 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             )
         sport_slug = sport.strip().lower()
         _ACTIVE_SPORT_BY_USER[user_id] = sport_slug
-        return _md_safe_text(await _format_matches_today_api(sport_slug))
+        return _md_safe_text(await _format_matches_today_api(user_id, sport_slug))
 
+    # match hub (API details)
     if norm.startswith("матч"):
         match_id = text_raw.split("матч", 1)[1].strip(" :\n\t")
         if not match_id:
             return _md_safe_text("Напиши: матч <id>")
 
-        _ACTIVE_MATCH_BY_USER[user_id] = match_id
-        return _md_safe_text(_format_match_screen(match_id))
+        match_meta = await _get_match_context(user_id, match_id)
+        _ACTIVE_MATCH_BY_USER[user_id] = str(match_meta.get("id") or match_id)
 
+        return _md_safe_text(
+            _format_match_hub_text(
+                str(match_meta.get("id") or match_id),
+                title=str(match_meta.get("title") or f"Матч {match_id}"),
+                league=str(match_meta.get("league") or ""),
+                sport_slug=str(match_meta.get("sport") or ""),
+                status=str(match_meta.get("status") or ""),
+                start_time=str(match_meta.get("start_time") or ""),
+            )
+        )
+
+    # buttons (text map)
     label = _extract_click_label(text_raw)
     mapped = _map_button_to_ui(label)
     if mapped:
         active = _ACTIVE_MATCH_BY_USER.get(user_id)
         if not active:
-            return _md_safe_text("Сначала выбери матч: матч <id>")
+            return _md_safe_text("Сначала выбери матч (из списка «Матчи сегодня»).")
         mode, action = mapped
         reply = await _run_ui_llm(user_id=user_id, match_id=active, mode=mode, action=action)
         return _md_safe_text(reply)
 
+    # profile
     if "профиль" in norm:
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
             stats = bets_db.get_user_stats(session, user_id)
         return _md_safe_text(_format_profile_text(bank, stats))
 
+    # bank
     if "банк" in norm:
         if re.search(r"\d", norm):
             new_bank = _parse_bank_set(norm)
