@@ -1,4 +1,4 @@
-# src/telegram_bot/app.py  (v6.4.0)
+# src/telegram_bot/app.py  (v6.3.2-safe-callbacks)
 from __future__ import annotations
 
 import logging
@@ -58,19 +58,16 @@ MAIN_KB = ReplyKeyboardMarkup(
 # Inline клавиатуры
 # -----------------------------
 SPORTS = [
+    ("hockey", "🏒 Хоккей"),
     ("football", "⚽ Футбол"),
-    ("ice-hockey", "🏒 Хоккей"),
     ("basketball", "🏀 Баскетбол"),
     ("tennis", "🎾 Теннис"),
-    ("table-tennis", "🏓 Настольный теннис"),
     ("esports", "🎮 Киберспорт"),
 ]
-
 
 # ожидаем строки типа:
 # • СКА — ЦСКА (КХЛ) — id: demo_hockey_001
 ID_RE = re.compile(r"id:\s*`?([a-zA-Z0-9_\-:.]{4,120})`?", re.IGNORECASE)
-
 
 # -----------------------------
 # Helpers
@@ -120,8 +117,8 @@ def kb_matches(match_buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ✅ Обновлённый хаб матча: добавили "Связки" и "LIVE полный"
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
+    # Хаб матча — как у тебя, но аккуратнее по LIVE
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Pre: Обзор", callback_data=f"UI:{match_id}:pre:overview")],
@@ -129,15 +126,11 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🧠 Pre: 1X2", callback_data=f"UI:{match_id}:pre:moneyline"),
                 InlineKeyboardButton("🧠 Pre: Тотал", callback_data=f"UI:{match_id}:pre:total"),
             ],
-            [
-                InlineKeyboardButton("🧠 Pre: Фора", callback_data=f"UI:{match_id}:pre:handicap"),
-                InlineKeyboardButton("🔗 Связки", callback_data=f"UI:{match_id}:pre:links"),
-            ],
+            [InlineKeyboardButton("🧠 Pre: Фора", callback_data=f"UI:{match_id}:pre:handicap")],
             [
                 InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{match_id}:live:overview"),
-                InlineKeyboardButton("🟢 LIVE (полный)", callback_data=f"UI:{match_id}:live:full"),
+                InlineKeyboardButton("🔄 LIVE обновить", callback_data=f"UI:{match_id}:live:refresh"),
             ],
-            [InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{match_id}:live:refresh")],
             [InlineKeyboardButton("⬅️ К матчам", callback_data="BACK:MATCHES")],
             [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
         ]
@@ -185,8 +178,21 @@ def _premium_text(tg_user_id: int) -> str:
 
 
 async def call_agent_local(user_id: int, message: str) -> str:
-    from ..parsing import run_dialog_agent
-    return await run_dialog_agent(user_id=user_id, message=message)
+    """
+    ВАЖНО: делаем функцию НЕУБИВАЕМОЙ.
+    Если parsing/ui_text сломан (ImportError), Telegram UI не должен умирать.
+    """
+    try:
+        from ..parsing import run_dialog_agent
+        return await run_dialog_agent(user_id=user_id, message=message)
+    except Exception as e:
+        logger.exception("call_agent_local failed: %s", e)
+        return (
+            "⚠️ Внутренняя ошибка.\n\n"
+            "Сейчас чиню модуль аналитики (ui_text/parsing).\n"
+            "Пожалуйста, попробуй ещё раз через минуту.\n\n"
+            "Если ты админ: проверь логи Render (ImportError)."
+        )
 
 
 async def _edit_or_send(
@@ -196,11 +202,6 @@ async def _edit_or_send(
     reply_markup=None,
     force_new: bool = False,
 ) -> None:
-    """
-    Надёжная отрисовка:
-    - пытаемся edit_text
-    - если 400/BadRequest -> fallback на send (reply_text)
-    """
     text = (text or "").strip() or "…"
 
     if not force_new:
@@ -208,9 +209,7 @@ async def _edit_or_send(
             await msg.edit_text(text, reply_markup=reply_markup)
             return
         except BadRequest as e:
-            s = str(e).lower()
-            # часто бывает: "message is not modified" / "can't parse entities" / "message can't be edited"
-            if "message is not modified" in s:
+            if "message is not modified" in str(e).lower():
                 return
             logger.warning("edit_text BadRequest -> fallback to send. err=%s", e)
         except Exception:
@@ -332,7 +331,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     data = query.data or ""
     tg_user_id = query.from_user.id
-    await query.answer()
+
+    # отвечаем на callback сразу — чтобы Telegram не “крутил”
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     logger.info("tg.callback user_id=%s data=%r", tg_user_id, data)
     await _typing_safe(context, query.message.chat_id)
@@ -347,12 +351,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     screen_msg: Message = query.message
 
+    # ----- back -----
     if data == "BACK:MENU":
         await _edit_or_send(
             screen_msg,
             "Выбирай действие кнопками ниже 👇",
             reply_markup=MAIN_KB,
-            force_new=True,  # ReplyKeyboard не редактируется, поэтому новое сообщение
+            force_new=True,
         )
         return
 
@@ -377,6 +382,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, "🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
+    # ----- choose sport -----
     if data.startswith("SPORT:"):
         sport_key = data.split(":", 1)[1].strip()
         context.user_data["last_sport_key"] = sport_key
@@ -393,6 +399,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _edit_or_send(screen_msg, reply, reply_markup=kb_sports())
         return
 
+    # ----- choose match -----
     if data.startswith("MATCH:"):
         match_id = data.split(":", 1)[1].strip()
         context.user_data["active_match_id"] = match_id
@@ -401,6 +408,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
+    # ----- UI actions -----
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) != 4:
@@ -416,21 +424,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             can_live = bool(getattr(ent, "can_live", False))
             can_live_refresh = bool(getattr(ent, "can_live_refresh", False))
 
-            # мягко: не ругаемся, не "запрещено", а даём понятный next step
-            if action in {"overview", "full"} and not can_live:
+            if action == "refresh" and not can_live_refresh:
                 await _edit_or_send(
                     screen_msg,
-                    "🟢 LIVE доступен в Premium.\n\n"
-                    "Подключи Premium — откроется LIVE-обзор и LIVE-полный разбор.",
+                    "🔒 Обновления LIVE доступны в Premium.\n\n"
+                    "Без раздражения: просто включи Premium, и кнопка начнёт обновлять без лимитов 🙂",
                     reply_markup=kb_premium(),
                 )
                 return
 
-            if action == "refresh" and not can_live_refresh:
+            if not can_live:
                 await _edit_or_send(
                     screen_msg,
-                    "🔄 Обновления LIVE ограничены на Free.\n\n"
-                    "В Premium — обновления без лимитов.",
+                    "🔒 LIVE-анализ доступен в Premium.\n\n"
+                    "Включи Premium — и откроется LIVE + обновления.",
                     reply_markup=kb_premium(),
                 )
                 return
@@ -439,13 +446,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _edit_or_send(screen_msg, reply, reply_markup=kb_match_hub(match_id))
         return
 
+    # ----- payment stub -----
     if data == "PAY:PREMIUM":
         await _edit_or_send(
             screen_msg,
             "🔓 Premium (скоро)\n\n"
-            "Архитектура подписок уже готова.\n"
-            "Следующий шаг — подключить оплату (Telegram Payments / YooKassa) и вебхук.\n\n"
-            "Пока Premium можно активировать вручную через админ-команду (добавим).",
+            "Следующий шаг — подключить оплату (Telegram Payments / YooKassa) и вебхук.\n"
+            "Пока Premium можно активировать вручную через админ-команду.",
             reply_markup=kb_premium(),
         )
         return
@@ -470,7 +477,7 @@ def build_telegram_application() -> Application:
     tg_app.add_handler(CommandHandler("premium", premium_cmd))
     tg_app.add_handler(CallbackQueryHandler(handle_callback))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    tg_app.add_error_handler(error_handler)  # ✅ чтобы не было "No error handlers are registered"
+    tg_app.add_error_handler(error_handler)
     return tg_app
 
 
@@ -498,6 +505,7 @@ def mount(fastapi_app: FastAPI) -> None:
         webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
         try:
             await tg_app.bot.delete_webhook(drop_pending_updates=True)
+
             await tg_app.bot.set_webhook(
                 url=webhook_url,
                 secret_token=WEBHOOK_SECRET or None,
