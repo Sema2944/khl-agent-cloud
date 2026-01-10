@@ -152,11 +152,15 @@ def _format_expert_strategy_for_today() -> str:
     text = ""
     date_label = today.isoformat()
 
-    with db_session() as session:
-        row = _get_strategy_row(session, today)
-        if row and row.text:
-            text = row.text
-            date_label = row.date.isoformat()
+    # ✅ DB optional: если таблицы нет — не падаем
+    try:
+        with db_session() as session:
+            row = _get_strategy_row(session, today)
+            if row and row.text:
+                text = row.text
+                date_label = row.date.isoformat()
+    except Exception:
+        logger.exception("expert_strategy table missing or db error (fallback to env)")
 
     if not text and EXPERT_STRATEGY_TEXT:
         text = EXPERT_STRATEGY_TEXT
