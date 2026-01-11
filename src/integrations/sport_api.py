@@ -36,6 +36,7 @@ class MatchItem:
     status: str
     start_time: str  # как приходит от провайдера (обычно ISO)
     score: str = ""  # текущий счёт/результат если есть (строкой)
+    odds_base: Optional[Dict[str, Any]] = None  # базовые коэффициенты/рынки если есть в списке матчей
 
 
 @dataclass
@@ -56,7 +57,7 @@ class SportAPIClient:
       SPORT_API_KEY_HEADER      например: X-Api-Key или Authorization
       SPORT_API_KEY_PREFIX      например: Bearer  (если используешь Authorization: Bearer <key>)
       SPORT_API_TIMEOUT_S       по умолчанию 12
-      SPORT_API_BASE_PATH       необязательно: если у провайдера все методы лежат под префиксом, напр. "api" или "sports"
+      SPORT_API_BASE_PATH       необязательно: если у провайдера все методы лежат под префиксом
     """
 
     def __init__(self) -> None:
@@ -84,7 +85,7 @@ class SportAPIClient:
             bool(self.key),
         )
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self(self) -> Dict[str, str]:
         v = self.key
         if self.key_prefix:
             v = f"{self.key_prefix} {self.key}".strip()
@@ -93,8 +94,11 @@ class SportAPIClient:
             self.key_header: v,
         }
 
+    # backward compatible name (typo-safe)
+    def _headers(self) -> Dict[str, str]:
+        return self._headers_R()
+
     def _normalize_path(self, path: str) -> str:
-        # если задан общий префикс для всех эндпоинтов
         path = (path or "").lstrip("/")
         if self.base_path:
             return f"{self.base_path}/{path}".lstrip("/")
@@ -132,7 +136,6 @@ class SportAPIClient:
         return str(x)
 
     def _infer_title(self, m: Dict[str, Any]) -> str:
-        # самые частые варианты у провайдеров
         t = self._pick(m, ["title", "name", "eventName", "matchName"], "")
         if t:
             return str(t)
@@ -170,21 +173,18 @@ class SportAPIClient:
         return str(st or "")
 
     def _infer_score(self, m: Dict[str, Any]) -> str:
-        # Частые варианты: score, scores, result, liveScore, homeScore/awayScore
         s = m.get("score") or m.get("scores") or m.get("result") or m.get("liveScore")
         if isinstance(s, str):
             return s.strip()
         if isinstance(s, (int, float)):
             return str(s)
 
-        # dict вида {"home": 1, "away": 2} или {"homeScore":1,"awayScore":2}
         if isinstance(s, dict):
             home = s.get("home") if s.get("home") is not None else s.get("homeScore")
             away = s.get("away") if s.get("away") is not None else s.get("awayScore")
             if home is not None and away is not None:
                 return f"{home}:{away}"
 
-            # иногда {"current": {"home":..,"away":..}}
             cur = s.get("current")
             if isinstance(cur, dict):
                 h = cur.get("home")
@@ -192,13 +192,11 @@ class SportAPIClient:
                 if h is not None and a is not None:
                     return f"{h}:{a}"
 
-        # иногда в корне матча: homeScore/awayScore
         home = m.get("homeScore")
         away = m.get("awayScore")
         if home is not None and away is not None:
             return f"{home}:{away}"
 
-        # иногда: {"home": {"score":1}, "away":{"score":2}}
         home_obj = m.get("home")
         away_obj = m.get("away")
         if isinstance(home_obj, dict) and isinstance(away_obj, dict):
@@ -209,18 +207,41 @@ class SportAPIClient:
 
         return ""
 
+    def _infer_odds_base(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        В списке матчей некоторые провайдеры уже отдают базовые коэффициенты/рынки.
+        parsing.py ожидает поле odds_base — поэтому возвращаем dict или None.
+        """
+        candidates = [
+            "odds_base",
+            "oddsBase",
+            "odds",
+            "markets",
+            "line",
+            "prematchOdds",
+            "prematch",
+            "bookmakers",
+        ]
+        for k in candidates:
+            v = m.get(k)
+            if isinstance(v, dict):
+                return v
+            if isinstance(v, list):
+                # иногда markets/odds списком — завернём в dict чтобы тип был стабильный
+                return {"items": v, "_source_key": k}
+        return None
+
     # ---------- public API used by parsing.py ----------
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchItem]:
         """
-        Под api.api-sport.ru у тебя реально сработало:
-          GET /v2/<sport>/matches?date=YYYY-MM-DD...
+        Для api.api-sport.ru у тебя сработало:
+          GET /v2/<sport>/matches?...
 
         Поэтому делаем несколько кандидатов путей и берём первый успешный.
         """
         sport_slug = (sport_slug or "").strip().lower()
         day_s = day.isoformat()
 
-        # разные варианты параметров даты (провайдеры называют по-разному)
         params = {
             "date": day_s,
             "day": day_s,
@@ -253,12 +274,7 @@ class SportAPIClient:
                 break
             except Exception as e:
                 last_err = e
-                logger.warning(
-                    "SportAPI failed matches_by_date sport=%s on path=%s err=%s",
-                    sport_slug,
-                    p,
-                    e,
-                )
+                logger.warning("SportAPI failed matches_by_date sport=%s on path=%s err=%s", sport_slug, p, e)
 
         if data is None:
             raise SportAPIError(
@@ -266,7 +282,6 @@ class SportAPIClient:
                 f"all endpoints failed for matches_by_date sport={sport_slug}: {last_err}"
             )
 
-        # некоторые провайдеры возвращают список сразу, некоторые заворачивают в {"data": [...]}
         items = None
         if isinstance(data, list):
             items = data
@@ -303,6 +318,7 @@ class SportAPIClient:
                     status=self._infer_status(m),
                     start_time=self._infer_start_time(m),
                     score=self._infer_score(m),
+                    odds_base=self._infer_odds_base(m),
                 )
             )
         return out
@@ -328,6 +344,7 @@ class SportAPIClient:
             status=self._infer_status(m),
             start_time=self._infer_start_time(m),
             score=self._infer_score(m),
+            odds_base=self._infer_odds_base(m),
         )
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
@@ -359,14 +376,12 @@ class SportAPIClient:
         if data is None:
             raise SportAPIError(f"all odds endpoints failed: {last_err}")
 
-        # raw храним полностью
         raw: Dict[str, Any]
         if isinstance(data, dict):
             raw = data
         else:
             raw = {"data": data}
 
-        # Нормализация (очень мягкая — чтобы parsing.py мог кормить LLM)
         moneyline = None
         total_main = None
         handicap_main = None
