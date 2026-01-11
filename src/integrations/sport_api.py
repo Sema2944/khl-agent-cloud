@@ -45,6 +45,10 @@ class OddsSnapshot:
 
 
 class SportAPIClient:
+    def __init__(self, base_url: str, api_key: str, ...):
+        self.base_url = base_url
+        ...
+
     """
     Универсальный клиент под Sport Events API (по твоим данным: /v2/<sport>/...).
 
