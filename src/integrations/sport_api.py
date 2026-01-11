@@ -5,10 +5,10 @@ import os
 import logging
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class MatchItem:
     league: str
     status: str
     start_time: str  # как приходит от провайдера (обычно ISO)
+    score: str = ""  # текущий счёт/результат если есть (строкой)
 
 
 @dataclass
@@ -45,34 +46,6 @@ class OddsSnapshot:
     handicap_main: Optional[Dict[str, Any]] = None
 
 
-# алиасы: то, что приходит из твоего бота -> то, что может ожидать API
-SPORT_SLUG_ALIASES: Dict[str, List[str]] = {
-    "ice-hockey": ["hockey", "icehockey", "ice_hockey", "hokkey", "nhl"],
-    "hockey": ["ice-hockey", "icehockey", "ice_hockey", "nhl"],
-    "football": ["soccer", "football"],
-    "soccer": ["football", "soccer"],
-    "basketball": ["basketball"],
-    "tennis": ["tennis"],
-    "baseball": ["baseball"],
-    "volleyball": ["volleyball"],
-    "handball": ["handball"],
-}
-
-
-def _uniq(seq: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for x in seq:
-        x = (x or "").strip()
-        if not x:
-            continue
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
 class SportAPIClient:
     """
     Универсальный клиент под Sport Events API.
@@ -80,24 +53,19 @@ class SportAPIClient:
     ENV:
       SPORT_API_BASE            например: https://api.api-sport.ru
       SPORT_API_KEY             ключ
-      SPORT_API_KEY_HEADER      например: Authorization или X-Api-Key
-      SPORT_API_KEY_PREFIX      например: Bearer   (если используешь Authorization: Bearer <key>)
+      SPORT_API_KEY_HEADER      например: X-Api-Key или Authorization
+      SPORT_API_KEY_PREFIX      например: Bearer  (если используешь Authorization: Bearer <key>)
       SPORT_API_TIMEOUT_S       по умолчанию 12
+      SPORT_API_BASE_PATH       необязательно: если у провайдера все методы лежат под префиксом, напр. "api" или "sports"
     """
 
-    def __init__(
-        self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        key_header: Optional[str] = None,
-        key_prefix: Optional[str] = None,
-        timeout_s: Optional[float] = None,
-    ) -> None:
-        self.base = (base_url or _env("SPORT_API_BASE")).strip()
-        self.key = (api_key or _env("SPORT_API_KEY")).strip()
-        self.key_header = (key_header or _env("SPORT_API_KEY_HEADER", "Authorization")).strip()
-        self.key_prefix = (key_prefix or _env("SPORT_API_KEY_PREFIX", "")).strip()
-        self.timeout_s = float(timeout_s if timeout_s is not None else (_env("SPORT_API_TIMEOUT_S", "12") or 12))
+    def __init__(self) -> None:
+        self.base = _env("SPORT_API_BASE")
+        self.key = _env("SPORT_API_KEY")
+        self.key_header = _env("SPORT_API_KEY_HEADER", "Authorization")
+        self.key_prefix = _env("SPORT_API_KEY_PREFIX", "")
+        self.timeout_s = float(_env("SPORT_API_TIMEOUT_S", "12") or 12)
+        self.base_path = _env("SPORT_API_BASE_PATH", "").strip("/")
 
         if not self.base:
             raise SportAPIError("SPORT_API_BASE is missing")
@@ -106,7 +74,7 @@ class SportAPIClient:
 
         u = urlparse(self.base)
         logger.info(
-            "SportAPI init: base=%r scheme=%r host=%r header=%r prefix=%r timeout=%.1f key_present=%s",
+            "SportAPI init: base=%r scheme=%r host=%r header=%r prefix=%r timeout=%s key_present=%s",
             self.base,
             u.scheme,
             u.netloc,
@@ -120,19 +88,30 @@ class SportAPIClient:
         v = self.key
         if self.key_prefix:
             v = f"{self.key_prefix} {self.key}".strip()
-        return {"Accept": "application/json", self.key_header: v}
+        return {
+            "Accept": "application/json",
+            self.key_header: v,
+        }
+
+    def _normalize_path(self, path: str) -> str:
+        # если задан общий префикс для всех эндпоинтов
+        path = (path or "").lstrip("/")
+        if self.base_path:
+            return f"{self.base_path}/{path}".lstrip("/")
+        return path
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        path = self._normalize_path(path)
         url = _join_url(self.base, path)
+
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
             try:
                 r = await client.get(url, headers=self._headers(), params=params)
             except Exception as e:
                 raise SportAPIError(f"request failed: {type(e).__name__}: {e}") from e
 
-        # 4xx/5xx
         if r.status_code >= 400:
-            txt = (r.text or "")[:500]
+            txt = (r.text or "")[:600]
             raise SportAPIError(f"HTTP {r.status_code}: {txt}")
 
         try:
@@ -148,9 +127,12 @@ class SportAPIClient:
         return default
 
     def _stringify_id(self, x: Any) -> str:
-        return "" if x is None else str(x)
+        if x is None:
+            return ""
+        return str(x)
 
     def _infer_title(self, m: Dict[str, Any]) -> str:
+        # самые частые варианты у провайдеров
         t = self._pick(m, ["title", "name", "eventName", "matchName"], "")
         if t:
             return str(t)
@@ -187,227 +169,245 @@ class SportAPIClient:
             return str(self._pick(st, ["utc", "iso", "dateTime"], ""))
         return str(st or "")
 
-    def _extract_list(self, data: Any) -> Optional[List[Any]]:
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for k in ("data", "events", "matches", "results", "items"):
-                if isinstance(data.get(k), list):
-                    return data[k]
-        return None
+    def _infer_score(self, m: Dict[str, Any]) -> str:
+        # Частые варианты: score, scores, result, liveScore, homeScore/awayScore
+        s = m.get("score") or m.get("scores") or m.get("result") or m.get("liveScore")
+        if isinstance(s, str):
+            return s.strip()
+        if isinstance(s, (int, float)):
+            return str(s)
 
-    def _looks_like_no_such_sport(self, err: Exception) -> bool:
-        msg = str(err).lower()
-        return ("no such sport endpoint" in msg) or ("no such sport" in msg)
+        # dict вида {"home": 1, "away": 2} или {"homeScore":1,"awayScore":2}
+        if isinstance(s, dict):
+            home = s.get("home") if s.get("home") is not None else s.get("homeScore")
+            away = s.get("away") if s.get("away") is not None else s.get("awayScore")
+            if home is not None and away is not None:
+                return f"{home}:{away}"
 
-    def _sport_candidates(self, sport_slug: str) -> List[str]:
-        s = (sport_slug or "").strip().lower()
-        cands = [s]
-        cands += SPORT_SLUG_ALIASES.get(s, [])
-        # доп. эвристики
-        if s == "ice-hockey":
-            cands += ["hockey"]
-        if "-" in s:
-            cands.append(s.replace("-", ""))
-            cands.append(s.replace("-", "_"))
-        return _uniq(cands)
+            # иногда {"current": {"home":..,"away":..}}
+            cur = s.get("current")
+            if isinstance(cur, dict):
+                h = cur.get("home")
+                a = cur.get("away")
+                if h is not None and a is not None:
+                    return f"{h}:{a}"
 
-    def _matches_paths(self, sport: str) -> List[str]:
-        # пробуем разные варианты — у провайдеров часто отличаются
-        # (важно: без лидирующего /, _join_url сам склеит)
-        return [
-            f"v2/{sport}/",
-            f"v2/{sport}",
-            f"v2/{sport}/events",
-            f"v2/{sport}/matches",
-            f"v2/{sport}/games",
-            f"v2/{sport}/list",
-        ]
+        # иногда в корне матча: homeScore/awayScore
+        home = m.get("homeScore")
+        away = m.get("awayScore")
+        if home is not None and away is not None:
+            return f"{home}:{away}"
 
-    def _details_paths(self, sport: str, match_id: str) -> List[str]:
-        return [
-            f"v2/{sport}/{match_id}",
-            f"v2/{sport}/events/{match_id}",
-            f"v2/{sport}/matches/{match_id}",
-            f"v2/{sport}/games/{match_id}",
-        ]
+        # иногда: {"home": {"score":1}, "away":{"score":2}}
+        home_obj = m.get("home")
+        away_obj = m.get("away")
+        if isinstance(home_obj, dict) and isinstance(away_obj, dict):
+            h = home_obj.get("score")
+            a = away_obj.get("score")
+            if h is not None and a is not None:
+                return f"{h}:{a}"
 
-    def _odds_paths(self, sport: str, match_id: str) -> List[str]:
-        return [
-            f"v2/{sport}/{match_id}/odds",
-            f"v2/{sport}/{match_id}/markets",
-            f"v2/{sport}/{match_id}/line",
-            f"v2/{sport}/odds/{match_id}",
-        ]
-
-    async def _try_many_get(
-        self,
-        paths: List[str],
-        params: Optional[Dict[str, Any]] = None,
-        purpose: str = "",
-    ) -> Tuple[Any, str]:
-        last_err: Optional[Exception] = None
-        for p in paths:
-            try:
-                logger.info("SportAPI try %s: GET %s params=%s", purpose or "request", p, params)
-                data = await self._get(p, params=params)
-                return data, p
-            except Exception as e:
-                last_err = e
-                logger.warning("SportAPI failed %s on path=%s err=%s", purpose or "request", p, e)
-        raise SportAPIError(f"all endpoints failed for {purpose}: {last_err}")
+        return ""
 
     # ---------- public API used by parsing.py ----------
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchItem]:
+        """
+        Под api.api-sport.ru у тебя реально сработало:
+          GET /v2/<sport>/matches?date=YYYY-MM-DD...
+
+        Поэтому делаем несколько кандидатов путей и берём первый успешный.
+        """
         sport_slug = (sport_slug or "").strip().lower()
+        day_s = day.isoformat()
+
+        # разные варианты параметров даты (провайдеры называют по-разному)
         params = {
-            "date": day.isoformat(),
-            "day": day.isoformat(),
-            "from": day.isoformat(),
-            "to": day.isoformat(),
-            # доп. варианты
-            "dateFrom": day.isoformat(),
-            "dateTo": day.isoformat(),
-            "startDate": day.isoformat(),
-            "endDate": day.isoformat(),
+            "date": day_s,
+            "day": day_s,
+            "from": day_s,
+            "to": day_s,
+            "dateFrom": day_s,
+            "dateTo": day_s,
+            "startDate": day_s,
+            "endDate": day_s,
         }
 
-        candidates = self._sport_candidates(sport_slug)
+        candidates = [
+            f"v2/{sport_slug}/",
+            f"v2/{sport_slug}",
+            f"v2/{sport_slug}/events",
+            f"v2/{sport_slug}/matches",
+            f"v2/{sport_slug}/games",
+            f"v2/{sport_slug}/list",
+        ]
 
         last_err: Optional[Exception] = None
-        for sport in candidates:
-            paths = self._matches_paths(sport)
+        data: Any = None
+        used_path = ""
+
+        for p in candidates:
             try:
-                data, used = await self._try_many_get(paths, params=params, purpose=f"matches_by_date sport={sport}")
-                items = self._extract_list(data)
-                if not isinstance(items, list):
-                    raise SportAPIError(f"unexpected response shape: {type(data).__name__}")
-                out: List[MatchItem] = []
-                for m in items:
-                    if not isinstance(m, dict):
-                        continue
-                    mid = self._stringify_id(self._pick(m, ["id", "eventId", "matchId"], ""))
-                    if not mid:
-                        continue
-                    out.append(
-                        MatchItem(
-                            id=mid,
-                            sport_slug=sport,  # ВАЖНО: фактический sport, который сработал
-                            title=self._infer_title(m),
-                            league=self._infer_league(m),
-                            status=self._infer_status(m),
-                            start_time=self._infer_start_time(m),
-                        )
-                    )
-                logger.info("SportAPI matches_by_date OK: requested=%s used_sport=%s used_path=%s n=%d", sport_slug, sport, used, len(out))
-                return out
+                logger.info("SportAPI try matches_by_date sport=%s: GET %s params=%s", sport_slug, p, params)
+                data = await self._get(p, params=params)
+                used_path = p
+                break
             except Exception as e:
                 last_err = e
-                # если это именно "не тот sport endpoint" — пробуем следующий алиас спорта
-                if self._looks_like_no_such_sport(e):
-                    continue
-                # иначе (например 401/403/500) — тоже пробуем алиасы, но пусть будет шанс
+                logger.warning(
+                    "SportAPI failed matches_by_date sport=%s on path=%s err=%s",
+                    sport_slug,
+                    p,
+                    e,
+                )
+
+        if data is None:
+            raise SportAPIError(
+                f"matches_by_date failed for sport_slug={sport_slug}: "
+                f"all endpoints failed for matches_by_date sport={sport_slug}: {last_err}"
+            )
+
+        # некоторые провайдеры возвращают список сразу, некоторые заворачивают в {"data": [...]}
+        items = None
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for k in ("data", "events", "matches", "results", "items"):
+                if isinstance(data.get(k), list):
+                    items = data[k]
+                    break
+
+        if not isinstance(items, list):
+            raise SportAPIError(f"unexpected response shape for matches_by_date: {type(data).__name__}")
+
+        logger.info(
+            "SportAPI matches_by_date OK: requested=%s used_sport=%s used_path=%s n=%s",
+            sport_slug,
+            sport_slug,
+            used_path,
+            len(items),
+        )
+
+        out: List[MatchItem] = []
+        for m in items:
+            if not isinstance(m, dict):
                 continue
-
-        raise SportAPIError(f"matches_by_date failed for sport_slug={sport_slug}: {last_err}")
-
-    async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
-        match_id = str(match_id).strip()
-        candidates = self._sport_candidates((sport_slug or "").strip().lower())
-
-        last_err: Optional[Exception] = None
-        for sport in candidates:
-            paths = self._details_paths(sport, match_id)
-            try:
-                data, used = await self._try_many_get(paths, purpose=f"match_details sport={sport}")
-                if isinstance(data, dict):
-                    m = data.get("data") if isinstance(data.get("data"), dict) else data
-                    if not isinstance(m, dict):
-                        m = data
-                else:
-                    raise SportAPIError(f"unexpected response shape: {type(data).__name__}")
-
-                logger.info("SportAPI match_details OK: requested=%s used_sport=%s used_path=%s", sport_slug, sport, used)
-                return MatchItem(
-                    id=match_id,
-                    sport_slug=sport,
+            mid = self._stringify_id(self._pick(m, ["id", "eventId", "matchId"], ""))
+            if not mid:
+                continue
+            out.append(
+                MatchItem(
+                    id=mid,
+                    sport_slug=sport_slug,
                     title=self._infer_title(m),
                     league=self._infer_league(m),
                     status=self._infer_status(m),
                     start_time=self._infer_start_time(m),
+                    score=self._infer_score(m),
                 )
-            except Exception as e:
-                last_err = e
-                if self._looks_like_no_such_sport(e):
-                    continue
-                continue
+            )
+        return out
 
-        raise SportAPIError(f"match_details failed for sport_slug={sport_slug} match_id={match_id}: {last_err}")
+    async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
+        sport_slug = (sport_slug or "").strip().lower()
+        match_id = str(match_id).strip()
+        path = f"v2/{sport_slug}/{match_id}"
+        data = await self._get(path)
+
+        if isinstance(data, dict):
+            m = data.get("data") if isinstance(data.get("data"), dict) else data
+            if not isinstance(m, dict):
+                m = data
+        else:
+            raise SportAPIError(f"unexpected response shape for match_details: {type(data).__name__}")
+
+        return MatchItem(
+            id=match_id,
+            sport_slug=sport_slug,
+            title=self._infer_title(m),
+            league=self._infer_league(m),
+            status=self._infer_status(m),
+            start_time=self._infer_start_time(m),
+            score=self._infer_score(m),
+        )
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
+        """
+        У разных провайдеров odds лежат по-разному. Делаем максимально мягко:
+        пробуем /odds, /markets, /line — и берём, что вернулось.
+        """
+        sport_slug = (sport_slug or "").strip().lower()
         match_id = str(match_id).strip()
-        candidates = self._sport_candidates((sport_slug or "").strip().lower())
+
+        candidates = [
+            f"v2/{sport_slug}/{match_id}/odds",
+            f"v2/{sport_slug}/{match_id}/markets",
+            f"v2/{sport_slug}/{match_id}/line",
+        ]
 
         last_err: Optional[Exception] = None
-        for sport in candidates:
-            paths = self._odds_paths(sport, match_id)
+        data: Any = None
+        used_path = ""
+
+        for p in candidates:
             try:
-                data, used_path = await self._try_many_get(paths, purpose=f"match_odds sport={sport}")
-
-                raw: Dict[str, Any]
-                if isinstance(data, dict):
-                    raw = data
-                else:
-                    raw = {"data": data}
-
-                moneyline = None
-                total_main = None
-                handicap_main = None
-
-                root = data
-                if isinstance(data, dict):
-                    for k in ("data", "odds", "markets", "result"):
-                        if k in data:
-                            root = data[k]
-                            break
-
-                markets = None
-                if isinstance(root, list):
-                    markets = root
-                elif isinstance(root, dict):
-                    for k in ("markets", "items", "data", "lines"):
-                        if isinstance(root.get(k), list):
-                            markets = root[k]
-                            break
-
-                if isinstance(markets, list):
-
-                    def mname(x: Dict[str, Any]) -> str:
-                        n = x.get("name") or x.get("key") or x.get("type") or ""
-                        return str(n).lower()
-
-                    for m in markets:
-                        if not isinstance(m, dict):
-                            continue
-                        n = mname(m)
-                        if (moneyline is None) and ("1x2" in n or "moneyline" in n or "winner" in n):
-                            moneyline = m
-                        if (total_main is None) and ("total" in n or ("over" in n and "under" in n)):
-                            total_main = m
-                        if (handicap_main is None) and ("handicap" in n or "spread" in n):
-                            handicap_main = m
-
-                logger.info("SportAPI match_odds OK: requested=%s used_sport=%s used_path=%s", sport_slug, sport, used_path)
-                return OddsSnapshot(
-                    raw={"_used_path": used_path, **raw} if isinstance(raw, dict) else {"_used_path": used_path, "raw": raw},
-                    moneyline=moneyline,
-                    total_main=total_main,
-                    handicap_main=handicap_main,
-                )
+                data = await self._get(p)
+                used_path = p
+                break
             except Exception as e:
                 last_err = e
-                if self._looks_like_no_such_sport(e):
-                    continue
-                continue
 
-        raise SportAPIError(f"match_odds failed for sport_slug={sport_slug} match_id={match_id}: {last_err}")
+        if data is None:
+            raise SportAPIError(f"all odds endpoints failed: {last_err}")
+
+        # raw храним полностью
+        raw: Dict[str, Any]
+        if isinstance(data, dict):
+            raw = data
+        else:
+            raw = {"data": data}
+
+        # Нормализация (очень мягкая — чтобы parsing.py мог кормить LLM)
+        moneyline = None
+        total_main = None
+        handicap_main = None
+
+        root = data
+        if isinstance(data, dict):
+            for k in ("data", "odds", "markets", "result"):
+                if k in data:
+                    root = data[k]
+                    break
+
+        markets = None
+        if isinstance(root, list):
+            markets = root
+        elif isinstance(root, dict):
+            for k in ("markets", "items", "data", "lines"):
+                if isinstance(root.get(k), list):
+                    markets = root[k]
+                    break
+
+        if isinstance(markets, list):
+
+            def mname(x: Dict[str, Any]) -> str:
+                n = x.get("name") or x.get("key") or x.get("type") or ""
+                return str(n).lower()
+
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                n = mname(m)
+                if (moneyline is None) and ("1x2" in n or "moneyline" in n or "winner" in n):
+                    moneyline = m
+                if (total_main is None) and ("total" in n or ("over" in n and "under" in n)):
+                    total_main = m
+                if (handicap_main is None) and ("handicap" in n or "spread" in n):
+                    handicap_main = m
+
+        snap = OddsSnapshot(
+            raw={"_used_path": used_path, **raw} if isinstance(raw, dict) else {"_used_path": used_path, "raw": raw},
+            moneyline=moneyline,
+            total_main=total_main,
+            handicap_main=handicap_main,
+        )
+        return snap
