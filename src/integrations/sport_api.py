@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -45,9 +46,6 @@ class OddsSnapshot:
 
 
 class SportAPIClient:
-    def __init__(self, base_url: str, api_key: str, ...):
-        self.base_url = base_url
-
     """
     Универсальный клиент под Sport Events API (по твоим данным: /v2/<sport>/...).
 
@@ -65,6 +63,18 @@ class SportAPIClient:
         self.key_header = _env("SPORT_API_KEY_HEADER", "X-Api-Key")
         self.key_prefix = _env("SPORT_API_KEY_PREFIX", "")
         self.timeout_s = float(_env("SPORT_API_TIMEOUT_S", "12") or 12)
+
+        p = urlparse(self.base) if self.base else None
+        logger.info(
+            "SportAPI init: base=%r scheme=%r host=%r header=%r prefix=%r timeout=%s key_present=%s",
+            self.base,
+            getattr(p, "scheme", None),
+            getattr(p, "hostname", None),
+            self.key_header,
+            self.key_prefix,
+            self.timeout_s,
+            bool(self.key),
+        )
 
         if not self.base:
             raise SportAPIError("SPORT_API_BASE is missing")
@@ -110,7 +120,6 @@ class SportAPIClient:
         return str(x)
 
     def _infer_title(self, m: Dict[str, Any]) -> str:
-        # самые частые варианты у провайдеров
         # 1) title/name
         t = self._pick(m, ["title", "name", "eventName", "matchName"], "")
         if t:
@@ -133,8 +142,9 @@ class SportAPIClient:
         return "Матч"
 
     def _infer_league(self, m: Dict[str, Any]) -> str:
-        # league/tournament/competition
-        league = self._pick(m, ["league", "tournament", "competitionName", "competition", "leagueName"], "")
+        league = self._pick(
+            m, ["league", "tournament", "competitionName", "competition", "leagueName"], ""
+        )
         if isinstance(league, dict):
             return str(self._pick(league, ["name", "title"], ""))
         return str(league or "")
@@ -146,25 +156,19 @@ class SportAPIClient:
         return str(s or "")
 
     def _infer_start_time(self, m: Dict[str, Any]) -> str:
-        # startTime/start_time/utcStartTime/date
-        st = self._pick(m, ["start_time", "startTime", "utcStartTime", "start", "date", "scheduled"], "")
+        st = self._pick(
+            m, ["start_time", "startTime", "utcStartTime", "start", "date", "scheduled"], ""
+        )
         if isinstance(st, dict):
             return str(self._pick(st, ["utc", "iso", "dateTime"], ""))
         return str(st or "")
 
     # ---------- public API used by parsing.py ----------
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchItem]:
-        """
-        Ожидаем путь по твоим данным:
-          /v2/<sport>/
-        И параметр даты (у разных провайдеров может называться по-разному).
-        Мы пошлём сразу несколько вариантов через params — обычно один из них сработает.
-        """
         sport_slug = (sport_slug or "").strip().lower()
         base_path = f"v2/{sport_slug}/"
 
         params = {
-            # самые типовые варианты
             "date": day.isoformat(),
             "day": day.isoformat(),
             "from": day.isoformat(),
@@ -173,8 +177,7 @@ class SportAPIClient:
 
         data = await self._get(base_path, params=params)
 
-        # некоторые провайдеры возвращают список сразу, некоторые заворачивают в {"data": [...]}
-        items = None
+        items: Optional[List[Any]] = None
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
@@ -184,8 +187,9 @@ class SportAPIClient:
                     break
 
         if not isinstance(items, list):
-            # чтобы было легче дебажить в логах
-            raise SportAPIError(f"unexpected response shape for matches_by_date: {type(data).__name__}")
+            raise SportAPIError(
+                f"unexpected response shape for matches_by_date: {type(data).__name__}"
+            )
 
         out: List[MatchItem] = []
         for m in items:
@@ -209,7 +213,7 @@ class SportAPIClient:
     async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
         sport_slug = (sport_slug or "").strip().lower()
         match_id = str(match_id).strip()
-        # универсально: /v2/<sport>/<id>
+
         path = f"v2/{sport_slug}/{match_id}"
         data = await self._get(path)
 
@@ -218,7 +222,9 @@ class SportAPIClient:
             if not isinstance(m, dict):
                 m = data
         else:
-            raise SportAPIError(f"unexpected response shape for match_details: {type(data).__name__}")
+            raise SportAPIError(
+                f"unexpected response shape for match_details: {type(data).__name__}"
+            )
 
         return MatchItem(
             id=match_id,
@@ -230,10 +236,6 @@ class SportAPIClient:
         )
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
-        """
-        У разных провайдеров odds лежат по-разному. Делаем максимально мягко:
-        пробуем /odds, /markets, /line — и берём, что вернулось.
-        """
         sport_slug = (sport_slug or "").strip().lower()
         match_id = str(match_id).strip()
 
@@ -246,6 +248,7 @@ class SportAPIClient:
         last_err: Optional[Exception] = None
         data: Any = None
         used_path = ""
+
         for p in candidates:
             try:
                 data = await self._get(p)
@@ -264,16 +267,10 @@ class SportAPIClient:
         else:
             raw = {"data": data}
 
-        # Нормализация (очень мягкая — чтобы parsing.py мог кормить LLM)
-        # Мы попытаемся вынуть что-то похожее на:
-        # - moneyline/1x2
-        # - main total
-        # - main handicap
         moneyline = None
         total_main = None
         handicap_main = None
 
-        # common wrappers
         root = data
         if isinstance(data, dict):
             for k in ("data", "odds", "markets", "result"):
@@ -281,7 +278,6 @@ class SportAPIClient:
                     root = data[k]
                     break
 
-        # если markets списком
         markets = None
         if isinstance(root, list):
             markets = root
@@ -292,7 +288,7 @@ class SportAPIClient:
                     break
 
         if isinstance(markets, list):
-            # ищем по name/key/type
+
             def mname(x: Dict[str, Any]) -> str:
                 n = x.get("name") or x.get("key") or x.get("type") or ""
                 return str(n).lower()
@@ -303,12 +299,11 @@ class SportAPIClient:
                 n = mname(m)
                 if (moneyline is None) and ("1x2" in n or "moneyline" in n or "winner" in n):
                     moneyline = m
-                if (total_main is None) and ("total" in n or "over" in n and "under" in n):
+                if (total_main is None) and ("total" in n or ("over" in n and "under" in n)):
                     total_main = m
                 if (handicap_main is None) and ("handicap" in n or "spread" in n):
                     handicap_main = m
 
-        # если вообще ничего не нашли — ничего страшного, raw остаётся
         snap = OddsSnapshot(
             raw={"_used_path": used_path, **raw} if isinstance(raw, dict) else {"_used_path": used_path, "raw": raw},
             moneyline=moneyline,
