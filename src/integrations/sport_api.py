@@ -85,7 +85,7 @@ class SportAPIClient:
             bool(self.key),
         )
 
-    def _headers(self(self) -> Dict[str, str]:
+    def _headers(self) -> Dict[str, str]:
         v = self.key
         if self.key_prefix:
             v = f"{self.key_prefix} {self.key}".strip()
@@ -93,10 +93,6 @@ class SportAPIClient:
             "Accept": "application/json",
             self.key_header: v,
         }
-
-    # backward compatible name (typo-safe)
-    def _headers(self) -> Dict[str, str]:
-        return self._headers_R()
 
     def _normalize_path(self, path: str) -> str:
         path = (path or "").lstrip("/")
@@ -208,10 +204,6 @@ class SportAPIClient:
         return ""
 
     def _infer_odds_base(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        В списке матчей некоторые провайдеры уже отдают базовые коэффициенты/рынки.
-        parsing.py ожидает поле odds_base — поэтому возвращаем dict или None.
-        """
         candidates = [
             "odds_base",
             "oddsBase",
@@ -227,7 +219,6 @@ class SportAPIClient:
             if isinstance(v, dict):
                 return v
             if isinstance(v, list):
-                # иногда markets/odds списком — завернём в dict чтобы тип был стабильный
                 return {"items": v, "_source_key": k}
         return None
 
@@ -348,10 +339,6 @@ class SportAPIClient:
         )
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
-        """
-        У разных провайдеров odds лежат по-разному. Делаем максимально мягко:
-        пробуем /odds, /markets, /line — и берём, что вернулось.
-        """
         sport_slug = (sport_slug or "").strip().lower()
         match_id = str(match_id).strip()
 
@@ -419,10 +406,9 @@ class SportAPIClient:
                 if (handicap_main is None) and ("handicap" in n or "spread" in n):
                     handicap_main = m
 
-        snap = OddsSnapshot(
+        return OddsSnapshot(
             raw={"_used_path": used_path, **raw} if isinstance(raw, dict) else {"_used_path": used_path, "raw": raw},
             moneyline=moneyline,
             total_main=total_main,
             handicap_main=handicap_main,
         )
-        return snap
