@@ -28,15 +28,6 @@ EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()
 
 MSK = ZoneInfo("Europe/Moscow")
 
-# --- Ограничения Telegram (чтобы не падало Message is too long)
-TG_TEXT_LIMIT = int((os.getenv("TG_TEXT_LIMIT") or "3500").strip() or 3500)
-MATCHES_LIST_LIMIT = int((os.getenv("MATCHES_LIST_LIMIT") or "20").strip() or 20)
-
-# --- Если у тебя куплен только один спорт — ограничим (по умолчанию ice-hockey)
-# Пример: ALLOWED_SPORTS=ice-hockey
-_ALLOWED_SPORTS_RAW = (os.getenv("ALLOWED_SPORTS") or "ice-hockey").strip()
-ALLOWED_SPORTS = {x.strip().lower() for x in _ALLOWED_SPORTS_RAW.split(",") if x.strip()}
-
 LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
@@ -54,6 +45,11 @@ _LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
 # кеш матчей "сегодня" по пользователю: match_id -> meta
 _MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
+# навигация по списку матчей
+_ACTIVE_COUNTRY_BY_USER: Dict[int, str] = {}
+_ACTIVE_LEAGUE_BY_USER: Dict[int, str] = {}
+_ACTIVE_PAGE_BY_USER: Dict[int, int] = {}
+
 API_SPORTS_LABELS = {
     "football": "⚽ Футбол",
     "ice-hockey": "🏒 Хоккей",
@@ -63,16 +59,8 @@ API_SPORTS_LABELS = {
     "esports": "🎮 Киберспорт",
 }
 
-# алиасы (на случай если кнопка/коллбек приходит по-русски)
-SPORT_ALIASES = {
-    "хоккей": "ice-hockey",
-    "хоккей 🏒": "ice-hockey",
-    "футбол": "football",
-    "баскетбол": "basketball",
-    "теннис": "tennis",
-    "настольный теннис": "table-tennis",
-    "киберспорт": "esports",
-}
+# чтобы Telegram не ругался Message is too long (ограничение ~4096)
+TELEGRAM_MAX_CHARS = 3800
 
 
 def _snap_key(user_id: int, match_id: str) -> str:
@@ -104,26 +92,11 @@ def _md_safe_text(text: str) -> str:
     return _md_escape(text or "")
 
 
-def _tg_truncate(text: str, limit: int = TG_TEXT_LIMIT) -> str:
-    """
-    Telegram max ~4096, но учитываем запас под markdown/кнопки.
-    """
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 80)].rstrip() + "\n\n…(сообщение обрезано, уточни лигу/команды)"
-
-
-def _normalize_sport_slug(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    if not s:
-        return ""
-    # убрать префиксы типа "спорт:" "СПОРТ:"
-    s = re.sub(r"^\s*спорт\s*:\s*", "", s, flags=re.IGNORECASE).strip()
-    # алиасы
-    if s in SPORT_ALIASES:
-        return SPORT_ALIASES[s]
-    return s
+def _truncate_telegram(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
+    t = text or ""
+    if len(t) <= limit:
+        return t
+    return t[: max(0, limit - 20)] + "\n…(обрезано)"
 
 
 @contextmanager
@@ -271,14 +244,231 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 
 
 # -----------------------------
+# Группировка матчей: страна -> лига -> матчи
+# -----------------------------
+def _norm_key(s: Any) -> str:
+    s = (str(s or "")).strip()
+    return s if s else "Other"
+
+
+def _build_index_for_user(user_id: int) -> Dict[str, Any]:
+    cache = _MATCH_CACHE_BY_USER.get(user_id) or {}
+    idx: Dict[str, Dict[str, List[str]]] = {}
+    # idx[country][league] = [match_id,...]
+    for mid, meta in cache.items():
+        country = _norm_key(meta.get("country") or meta.get("league_country") or "Other")
+        league = _norm_key(meta.get("league") or "Other")
+        idx.setdefault(country, {}).setdefault(league, []).append(mid)
+
+    # стабильный порядок внутри лиг: по start_time (если есть) иначе как пришло
+    for c, leagues in idx.items():
+        for lg, ids in leagues.items():
+            ids.sort(
+                key=lambda _id: str((cache.get(_id) or {}).get("start_time") or "")
+            )
+    return idx
+
+
+def _render_countries(user_id: int, sport_title: str, today_iso: str) -> str:
+    idx = _build_index_for_user(user_id)
+    items: List[Tuple[str, int]] = []
+    for country, leagues in idx.items():
+        n = sum(len(v) for v in leagues.values())
+        items.append((country, n))
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    lines = [
+        f"🏟 Матчи сегодня (по МСК) — {sport_title}",
+        f"Дата: {today_iso}",
+        "",
+        "Выбери страну:",
+    ]
+    for c, n in items[:10]:
+        lines.append(f"• {c} ({n})")
+    if len(items) > 10:
+        rest = sum(n for _, n in items[10:])
+        lines.append(f"• Другие ({rest})")
+
+    lines.append("")
+    lines.append("Команды навигации:")
+    lines.append("• страна: <название>")
+    lines.append("• лига: <страна> | <лига> | <страница?>")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _render_leagues(user_id: int, country: str) -> str:
+    idx = _build_index_for_user(user_id)
+    leagues = idx.get(country) or {}
+    items = [(lg, len(ids)) for lg, ids in leagues.items()]
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    lines = [f"🏳️ Страна: {country}", "", "Выбери лигу:"]
+    for lg, n in items[:15]:
+        lines.append(f"• {lg} ({n})")
+    if not items:
+        lines.append("• (пусто)")
+    lines.append("")
+    lines.append("Команда:")
+    lines.append("лига: {страна} | {лига} | 1")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _render_matches_page(user_id: int, country: str, league: str, page: int, per_page: int = 15) -> str:
+    idx = _build_index_for_user(user_id)
+    ids = (idx.get(country) or {}).get(league) or []
+    total = len(ids)
+    if total == 0:
+        return "Матчей не найдено."
+
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    chunk = ids[start : start + per_page]
+
+    lines = [f"🏳️ {country}", f"🏆 {league}", f"Страница {page}/{pages}", ""]
+    for mid in chunk:
+        meta = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(mid) or {}
+        title = meta.get("title") or f"Матч {mid}"
+        status = meta.get("status") or ""
+        score = meta.get("score") or ""
+        start_time = meta.get("start_time") or ""
+        s: List[str] = []
+        s.append(f"• {title}")
+        if start_time:
+            s.append(f"  старт: {start_time}")
+        if score:
+            s.append(f"  счёт: {score}")
+        if status:
+            s.append(f"  статус: {status}")
+        s.append(f"  id: {mid}")
+        lines.append("\n".join(s))
+
+    lines.append("")
+    if pages > 1:
+        prev_p = max(1, page - 1)
+        next_p = min(pages, page + 1)
+        lines.append(f"Листать: лига: {country} | {league} | {prev_p}   /   {next_p}")
+    lines.append("Открыть матч: матч <id>")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _parse_nav_country(text_raw: str) -> Optional[str]:
+    m = re.match(r"^(страна)\s*:\s*(.+)$", (text_raw or "").strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(2).strip()
+
+
+def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
+    """
+    Форматы:
+      лига: Country | League | 1
+      лига: Country | League
+      лига: Country / League / 2
+    """
+    m = re.match(r"^(лига)\s*:\s*(.+)$", (text_raw or "").strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    tail = m.group(2).strip()
+    # split by | or /
+    if "|" in tail:
+        parts = [p.strip() for p in tail.split("|")]
+    elif "/" in tail:
+        parts = [p.strip() for p in tail.split("/")]
+    else:
+        # если без разделителя — не принимаем
+        return None
+
+    if len(parts) < 2:
+        return None
+
+    country = parts[0]
+    league = parts[1]
+    page = 1
+    if len(parts) >= 3 and parts[2]:
+        try:
+            page = int(re.findall(r"\d+", parts[2])[0])
+        except Exception:
+            page = 1
+    return country, league, page
+
+
+# -----------------------------
 # API: матчи / матч / oddsBase
 # -----------------------------
+async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
+    from .integrations.sport_api import SportAPIClient, SportAPIError
+
+    sport_slug = (sport_slug or "").strip().lower()
+    if sport_slug not in API_SPORTS_LABELS:
+        return (
+            "Не понял спорт.\n"
+            "Варианты: football, ice-hockey, basketball, tennis, table-tennis, esports"
+        )
+
+    today = _msk_today_date()
+    title = API_SPORTS_LABELS.get(sport_slug, sport_slug)
+
+    try:
+        api = SportAPIClient()
+        matches = await api.matches_by_date(sport_slug, today)
+    except SportAPIError as e:
+        return _truncate_telegram(
+            "\n".join(
+                [
+                    f"🏟 Матчи сегодня (по МСК) — {title}",
+                    f"Дата: {today.isoformat()}",
+                    "",
+                    "Не удалось получить матчи из API.",
+                    f"Причина: {str(e)[:240]}",
+                ]
+            )
+        )
+    except Exception:
+        logger.exception("Sport API error")
+        return _truncate_telegram(
+            "\n".join(
+                [
+                    f"🏟 Матчи сегодня (по МСК) — {title}",
+                    f"Дата: {today.isoformat()}",
+                    "",
+                    "Не удалось получить матчи (ошибка сервера).",
+                ]
+            )
+        )
+
+    # кешируем матчи (чтобы потом по MATCH:<id> понять sport/league/title)
+    _MATCH_CACHE_BY_USER[user_id] = {}
+    for m in matches:
+        # ВАЖНО: страна может отсутствовать в данных => будет Other
+        # Если позже добавишь country в MatchItem — оно автоматически начнёт группировать
+        _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
+            "sport": m.sport_slug,
+            "title": m.title,
+            "league": m.league,
+            "status": m.status,
+            "start_time": m.start_time,
+            "score": m.score,
+            "odds_base": m.odds_base,
+            "country": "",  # если в MatchItem появится m.country — поставь тут: m.country
+        }
+
+    # по умолчанию: показываем страны (короткий экран, не ломает телеграм-лимит)
+    _ACTIVE_COUNTRY_BY_USER[user_id] = ""
+    _ACTIVE_LEAGUE_BY_USER[user_id] = ""
+    _ACTIVE_PAGE_BY_USER[user_id] = 1
+
+    return _render_countries(user_id, title, today.isoformat())
+
+
 def _fmt_status_ru(status: str) -> str:
     s = (status or "").strip().lower()
     if not s:
         return "—"
     map_ru = {
         "not_started": "не начался",
+        "notstarted": "не начался",
         "scheduled": "по расписанию",
         "live": "LIVE",
         "inprogress": "LIVE",
@@ -290,97 +480,6 @@ def _fmt_status_ru(status: str) -> str:
         "postponed": "перенесён",
     }
     return map_ru.get(s, status)
-
-
-async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
-    from .integrations.sport_api import SportAPIClient, SportAPIError
-
-    sport_slug = _normalize_sport_slug(sport_slug)
-    if not sport_slug:
-        return "Не понял спорт. Пример: матчи сегодня ice-hockey"
-
-    if sport_slug not in API_SPORTS_LABELS:
-        return (
-            "Не понял спорт.\n"
-            "Варианты: football, ice-hockey, basketball, tennis, table-tennis, esports"
-        )
-
-    # ограничение по купленному тарифу (по умолчанию только хоккей)
-    if ALLOWED_SPORTS and sport_slug not in ALLOWED_SPORTS:
-        allowed_pretty = ", ".join(sorted(ALLOWED_SPORTS))
-        return (
-            f"Этот вид спорта сейчас недоступен в твоём тарифе.\n"
-            f"Доступно: {allowed_pretty}\n\n"
-            "Если хочешь — расширь тариф или поменяй ALLOWED_SPORTS."
-        )
-
-    today = _msk_today_date()
-    title = API_SPORTS_LABELS.get(sport_slug, sport_slug)
-
-    try:
-        api = SportAPIClient()
-        matches = await api.matches_by_date(sport_slug, today)
-    except SportAPIError as e:
-        text = (
-            f"🏟 Матчи сегодня (по МСК) — {title}\n"
-            f"Дата: {today.isoformat()}\n\n"
-            "Не удалось получить матчи из API.\n"
-            f"Причина: {str(e)[:180]}"
-        )
-        return _tg_truncate(text)
-    except Exception:
-        logger.exception("Sport API error")
-        text = (
-            f"🏟 Матчи сегодня (по МСК) — {title}\n"
-            f"Дата: {today.isoformat()}\n\n"
-            "Не удалось получить матчи (ошибка сервера)."
-        )
-        return _tg_truncate(text)
-
-    # кешируем матчи (чтобы потом по MATCH:<id> понять sport/league/title)
-    _MATCH_CACHE_BY_USER[user_id] = {}
-
-    for m in matches:
-        mid = str(getattr(m, "id", "") or "")
-        if not mid:
-            continue
-        _MATCH_CACHE_BY_USER[user_id][mid] = {
-            "sport": str(getattr(m, "sport_slug", "") or sport_slug),
-            "title": str(getattr(m, "title", "") or ""),
-            "league": str(getattr(m, "league", "") or ""),
-            "status": str(getattr(m, "status", "") or ""),
-            "start_time": str(getattr(m, "start_time", "") or ""),
-            # ВАЖНО: у твоего MatchItem может не быть этих полей — не падаем
-            "score": str(getattr(m, "score", "") or ""),
-            "odds_base": getattr(m, "odds_base", None),
-        }
-
-    lines = [f"🏟 Матчи сегодня (по МСК) — {title}", f"Дата: {today.isoformat()}", ""]
-
-    if not matches:
-        lines.append("Пока нет матчей на сегодня по этому виду спорта.")
-        return _tg_truncate("\n".join(lines))
-
-    total = len(matches)
-    shown = min(total, MATCHES_LIST_LIMIT)
-
-    for m in matches[:shown]:
-        league = f" ({getattr(m, 'league', '')})" if getattr(m, "league", "") else ""
-        score_val = str(getattr(m, "score", "") or "")
-        score = f" · {score_val}" if score_val else ""
-        status_val = str(getattr(m, "status", "") or "")
-        status = f" · {_fmt_status_ru(status_val)}" if status_val else ""
-        mid = str(getattr(m, "id", "") or "")
-        title_m = str(getattr(m, "title", "") or "Матч")
-        lines.append(f"• {title_m}{league}{score}{status} — id: {_md_escape(mid)}")
-
-    if total > shown:
-        lines.append("")
-        lines.append(f"Показано {shown} из {total}. Уточни лигу/команды, чтобы сузить список.")
-
-    lines.append("")
-    lines.append("Дальше: матч <id>.")
-    return _tg_truncate("\n".join(lines))
 
 
 def _format_match_hub_text(
@@ -435,13 +534,13 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
             d = await api.match_details(sport, match_id)
             return {
                 "id": match_id,
-                "sport": str(getattr(d, "sport_slug", "") or sport),
-                "title": str(getattr(d, "title", "") or f"Матч {match_id}"),
-                "league": str(getattr(d, "league", "") or ""),
-                "status": str(getattr(d, "status", "") or ""),
-                "start_time": str(getattr(d, "start_time", "") or ""),
-                "score": str(getattr(d, "score", "") or ""),
-                "odds_base": getattr(d, "odds_base", None),
+                "sport": d.sport_slug,
+                "title": d.title,
+                "league": d.league,
+                "status": d.status,
+                "start_time": d.start_time,
+                "score": d.score,
+                "odds_base": d.odds_base,
             }
         except Exception:
             pass
@@ -581,9 +680,7 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
             "ℹ️ Аналитический материал. Не является рекомендацией."
         )
 
-    title = str(
-        analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")
-    ).strip()
+    title = str(analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")).strip()
     lines: list[str] = [title]
 
     if analysis.get("summary"):
@@ -636,13 +733,7 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     return "\n".join(lines)
 
 
-def _hash_cache_key(
-    match_id: str,
-    mode: str,
-    action: str,
-    cur_snap: Dict[str, Any],
-    prev_snap: Optional[Dict[str, Any]],
-) -> str:
+def _hash_cache_key(match_id: str, mode: str, action: str, cur_snap: Dict[str, Any], prev_snap: Optional[Dict[str, Any]]) -> str:
     payload = {"m": match_id, "mode": mode, "action": action, "cur": cur_snap, "prev": prev_snap}
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
@@ -674,7 +765,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
     h = _hash_cache_key(match_id, mode, action, cur_snap, prev_snap)
     suffix = f":r{_now_ts()}" if force_refresh else ""
-    cache_key = f"v9:ui:{match_id}:{mode}:{action}:{h}{suffix}"
+    cache_key = f"v10:ui:{match_id}:{mode}:{action}:{h}{suffix}"
 
     schema = "ui_live" if (mode or "").lower() == "live" else "ui_pre"
     analysis, meta = await analyze_with_llm_cached(
@@ -737,9 +828,6 @@ def _format_env_status() -> str:
         "LLM_ENABLED",
         "LLM_PROVIDER",
         "OPENAI_MODEL",
-        "ALLOWED_SPORTS",
-        "MATCHES_LIST_LIMIT",
-        "TG_TEXT_LIMIT",
     ]
     lines = ["🔧 ENV status"]
     for k in keys:
@@ -786,9 +874,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text(
-            "✅ parsing.py version: 2026-01-14 v10 (tg length safe + score/odds_base safe + sport aliases + allowed sports)"
-        )
+        return _md_safe_text("✅ parsing.py version: 2026-01-14 v10 (countries/leagues navigation + telegram truncation)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -821,7 +907,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
         _ACTIVE_MATCH_BY_USER[user_id] = match_id
         reply = await _run_ui_llm(user_id=user_id, match_id=match_id, mode=mode, action=action)
-        return _md_safe_text(reply)
+        return _md_safe_text(_truncate_telegram(reply))
 
     # admin strategy
     if norm.startswith("админ"):
@@ -832,15 +918,55 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _md_safe_text(_format_expert_strategy_for_today())
 
+    # --------- NAV: страна / лига ----------
+    ctry = _parse_nav_country(text_raw)
+    if ctry:
+        # нормализуем по существующим ключам (если отличаются регистром)
+        idx = _build_index_for_user(user_id)
+        hit = None
+        for k in idx.keys():
+            if k.lower() == ctry.lower():
+                hit = k
+                break
+        country = hit or ctry
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        return _md_safe_text(_render_leagues(user_id, country))
+
+    lg = _parse_nav_league(text_raw)
+    if lg:
+        country, league, page = lg
+        idx = _build_index_for_user(user_id)
+
+        # нормализуем по ключам
+        c_hit = None
+        for k in idx.keys():
+            if k.lower() == country.lower():
+                c_hit = k
+                break
+        country = c_hit or country
+
+        leagues = idx.get(country) or {}
+        l_hit = None
+        for k in leagues.keys():
+            if k.lower() == league.lower():
+                l_hit = k
+                break
+        league = l_hit or league
+
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        _ACTIVE_LEAGUE_BY_USER[user_id] = league
+        _ACTIVE_PAGE_BY_USER[user_id] = page
+        return _md_safe_text(_render_matches_page(user_id, country, league, page))
+
     # matches today (API)
     if norm.startswith("матчи сегодня"):
         sport = text_raw.split("матчи сегодня", 1)[1].strip(" :\n\t")
         if not sport:
             return _md_safe_text(
-                "Напиши: матчи сегодня ice-hockey\n"
+                "Напиши: матчи сегодня football\n"
                 "Варианты: football, ice-hockey, basketball, tennis, table-tennis, esports"
             )
-        sport_slug = _normalize_sport_slug(sport)
+        sport_slug = sport.strip().lower()
         _ACTIVE_SPORT_BY_USER[user_id] = sport_slug
         return _md_safe_text(await _format_matches_today_api(user_id, sport_slug))
 
@@ -854,7 +980,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         _ACTIVE_MATCH_BY_USER[user_id] = str(match_meta.get("id") or match_id)
 
         return _md_safe_text(
-            _tg_truncate(
+            _truncate_telegram(
                 _format_match_hub_text(
                     str(match_meta.get("id") or match_id),
                     title=str(match_meta.get("title") or f"Матч {match_id}"),
@@ -876,7 +1002,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
             return _md_safe_text("Сначала выбери матч (из списка «Матчи сегодня»).")
         mode, action = mapped
         reply = await _run_ui_llm(user_id=user_id, match_id=active, mode=mode, action=action)
-        return _md_safe_text(reply)
+        return _md_safe_text(_truncate_telegram(reply))
 
     # profile
     if "профиль" in norm:
@@ -904,6 +1030,8 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     help_text = (
         "Команды:\n\n"
         "• матчи сегодня football|ice-hockey|basketball|tennis|table-tennis|esports\n"
+        "• страна: <название>\n"
+        "• лига: <страна> | <лига> | <страница>\n"
         "• матч <id> (дальше кнопки PRE/LIVE)\n"
         "• стратегия\n"
         "• профиль\n"
