@@ -1,754 +1,479 @@
-# src/telegram_bot/app.py
+# src/integrations/sport_api.py
 from __future__ import annotations
 
-import hashlib
-import logging
 import os
+import logging
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import date
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from zoneinfo import ZoneInfo
-
-from fastapi import APIRouter, Request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import httpx
 
 logger = logging.getLogger(__name__)
 
-MSK = ZoneInfo("Europe/Moscow")
+
+class SportAPIError(RuntimeError):
+    pass
 
 
-# ============================================================
-# ENV
-# ============================================================
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()  # https://xxxx.onrender.com
-WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
-WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()  # если задан — используем, иначе PUBLIC_URL + WEBHOOK_PATH
-
-# доступ по тарифу
-ALLOWED_SPORTS = [s.strip() for s in (os.getenv("ALLOWED_SPORTS") or "ice-hockey").split(",") if s.strip()]
-HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "").strip().lower() in {"1", "true", "yes", "on"}
-
-# лимит текста под Telegram (защита от Message_too_long)
-TG_TEXT_LIMIT = 3800
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
 
 
-# ============================================================
-# UI labels
-# ============================================================
-SPORT_LABELS = {
-    "ice-hockey": "🏒 Хоккей",
-    "football": "⚽️ Футбол",
-    "basketball": "🏀 Баскетбол",
-    "tennis": "🎾 Теннис",
-    "table-tennis": "🏓 Настольный теннис",
-    "esports": "🎮 Киберспорт",
-}
-
-MAIN_MENU_TEXT = "Главное меню"
+def _join_url(base: str, path: str) -> str:
+    base = (base or "").rstrip("/")
+    path = (path or "").lstrip("/")
+    return f"{base}/{path}"
 
 
-# ============================================================
-# Telegram Application (создаётся в telegram_startup)
-# ============================================================
-_telegram_app: Optional[Application] = None
-
-router = APIRouter()
-
-
-# ============================================================
-# Helpers
-# ============================================================
-def _is_allowed_sport(sport_slug: str) -> bool:
-    s = (sport_slug or "").strip().lower()
-    return s in {x.lower() for x in ALLOWED_SPORTS}
-
-
-def _msk_today_iso() -> str:
-    return datetime.now(MSK).date().isoformat()
-
-
-def _safe_markdown(text: str) -> str:
-    """
-    Минимальная экранизация под Markdown (ParseMode.MARKDOWN).
-    """
-    s = text or ""
-    s = s.replace("\\", "\\\\")
-    s = s.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
-    s = s.replace("`", "\\`")
-    return s
-
-
-def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
-    t = text or ""
-    if len(t) <= limit:
-        return t
-    return t[: limit - 50] + "\n\n…(сообщение обрезано)"
-
-
-async def call_agent_local(user_id: int, text: str) -> str:
-    """
-    Вызываем локального агента (src/parsing.py).
-    """
-    from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
-
-    return await run_dialog_agent(user_id, text)
-
-
-# ============================================================
-# Keyboards
-# ============================================================
-def kb_main_menu() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("🏟 Матчи сегодня", callback_data="MENU:MATCHES")],
-        [InlineKeyboardButton("🧠 AI Аналитика", callback_data="MENU:AI")],
-        [InlineKeyboardButton("👤 Стратегия эксперта", callback_data="MENU:STRATEGY")],
-        [InlineKeyboardButton("📊 Профиль", callback_data="MENU:PROFILE")],
-        [InlineKeyboardButton("⭐ Премиум", callback_data="MENU:PREMIUM")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_sports() -> InlineKeyboardMarkup:
-    """
-    Меню выбора спорта:
-    - доступные: SPORT:<slug>
-    - недоступные: SPORT_LOCKED:<slug> (или скрываем)
-    """
-    rows: List[List[InlineKeyboardButton]] = []
-
-    for slug in ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]:
-        title = SPORT_LABELS.get(slug, slug)
-        if _is_allowed_sport(slug):
-            rows.append([InlineKeyboardButton(title, callback_data=f"SPORT:{slug}")])
-        else:
-            if HIDE_LOCKED_SPORTS:
-                continue
-            rows.append([InlineKeyboardButton(f"🔒 {title}", callback_data=f"SPORT_LOCKED:{slug}")])
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
-    return InlineKeyboardMarkup(rows)
-
-
-def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>
-    """
-    mid = str(match_id).strip()
-    rows = [
-        [
-            InlineKeyboardButton("📊 Обзор (PRE)", callback_data=f"UI:{mid}:pre:overview"),
-            InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{mid}:live:overview"),
-        ],
-        [
-            InlineKeyboardButton("1X2", callback_data=f"UI:{mid}:pre:moneyline"),
-            InlineKeyboardButton("Тотал", callback_data=f"UI:{mid}:pre:total"),
-            InlineKeyboardButton("Фора", callback_data=f"UI:{mid}:pre:handicap"),
-        ],
-        [InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh")],
-        [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES_MENU")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-# ============================================================
-# Navigation: Country -> League -> Matches (paged)
-# ============================================================
 @dataclass
-class _NavState:
-    sport: str
-    today_iso: str
-    country_by_key: Dict[str, str]
-    league_by_key: Dict[Tuple[str, str], str]
-    match_ids_by_league: Dict[Tuple[str, str], List[str]]
-    match_meta: Dict[str, Dict[str, str]]
+class MatchItem:
+    id: str
+    sport_slug: str
+    title: str
+    league: str
+    status: str
+    start_time: str  # как приходит от провайдера (обычно ISO)
+    score: str = ""  # текущий счёт/результат если есть (строкой)
+    odds_base: Optional[Dict[str, Any]] = None  # базовые коэффициенты/рынки если есть в списке матчей
 
 
-_NAV_BY_USER: Dict[int, _NavState] = {}
-_PER_PAGE = 12
+@dataclass
+class OddsSnapshot:
+    raw: Dict[str, Any]
+    moneyline: Optional[Dict[str, Any]] = None
+    total_main: Optional[Dict[str, Any]] = None
+    handicap_main: Optional[Dict[str, Any]] = None
 
 
-def _short_key(s: str, n: int = 10) -> str:
-    h = hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-    return h[:n]
+class SportAPIClient:
+    """
+    Клиент под api.api-sport.ru (и похожие провайдеры).
 
+    ENV:
+      SPORT_API_BASE            например: https://api.api-sport.ru
+      SPORT_API_KEY             ключ
+      SPORT_API_KEY_HEADER      например: Authorization
+      SPORT_API_KEY_PREFIX      например: Bearer  (если используешь Authorization: Bearer <key>)
+      SPORT_API_TIMEOUT_S       по умолчанию 12
+      SPORT_API_BASE_PATH       необязательно: если у провайдера все методы лежат под префиксом
+    """
 
-def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
-    today_iso = _msk_today_iso()
+    def __init__(self) -> None:
+        self.base = _env("SPORT_API_BASE")
+        self.key = _env("SPORT_API_KEY")
+        self.key_header = _env("SPORT_API_KEY_HEADER", "Authorization")
+        self.key_prefix = _env("SPORT_API_KEY_PREFIX", "")
+        self.timeout_s = float(_env("SPORT_API_TIMEOUT_S", "12") or 12)
+        self.base_path = _env("SPORT_API_BASE_PATH", "").strip("/")
 
-    country_by_key: Dict[str, str] = {}
-    league_by_key: Dict[Tuple[str, str], str] = {}
-    match_ids_by_league: Dict[Tuple[str, str], List[str]] = {}
-    match_meta: Dict[str, Dict[str, str]] = {}
+        if not self.base:
+            raise SportAPIError("SPORT_API_BASE is missing")
+        if not self.key:
+            raise SportAPIError("SPORT_API_KEY is missing")
 
-    for m in matches:
-        mid = str(getattr(m, "id", "") or "").strip()
-        if not mid:
-            continue
+        u = urlparse(self.base)
+        logger.info(
+            "SportAPI init: base=%r scheme=%r host=%r header=%r prefix=%r timeout=%s key_present=%s",
+            self.base,
+            u.scheme,
+            u.netloc,
+            self.key_header,
+            self.key_prefix,
+            self.timeout_s,
+            bool(self.key),
+        )
 
-        # ВАЖНО: country желательно передавать из sport_api.py (MatchItem.country).
-        # Если нет — группировка уйдёт в Other.
-        country = (getattr(m, "country", "") or "").strip() or "Other"
-        league = (getattr(m, "league", "") or "").strip() or "Other"
+    def _headers(self) -> Dict[str, str]:
+        v = self.key
+        if self.key_prefix:
+            v = f"{self.key_prefix} {self.key}".strip()
+        return {"Accept": "application/json", self.key_header: v}
 
-        ckey = _short_key(country)
-        lkey = _short_key(f"{country}::{league}")
+    def _normalize_path(self, path: str) -> str:
+        path = (path or "").lstrip("/")
+        if self.base_path:
+            return f"{self.base_path}/{path}".lstrip("/")
+        return path
 
-        country_by_key[ckey] = country
-        league_by_key[(ckey, lkey)] = league
-        match_ids_by_league.setdefault((ckey, lkey), []).append(mid)
+    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        path = self._normalize_path(path)
+        url = _join_url(self.base, path)
 
-        match_meta[mid] = {
-            "title": str(getattr(m, "title", "") or f"Матч {mid}"),
-            "league": league,
-            "country": country,
-            "status": str(getattr(m, "status", "") or ""),
-            "score": str(getattr(m, "score", "") or ""),
-            "start_time": str(getattr(m, "start_time", "") or ""),
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            try:
+                r = await client.get(url, headers=self._headers(), params=params)
+            except Exception as e:
+                raise SportAPIError(f"request failed: {type(e).__name__}: {e}") from e
+
+        if r.status_code >= 400:
+            txt = (r.text or "")[:600]
+            raise SportAPIError(f"HTTP {r.status_code}: {txt}")
+
+        try:
+            return r.json()
+        except Exception as e:
+            raise SportAPIError(f"bad json: {type(e).__name__}: {e}") from e
+
+    # ---------- helpers ----------
+    def _pick(self, obj: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
+        for k in keys:
+            if k in obj and obj[k] not in (None, ""):
+                return obj[k]
+        return default
+
+    def _stringify_id(self, x: Any) -> str:
+        if x is None:
+            return ""
+        return str(x).strip()
+
+    def _team_name(self, v: Any) -> str:
+        """Команда может быть строкой или dict. Берём translations.ru -> name -> str."""
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            tr = v.get("translations")
+            if isinstance(tr, dict):
+                ru = tr.get("ru")
+                if isinstance(ru, str) and ru.strip():
+                    return ru.strip()
+            name = v.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return str(v).strip()
+
+    def _score_num(self, v: Any) -> str:
+        """Число счёта может быть int/str или dict вида {'current': 0}."""
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return str(int(v))
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            cur = v.get("current")
+            if isinstance(cur, (int, float)):
+                return str(int(cur))
+            if isinstance(cur, str) and cur.strip():
+                return cur.strip()
+            # иногда бывает просто {"home":0,"away":0}
+            if "home" in v or "away" in v:
+                h = v.get("home")
+                a = v.get("away")
+                if isinstance(h, (int, float)) and isinstance(a, (int, float)):
+                    return f"{int(h)}:{int(a)}"
+        return ""
+
+    def _infer_title(self, m: Dict[str, Any]) -> str:
+        # 1) title/name (если уже строка)
+        t = self._pick(m, ["title", "name", "eventName", "matchName"], "")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+
+        # 2) home/away (часто dict)
+        home_raw = self._pick(m, ["home", "homeTeam", "home_team", "team1", "homeName"], None)
+        away_raw = self._pick(m, ["away", "awayTeam", "away_team", "team2", "awayName"], None)
+        home = self._team_name(home_raw)
+        away = self._team_name(away_raw)
+        if home and away:
+            return f"{home} — {away}"
+
+        # 3) competitors/participants/teams list
+        comps = m.get("competitors") or m.get("participants") or m.get("teams")
+        if isinstance(comps, list) and len(comps) >= 2:
+            a = self._team_name(comps[0] if isinstance(comps[0], (dict, str)) else str(comps[0]))
+            b = self._team_name(comps[1] if isinstance(comps[1], (dict, str)) else str(comps[1]))
+            if a and b:
+                return f"{a} — {b}"
+
+        return "Матч"
+
+    def _infer_league(self, m: Dict[str, Any]) -> str:
+        league = self._pick(m, ["league", "tournament", "competitionName", "competition", "leagueName"], "")
+        if isinstance(league, dict):
+            return str(self._pick(league, ["name", "title"], "")).strip()
+        return str(league or "").strip()
+
+    def _infer_status(self, m: Dict[str, Any]) -> str:
+        s = self._pick(m, ["status", "state", "matchStatus", "eventStatus"], "")
+        if isinstance(s, dict):
+            return str(self._pick(s, ["type", "code", "name"], "")).strip()
+        return str(s or "").strip()
+
+    def _infer_start_time(self, m: Dict[str, Any]) -> str:
+        st = self._pick(m, ["start_time", "startTime", "utcStartTime", "start", "date", "scheduled"], "")
+        if isinstance(st, dict):
+            return str(self._pick(st, ["utc", "iso", "dateTime"], "")).strip()
+        return str(st or "").strip()
+
+    def _infer_score(self, m: Dict[str, Any]) -> str:
+        """
+        Нормализуем score во всех частых форматах api.api-sport.ru:
+          score: {"home":{"current":0},"away":{"current":0}}
+          score: {"home":0,"away":0}
+          scores/result/liveScore и др.
+        """
+        s = m.get("score") or m.get("scores") or m.get("result") or m.get("liveScore")
+
+        if isinstance(s, str):
+            return s.strip()
+        if isinstance(s, (int, float)):
+            return str(int(s))
+
+        if isinstance(s, dict):
+            # формат: {"home":{"current":0},"away":{"current":0}}
+            home = s.get("home") if s.get("home") is not None else s.get("homeScore")
+            away = s.get("away") if s.get("away") is not None else s.get("awayScore")
+
+            # если home/away — числа
+            if isinstance(home, (int, float)) and isinstance(away, (int, float)):
+                return f"{int(home)}:{int(away)}"
+
+            # если home/away — dict с current
+            h = self._score_num(home)
+            a = self._score_num(away)
+            if ":" in h and not a:
+                # вдруг _score_num вернул "x:y"
+                return h
+            if h or a:
+                return f"{h or '0'}:{a or '0'}"
+
+            # формат: {"current":{"home":0,"away":0}}
+            cur = s.get("current")
+            if isinstance(cur, dict):
+                hh = cur.get("home")
+                aa = cur.get("away")
+                if isinstance(hh, (int, float)) and isinstance(aa, (int, float)):
+                    return f"{int(hh)}:{int(aa)}"
+                if isinstance(hh, str) and isinstance(aa, str) and (hh.strip() or aa.strip()):
+                    return f"{hh.strip() or '0'}:{aa.strip() or '0'}"
+
+        # fallback: отдельные поля
+        home = m.get("homeScore")
+        away = m.get("awayScore")
+        if isinstance(home, (int, float)) and isinstance(away, (int, float)):
+            return f"{int(home)}:{int(away)}"
+
+        # fallback: home/away objects with score/current
+        home_obj = m.get("home")
+        away_obj = m.get("away")
+        if isinstance(home_obj, dict) and isinstance(away_obj, dict):
+            h = self._score_num(home_obj.get("score") or home_obj)
+            a = self._score_num(away_obj.get("score") or away_obj)
+            if h or a:
+                return f"{h or '0'}:{a or '0'}"
+
+        return ""
+
+    def _infer_odds_base(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Важно: oddsBase в приоритете
+        candidates = ["oddsBase", "odds_base", "odds", "line", "prematchOdds", "prematch", "bookmakers", "markets"]
+        for k in candidates:
+            v = m.get(k)
+            if isinstance(v, dict):
+                return v
+            if isinstance(v, list):
+                return {"items": v, "_source_key": k}
+        return None
+
+    # ---------- public API used by parsing.py ----------
+    async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchItem]:
+        """
+        Для api.api-sport.ru у тебя сработало:
+          GET /v2/<sport>/matches?...
+
+        Поэтому делаем несколько кандидатов путей и берём первый успешный.
+        """
+        sport_slug = (sport_slug or "").strip().lower()
+        day_s = day.isoformat()
+
+        params = {
+            "date": day_s,
+            "day": day_s,
+            "from": day_s,
+            "to": day_s,
+            "dateFrom": day_s,
+            "dateTo": day_s,
+            "startDate": day_s,
+            "endDate": day_s,
         }
 
-    # сортировка матчей по времени
-    for key, ids in match_ids_by_league.items():
+        candidates = [
+            f"v2/{sport_slug}/matches",
+            f"v2/{sport_slug}/events",
+            f"v2/{sport_slug}/",
+            f"v2/{sport_slug}",
+            f"v2/{sport_slug}/games",
+            f"v2/{sport_slug}/list",
+        ]
 
-        def _sk(mid: str) -> str:
-            return (match_meta.get(mid) or {}).get("start_time") or ""
+        last_err: Optional[Exception] = None
+        data: Any = None
+        used_path = ""
 
-        ids.sort(key=_sk)
-
-    return _NavState(
-        sport=sport_slug,
-        today_iso=today_iso,
-        country_by_key=country_by_key,
-        league_by_key=league_by_key,
-        match_ids_by_league=match_ids_by_league,
-        match_meta=match_meta,
-    )
-
-
-def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
-    st = _NAV_BY_USER.get(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-
-    if not st:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-        return InlineKeyboardMarkup(rows)
-
-    counts: List[Tuple[str, int]] = []
-    for ckey in st.country_by_key.keys():
-        n = 0
-        for (ck, lk), ids in st.match_ids_by_league.items():
-            if ck == ckey:
-                n += len(ids)
-        counts.append((ckey, n))
-    counts.sort(key=lambda x: x[1], reverse=True)
-
-    buf: List[InlineKeyboardButton] = []
-    for ckey, n in counts[:18]:
-        cname = st.country_by_key.get(ckey, "Other")
-        buf.append(InlineKeyboardButton(f"{cname} ({n})", callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}"))
-        if len(buf) == 2:
-            rows.append(buf)
-            buf = []
-    if buf:
-        rows.append(buf)
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarkup:
-    st = _NAV_BY_USER.get(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-    if not st:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-        return InlineKeyboardMarkup(rows)
-
-    items: List[Tuple[str, int]] = []
-    for (ck, lk), lname in st.league_by_key.items():
-        if ck != ckey:
-            continue
-        n = len(st.match_ids_by_league.get((ck, lk), []))
-        items.append((lk, n))
-    items.sort(key=lambda x: x[1], reverse=True)
-
-    for lk, n in items[:30]:
-        lname = st.league_by_key.get((ckey, lk), "Other")
-        rows.append([InlineKeyboardButton(f"{lname} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{ckey}:{lk}")])
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"BACK:COUNTRIES:{sport_slug}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _kb_matches(user_id: int, sport_slug: str, ckey: str, lkey: str, page: int) -> InlineKeyboardMarkup:
-    st = _NAV_BY_USER.get(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-    if not st:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-        return InlineKeyboardMarkup(rows)
-
-    ids = st.match_ids_by_league.get((ckey, lkey), [])
-    total = len(ids)
-    pages = max(1, (total + _PER_PAGE - 1) // _PER_PAGE)
-    page = max(1, min(page, pages))
-
-    start = (page - 1) * _PER_PAGE
-    chunk = ids[start : start + _PER_PAGE]
-
-    for mid in chunk:
-        meta = st.match_meta.get(mid) or {}
-        title = meta.get("title") or f"Матч {mid}"
-        btn_title = (title[:48] + "…") if len(title) > 49 else title
-        rows.append([InlineKeyboardButton(btn_title, callback_data=f"MATCH:{sport_slug}:{mid}")])
-
-    nav_row: List[InlineKeyboardButton] = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"NAV:PAGE:{sport_slug}:{ckey}:{lkey}:{page-1}"))
-    nav_row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="NOOP"))
-    if page < pages:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"NAV:PAGE:{sport_slug}:{ckey}:{lkey}:{page+1}"))
-    rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"BACK:LEAGUES:{sport_slug}:{ckey}")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _text_countries(user_id: int, sport_slug: str) -> str:
-    st = _NAV_BY_USER.get(user_id)
-    title = SPORT_LABELS.get(sport_slug, sport_slug)
-    if not st:
-        return f"🏟 Матчи сегодня (по МСК) — {title}\nДата: {_msk_today_iso()}\n\nНет данных."
-    return f"🏟 Матчи сегодня (по МСК) — {title}\nДата: {st.today_iso}\n\nВыбери страну:"
-
-
-def _text_leagues(user_id: int, ckey: str) -> str:
-    st = _NAV_BY_USER.get(user_id)
-    if not st:
-        return "Нет данных."
-    country = st.country_by_key.get(ckey, "Other")
-    return f"🏳️ Страна: {country}\n\nВыбери лигу:"
-
-
-def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
-    st = _NAV_BY_USER.get(user_id)
-    if not st:
-        return "Нет данных."
-    country = st.country_by_key.get(ckey, "Other")
-    league = st.league_by_key.get((ckey, lkey), "Other")
-    ids = st.match_ids_by_league.get((ckey, lkey), [])
-    total = len(ids)
-    pages = max(1, (total + _PER_PAGE - 1) // _PER_PAGE)
-    page = max(1, min(page, pages))
-    return (
-        f"🏳️ {country}\n"
-        f"🏆 {league}\n"
-        f"Матчи: {total} • Страница {page}/{pages}\n\n"
-        "Нажми матч ниже 👇"
-    )
-
-
-async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
-    from ..integrations.sport_api import SportAPIClient, SportAPIError
-
-    today = datetime.now(MSK).date()
-    title = SPORT_LABELS.get(sport_slug, sport_slug)
-
-    try:
-        api = SportAPIClient()
-        matches = await api.matches_by_date(sport_slug, today)
-    except SportAPIError as e:
-        text = (
-            f"🏟 Матчи сегодня (по МСК) — {title}\n"
-            f"Дата: {today.isoformat()}\n\n"
-            "Не удалось получить матчи из API.\n"
-            f"Причина: {str(e)[:250]}"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")]])
-        return text, kb
-
-    _NAV_BY_USER[user_id] = _build_nav_state(user_id, sport_slug, matches)
-    return _text_countries(user_id, sport_slug), _kb_countries(user_id, sport_slug)
-
-
-# ============================================================
-# Handlers
-# ============================================================
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Привет! Выбери раздел 👇"
-    await update.message.reply_text(text, reply_markup=kb_main_menu())
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    user_id = update.effective_user.id if update.effective_user else 0
-    text_raw = (update.message.text or "").strip()
-    norm = text_raw.lower()
-
-    logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
-
-    # быстрый вход в матчи
-    if "матчи сегодня" in norm:
-        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
-        return
-
-    # остальное — в агента
-    reply = await call_agent_local(user_id, text_raw)
-    txt = _truncate_tg(reply)
-    await update.message.reply_text(
-        _safe_markdown(txt),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_main_menu(),
-    )
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.callback_query:
-        return
-
-    q = update.callback_query
-    data = (q.data or "").strip()
-    user_id = update.effective_user.id if update.effective_user else 0
-    chat_id = update.effective_chat.id if update.effective_chat else None
-
-    logger.info("tg.callback user_id=%s data=%r", user_id, data)
-
-    try:
-        await q.answer()
-    except Exception:
-        pass
-
-    try:
-        if chat_id is not None:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-    if data in {"NOOP", ""}:
-        return
-
-    # BACK
-    if data == "BACK:MENU":
-        try:
-            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
-        except Exception:
-            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
-        return
-
-    if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
-        text = "🏟 Выбери спорт:"
-        try:
-            await q.edit_message_text(text, reply_markup=kb_sports())
-        except Exception:
-            await q.message.reply_text(text, reply_markup=kb_sports())
-        return
-
-    # MENU shortcuts
-    if data == "MENU:AI":
-        reply = (
-            "Как пользоваться:\n"
-            "1) 🏟 Матчи сегодня\n"
-            "2) спорт → страна → лига → матч\n"
-            "3) в матче нажми: PRE / LIVE / рынки\n\n"
-            "Диагностика: llm ping, env, version, last_error"
-        )
-        try:
-            await q.edit_message_text(reply, reply_markup=kb_main_menu())
-        except Exception:
-            await q.message.reply_text(reply, reply_markup=kb_main_menu())
-        return
-
-    if data == "MENU:STRATEGY":
-        reply = await call_agent_local(user_id, "стратегия")
-        txt = _truncate_tg(reply)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "MENU:PROFILE":
-        reply = await call_agent_local(user_id, "профиль")
-        txt = _truncate_tg(reply)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if data == "MENU:PREMIUM":
-        from ..ui_text import text_premium
-
-        try:
-            await q.edit_message_text(text_premium(), reply_markup=kb_main_menu())
-        except Exception:
-            await q.message.reply_text(text_premium(), reply_markup=kb_main_menu())
-        return
-
-    # SPORT locked
-    if data.startswith("SPORT_LOCKED:"):
-        slug = data.split(":", 1)[1].strip().lower()
-        title = SPORT_LABELS.get(slug, slug)
-        txt = (
-            f"🔒 {title} недоступен по твоему тарифу.\n\n"
-            "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in ALLOWED_SPORTS)
-        )
-        try:
-            await q.edit_message_text(txt, reply_markup=kb_sports())
-        except Exception:
-            await q.message.reply_text(txt, reply_markup=kb_sports())
-        return
-
-    # SPORT selection (только разрешённые)
-    if data.startswith("SPORT:"):
-        sport_slug = data.split(":", 1)[1].strip().lower()
-        if not _is_allowed_sport(sport_slug):
-            title = SPORT_LABELS.get(sport_slug, sport_slug)
-            txt = f"🔒 {title} недоступен по твоему тарифу."
+        for p in candidates:
             try:
-                await q.edit_message_text(txt, reply_markup=kb_sports())
-            except Exception:
-                await q.message.reply_text(txt, reply_markup=kb_sports())
-            return
+                logger.info("SportAPI try matches_by_date sport=%s: GET %s params=%s", sport_slug, p, params)
+                data = await self._get(p, params=params)
+                used_path = p
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning("SportAPI failed matches_by_date sport=%s on path=%s err=%s", sport_slug, p, e)
 
-        text, kb = await _render_sport_nav_root(user_id, sport_slug)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+        if data is None:
+            raise SportAPIError(
+                f"matches_by_date failed for sport_slug={sport_slug}: "
+                f"all endpoints failed for matches_by_date sport={sport_slug}: {last_err}"
+            )
 
-    # NAV
-    if data.startswith("NAV:COUNTRY:"):
-        # NAV:COUNTRY:<sport>:<ckey>
-        parts = data.split(":")
-        if len(parts) < 4:
-            return
-        sport_slug = parts[2].strip().lower()
-        ckey = parts[3].strip()
-        text = _text_leagues(user_id, ckey)
-        kb = _kb_leagues(user_id, sport_slug, ckey)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+        items = None
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for k in ("data", "events", "matches", "results", "items"):
+                if isinstance(data.get(k), list):
+                    items = data[k]
+                    break
 
-    if data.startswith("NAV:LEAGUE:"):
-        # NAV:LEAGUE:<sport>:<ckey>:<lkey>
-        parts = data.split(":")
-        if len(parts) < 5:
-            return
-        sport_slug = parts[2].strip().lower()
-        ckey = parts[3].strip()
-        lkey = parts[4].strip()
-        text = _text_matches(user_id, ckey, lkey, page=1)
-        kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=1)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+        if not isinstance(items, list):
+            raise SportAPIError(f"unexpected response shape for matches_by_date: {type(data).__name__}")
 
-    if data.startswith("NAV:PAGE:"):
-        # NAV:PAGE:<sport>:<ckey>:<lkey>:<page>
-        parts = data.split(":")
-        if len(parts) < 6:
-            return
-        sport_slug = parts[2].strip().lower()
-        ckey = parts[3].strip()
-        lkey = parts[4].strip()
-        try:
-            page = int(parts[5].strip())
-        except Exception:
-            page = 1
-        text = _text_matches(user_id, ckey, lkey, page=page)
-        kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=page)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+        logger.info(
+            "SportAPI matches_by_date OK: requested=%s used_sport=%s used_path=%s n=%s",
+            sport_slug,
+            sport_slug,
+            used_path,
+            len(items),
+        )
 
-    if data.startswith("BACK:COUNTRIES:"):
-        # BACK:COUNTRIES:<sport>
-        parts = data.split(":")
-        sport_slug = parts[2].strip().lower() if len(parts) >= 3 else "ice-hockey"
-        text = _text_countries(user_id, sport_slug)
-        kb = _kb_countries(user_id, sport_slug)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+        out: List[MatchItem] = []
+        for m in items:
+            if not isinstance(m, dict):
+                continue
+            mid = self._stringify_id(self._pick(m, ["id", "eventId", "matchId"], ""))
+            if not mid:
+                continue
 
-    if data.startswith("BACK:LEAGUES:"):
-        # BACK:LEAGUES:<sport>:<ckey>
-        parts = data.split(":")
-        if len(parts) < 4:
-            return
-        sport_slug = parts[2].strip().lower()
-        ckey = parts[3].strip()
-        text = _text_leagues(user_id, ckey)
-        kb = _kb_leagues(user_id, sport_slug, ckey)
-        txt = _truncate_tg(text)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
+            out.append(
+                MatchItem(
+                    id=mid,
+                    sport_slug=sport_slug,
+                    title=self._infer_title(m),
+                    league=self._infer_league(m),
+                    status=self._infer_status(m),
+                    start_time=self._infer_start_time(m),
+                    score=self._infer_score(m),
+                    odds_base=self._infer_odds_base(m),
+                )
+            )
 
-    # MATCH open
-    if data.startswith("MATCH:"):
-        # MATCH:<sport_slug>:<match_id>
-        parts = data.split(":")
-        if len(parts) >= 3:
-            sport_slug = parts[1].strip().lower()
-            match_id = ":".join(parts[2:]).strip()
+        return out
+
+    async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
+        sport_slug = (sport_slug or "").strip().lower()
+        match_id = str(match_id).strip()
+        path = f"v2/{sport_slug}/{match_id}"
+        data = await self._get(path)
+
+        if isinstance(data, dict):
+            m = data.get("data") if isinstance(data.get("data"), dict) else data
+            if not isinstance(m, dict):
+                m = data
         else:
-            sport_slug = "ice-hockey"
-            match_id = data.split(":", 1)[1].strip()
+            raise SportAPIError(f"unexpected response shape for match_details: {type(data).__name__}")
 
-        # прогреваем контекст для parsing.py
-        try:
-            await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
-        except Exception:
-            logger.exception("pre-cache matches failed")
+        return MatchItem(
+            id=match_id,
+            sport_slug=sport_slug,
+            title=self._infer_title(m),
+            league=self._infer_league(m),
+            status=self._infer_status(m),
+            start_time=self._infer_start_time(m),
+            score=self._infer_score(m),
+            odds_base=self._infer_odds_base(m),
+        )
 
-        reply = await call_agent_local(user_id, f"матч {match_id}")
-        txt = _truncate_tg(reply)
-        try:
-            await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        return
+    async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
+        sport_slug = (sport_slug or "").strip().lower()
+        match_id = str(match_id).strip()
 
-    # UI actions
-    if data.startswith("UI:"):
-        # UI:<match_id>:<pre|live>:<action>
-        parts = data.split(":")
-        if len(parts) < 4:
+        candidates = [
+            f"v2/{sport_slug}/{match_id}/odds",
+            f"v2/{sport_slug}/{match_id}/markets",
+            f"v2/{sport_slug}/{match_id}/line",
+        ]
+
+        last_err: Optional[Exception] = None
+        data: Any = None
+        used_path = ""
+
+        for p in candidates:
             try:
-                await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
-            except Exception:
-                await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
-            return
+                data = await self._get(p)
+                used_path = p
+                break
+            except Exception as e:
+                last_err = e
 
-        match_id = parts[1].strip()
-        mode = parts[2].strip().lower()
-        action = parts[3].strip().lower()
+        if data is None:
+            raise SportAPIError(f"all odds endpoints failed: {last_err}")
 
-        reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
-        txt = _truncate_tg(reply)
+        raw: Dict[str, Any]
+        if isinstance(data, dict):
+            raw = data
+        else:
+            raw = {"data": data}
 
-        try:
-            await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        return
+        moneyline = None
+        total_main = None
+        handicap_main = None
 
-    # fallback
-    try:
-        await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
-    except Exception:
-        await q.message.reply_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+        root = data
+        if isinstance(data, dict):
+            for k in ("data", "odds", "markets", "result"):
+                if k in data:
+                    root = data[k]
+                    break
 
+        markets = None
+        if isinstance(root, list):
+            markets = root
+        elif isinstance(root, dict):
+            for k in ("markets", "items", "data", "lines"):
+                if isinstance(root.get(k), list):
+                    markets = root[k]
+                    break
 
-# ============================================================
-# Telegram init / webhook
-# ============================================================
-def create_application() -> Application:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+        if isinstance(markets, list):
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", handle_start))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    return app
+            def mname(x: Dict[str, Any]) -> str:
+                n = x.get("name") or x.get("key") or x.get("type") or ""
+                return str(n).lower()
 
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                n = mname(m)
+                if (moneyline is None) and ("1x2" in n or "moneyline" in n or "winner" in n):
+                    moneyline = m
+                if (total_main is None) and ("total" in n or ("over" in n and "under" in n)):
+                    total_main = m
+                if (handicap_main is None) and ("handicap" in n or "spread" in n):
+                    handicap_main = m
 
-async def telegram_startup() -> None:
-    """
-    Вызывай это из src/service.py на старте.
-    """
-    global _telegram_app
-    if _telegram_app is not None:
-        return
+        merged_raw: Dict[str, Any]
+        if isinstance(raw, dict):
+            merged_raw = {"_used_path": used_path, **raw}
+        else:
+            merged_raw = {"_used_path": used_path, "raw": raw}
 
-    _telegram_app = create_application()
-
-    await _telegram_app.initialize()
-    await _telegram_app.start()
-
-    webhook_url = WEBHOOK_URL
-    if not webhook_url:
-        if not PUBLIC_URL:
-            logger.warning("PUBLIC_URL is missing; webhook not set")
-            return
-        webhook_url = PUBLIC_URL.rstrip("/") + WEBHOOK_PATH
-
-    try:
-        ok = await _telegram_app.bot.set_webhook(webhook_url)
-        logger.info("Telegram webhook set: %s (ok=%s)", webhook_url, ok)
-    except Exception:
-        logger.exception("Failed to set webhook")
-
-
-async def telegram_shutdown() -> None:
-    global _telegram_app
-    if _telegram_app is None:
-        return
-    try:
-        await _telegram_app.stop()
-        await _telegram_app.shutdown()
-    finally:
-        _telegram_app = None
-
-
-# ============================================================
-# FastAPI webhook router
-# ============================================================
-@router.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    """
-    FastAPI endpoint для Telegram webhook.
-    """
-    if _telegram_app is None:
-        await telegram_startup()
-
-    data = await request.json()
-    update = Update.de_json(data, _telegram_app.bot)  # type: ignore[arg-type]
-    await _telegram_app.process_update(update)  # type: ignore[union-attr]
-    return {"ok": True}
+        return OddsSnapshot(
+            raw=merged_raw,
+            moneyline=moneyline,
+            total_main=total_main,
+            handicap_main=handicap_main,
+        )
