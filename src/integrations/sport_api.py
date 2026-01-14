@@ -49,12 +49,12 @@ class OddsSnapshot:
 
 class SportAPIClient:
     """
-    Универсальный клиент под Sport Events API.
+    Клиент под api.api-sport.ru (и похожие провайдеры).
 
     ENV:
       SPORT_API_BASE            например: https://api.api-sport.ru
       SPORT_API_KEY             ключ
-      SPORT_API_KEY_HEADER      например: X-Api-Key или Authorization
+      SPORT_API_KEY_HEADER      например: Authorization
       SPORT_API_KEY_PREFIX      например: Bearer  (если используешь Authorization: Bearer <key>)
       SPORT_API_TIMEOUT_S       по умолчанию 12
       SPORT_API_BASE_PATH       необязательно: если у провайдера все методы лежат под префиксом
@@ -89,10 +89,7 @@ class SportAPIClient:
         v = self.key
         if self.key_prefix:
             v = f"{self.key_prefix} {self.key}".strip()
-        return {
-            "Accept": "application/json",
-            self.key_header: v,
-        }
+        return {"Accept": "application/json", self.key_header: v}
 
     def _normalize_path(self, path: str) -> str:
         path = (path or "").lstrip("/")
@@ -119,7 +116,7 @@ class SportAPIClient:
         except Exception as e:
             raise SportAPIError(f"bad json: {type(e).__name__}: {e}") from e
 
-    # ---------- helpers: parsing разных форматов ----------
+    # ---------- helpers ----------
     def _pick(self, obj: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
         for k in keys:
             if k in obj and obj[k] not in (None, ""):
@@ -129,22 +126,66 @@ class SportAPIClient:
     def _stringify_id(self, x: Any) -> str:
         if x is None:
             return ""
-        return str(x)
+        return str(x).strip()
+
+    def _team_name(self, v: Any) -> str:
+        """Команда может быть строкой или dict. Берём translations.ru -> name -> str."""
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            tr = v.get("translations")
+            if isinstance(tr, dict):
+                ru = tr.get("ru")
+                if isinstance(ru, str) and ru.strip():
+                    return ru.strip()
+            name = v.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return str(v).strip()
+
+    def _score_num(self, v: Any) -> str:
+        """Число счёта может быть int/str или dict вида {'current': 0}."""
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return str(int(v))
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, dict):
+            cur = v.get("current")
+            if isinstance(cur, (int, float)):
+                return str(int(cur))
+            if isinstance(cur, str) and cur.strip():
+                return cur.strip()
+            # иногда бывает просто {"home":0,"away":0}
+            if "home" in v or "away" in v:
+                h = v.get("home")
+                a = v.get("away")
+                if isinstance(h, (int, float)) and isinstance(a, (int, float)):
+                    return f"{int(h)}:{int(a)}"
+        return ""
 
     def _infer_title(self, m: Dict[str, Any]) -> str:
+        # 1) title/name (если уже строка)
         t = self._pick(m, ["title", "name", "eventName", "matchName"], "")
-        if t:
-            return str(t)
+        if isinstance(t, str) and t.strip():
+            return t.strip()
 
-        home = self._pick(m, ["homeName", "home_team", "homeTeam", "home", "team1"], "")
-        away = self._pick(m, ["awayName", "away_team", "awayTeam", "away", "team2"], "")
+        # 2) home/away (часто dict)
+        home_raw = self._pick(m, ["home", "homeTeam", "home_team", "team1", "homeName"], None)
+        away_raw = self._pick(m, ["away", "awayTeam", "away_team", "team2", "awayName"], None)
+        home = self._team_name(home_raw)
+        away = self._team_name(away_raw)
         if home and away:
             return f"{home} — {away}"
 
+        # 3) competitors/participants/teams list
         comps = m.get("competitors") or m.get("participants") or m.get("teams")
         if isinstance(comps, list) and len(comps) >= 2:
-            a = comps[0].get("name") if isinstance(comps[0], dict) else str(comps[0])
-            b = comps[1].get("name") if isinstance(comps[1], dict) else str(comps[1])
+            a = self._team_name(comps[0] if isinstance(comps[0], (dict, str)) else str(comps[0]))
+            b = self._team_name(comps[1] if isinstance(comps[1], (dict, str)) else str(comps[1]))
             if a and b:
                 return f"{a} — {b}"
 
@@ -153,67 +194,83 @@ class SportAPIClient:
     def _infer_league(self, m: Dict[str, Any]) -> str:
         league = self._pick(m, ["league", "tournament", "competitionName", "competition", "leagueName"], "")
         if isinstance(league, dict):
-            return str(self._pick(league, ["name", "title"], ""))
-        return str(league or "")
+            return str(self._pick(league, ["name", "title"], "")).strip()
+        return str(league or "").strip()
 
     def _infer_status(self, m: Dict[str, Any]) -> str:
         s = self._pick(m, ["status", "state", "matchStatus", "eventStatus"], "")
         if isinstance(s, dict):
-            return str(self._pick(s, ["type", "code", "name"], ""))
-        return str(s or "")
+            return str(self._pick(s, ["type", "code", "name"], "")).strip()
+        return str(s or "").strip()
 
     def _infer_start_time(self, m: Dict[str, Any]) -> str:
         st = self._pick(m, ["start_time", "startTime", "utcStartTime", "start", "date", "scheduled"], "")
         if isinstance(st, dict):
-            return str(self._pick(st, ["utc", "iso", "dateTime"], ""))
-        return str(st or "")
+            return str(self._pick(st, ["utc", "iso", "dateTime"], "")).strip()
+        return str(st or "").strip()
 
     def _infer_score(self, m: Dict[str, Any]) -> str:
+        """
+        Нормализуем score во всех частых форматах api.api-sport.ru:
+          score: {"home":{"current":0},"away":{"current":0}}
+          score: {"home":0,"away":0}
+          scores/result/liveScore и др.
+        """
         s = m.get("score") or m.get("scores") or m.get("result") or m.get("liveScore")
+
         if isinstance(s, str):
             return s.strip()
         if isinstance(s, (int, float)):
-            return str(s)
+            return str(int(s))
 
         if isinstance(s, dict):
+            # формат: {"home":{"current":0},"away":{"current":0}}
             home = s.get("home") if s.get("home") is not None else s.get("homeScore")
             away = s.get("away") if s.get("away") is not None else s.get("awayScore")
-            if home is not None and away is not None:
-                return f"{home}:{away}"
 
+            # если home/away — числа
+            if isinstance(home, (int, float)) and isinstance(away, (int, float)):
+                return f"{int(home)}:{int(away)}"
+
+            # если home/away — dict с current
+            h = self._score_num(home)
+            a = self._score_num(away)
+            if ":" in h and not a:
+                # вдруг _score_num вернул "x:y"
+                return h
+            if h or a:
+                return f"{h or '0'}:{a or '0'}"
+
+            # формат: {"current":{"home":0,"away":0}}
             cur = s.get("current")
             if isinstance(cur, dict):
-                h = cur.get("home")
-                a = cur.get("away")
-                if h is not None and a is not None:
-                    return f"{h}:{a}"
+                hh = cur.get("home")
+                aa = cur.get("away")
+                if isinstance(hh, (int, float)) and isinstance(aa, (int, float)):
+                    return f"{int(hh)}:{int(aa)}"
+                if isinstance(hh, str) and isinstance(aa, str) and (hh.strip() or aa.strip()):
+                    return f"{hh.strip() or '0'}:{aa.strip() or '0'}"
 
+        # fallback: отдельные поля
         home = m.get("homeScore")
         away = m.get("awayScore")
-        if home is not None and away is not None:
-            return f"{home}:{away}"
+        if isinstance(home, (int, float)) and isinstance(away, (int, float)):
+            return f"{int(home)}:{int(away)}"
 
+        # fallback: home/away objects with score/current
         home_obj = m.get("home")
         away_obj = m.get("away")
         if isinstance(home_obj, dict) and isinstance(away_obj, dict):
-            h = home_obj.get("score")
-            a = away_obj.get("score")
-            if h is not None and a is not None:
-                return f"{h}:{a}"
+            h = self._score_num(home_obj.get("score") or home_obj)
+            a = self._score_num(away_obj.get("score") or away_obj)
+            if h or a:
+                return f"{h or '0'}:{a or '0'}"
 
         return ""
 
     def _infer_odds_base(self, m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        candidates = [
-            "odds_base",
-            "oddsBase",
-            "odds",
-            "markets",
-            "line",
-            "prematchOdds",
-            "prematch",
-            "bookmakers",
-        ]
+        # Важно: oddsBase в приоритете
+        candidates = ["oddsBase", "odds_base", "odds", "line", "prematchOdds", "prematch", "bookmakers", "markets"]
         for k in candidates:
             v = m.get(k)
             if isinstance(v, dict):
@@ -245,10 +302,10 @@ class SportAPIClient:
         }
 
         candidates = [
+            f"v2/{sport_slug}/matches",
+            f"v2/{sport_slug}/events",
             f"v2/{sport_slug}/",
             f"v2/{sport_slug}",
-            f"v2/{sport_slug}/events",
-            f"v2/{sport_slug}/matches",
             f"v2/{sport_slug}/games",
             f"v2/{sport_slug}/list",
         ]
@@ -300,6 +357,7 @@ class SportAPIClient:
             mid = self._stringify_id(self._pick(m, ["id", "eventId", "matchId"], ""))
             if not mid:
                 continue
+
             out.append(
                 MatchItem(
                     id=mid,
@@ -312,6 +370,7 @@ class SportAPIClient:
                     odds_base=self._infer_odds_base(m),
                 )
             )
+
         return out
 
     async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
@@ -406,8 +465,14 @@ class SportAPIClient:
                 if (handicap_main is None) and ("handicap" in n or "spread" in n):
                     handicap_main = m
 
+        merged_raw: Dict[str, Any]
+        if isinstance(raw, dict):
+            merged_raw = {"_used_path": used_path, **raw}
+        else:
+            merged_raw = {"_used_path": used_path, "raw": raw}
+
         return OddsSnapshot(
-            raw={"_used_path": used_path, **raw} if isinstance(raw, dict) else {"_used_path": used_path, "raw": raw},
+            raw=merged_raw,
             moneyline=moneyline,
             total_main=total_main,
             handicap_main=handicap_main,
