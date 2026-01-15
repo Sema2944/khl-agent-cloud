@@ -23,9 +23,7 @@ from telegram.ext import (
 )
 
 logger = logging.getLogger(__name__)
-
 MSK = ZoneInfo("Europe/Moscow")
-
 
 # ============================================================
 # ENV
@@ -33,19 +31,14 @@ MSK = ZoneInfo("Europe/Moscow")
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()  # https://xxxx.onrender.com
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
-WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()  # если задан — используем, иначе PUBLIC_URL + WEBHOOK_PATH
+WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()  # если задан — используем его, иначе PUBLIC_URL+WEBHOOK_PATH
 
 # доступ по тарифу
 ALLOWED_SPORTS = [s.strip() for s in (os.getenv("ALLOWED_SPORTS") or "ice-hockey").split(",") if s.strip()]
 HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "").strip().lower() in {"1", "true", "yes", "on"}
 
-# лимит текста под Telegram (защита от Message_too_long)
-TG_TEXT_LIMIT = 3800
-
-# навигация
-LEAGUES_PER_PAGE = 16   # сколько лиг на странице
-MATCHES_PER_PAGE = 14   # сколько матчей на странице
-
+# лимит текста Telegram (страховка Message_too_long)
+TG_TEXT_LIMIT = int((os.getenv("TG_TEXT_LIMIT") or "3800").strip() or 3800)
 
 # ============================================================
 # UI labels
@@ -58,8 +51,27 @@ SPORT_LABELS = {
     "table-tennis": "🏓 Настольный теннис",
     "esports": "🎮 Киберспорт",
 }
-
 MAIN_MENU_TEXT = "Главное меню"
+
+# простая “русификация” самых частых лиг (можешь дополнять)
+LEAGUE_RU = {
+    "NHL": "НХЛ",
+    "KHL": "КХЛ",
+    "AHL": "АХЛ",
+    "VHL": "ВХЛ",
+    "MHL": "МХЛ",
+    "NCAA Women": "NCAA (жен.)",
+    "National League A": "Нац. лига A (Швейцария)",
+    "Swiss League": "Швейцарская лига",
+    "Continental Cup": "Континентальный кубок",
+}
+
+
+def _league_ru(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        return "Другое"
+    return LEAGUE_RU.get(s, s)
 
 
 # ============================================================
@@ -83,9 +95,7 @@ def _msk_today_iso() -> str:
 
 
 def _safe_markdown(text: str) -> str:
-    """
-    Минимальная экранизация под Markdown (ParseMode.MARKDOWN).
-    """
+    """Минимальная экранизация под ParseMode.MARKDOWN."""
     s = text or ""
     s = s.replace("\\", "\\\\")
     s = s.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
@@ -97,7 +107,7 @@ def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
     t = text or ""
     if len(t) <= limit:
         return t
-    return t[: limit - 50] + "\n\n…(сообщение обрезано)"
+    return t[: max(0, limit - 60)] + "\n\n…(сообщение обрезано)"
 
 
 def _short_key(s: str, n: int = 10) -> str:
@@ -105,32 +115,64 @@ def _short_key(s: str, n: int = 10) -> str:
     return h[:n]
 
 
-def _parse_time_msk(start_time: str) -> str:
-    """
-    Пытаемся вытащить HH:MM по МСК из ISO.
-    Если не получилось — возвращаем пусто.
-    """
-    if not start_time:
-        return ""
-    s = str(start_time).strip()
+def _fmt_status_ru(status: str) -> str:
+    s = (status or "").strip().lower()
     if not s:
         return ""
-    s2 = s.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(s2)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-        dt = dt.astimezone(MSK)
-        return dt.strftime("%H:%M")
-    except Exception:
-        return ""
+    m = {
+        "not_started": "не начался",
+        "notstarted": "не начался",
+        "scheduled": "по расписанию",
+        "live": "LIVE",
+        "inprogress": "LIVE",
+        "in_progress": "LIVE",
+        "finished": "завершён",
+        "ended": "завершён",
+        "canceled": "отменён",
+        "cancelled": "отменён",
+        "postponed": "перенесён",
+    }
+    return m.get(s, status)
+
+
+def _compact_match_btn_title(title: str, score: str, status: str) -> str:
+    """
+    Кнопка матча должна быть “понятной”:
+    - Названия команд
+    - Если LIVE/Finished — показываем счёт
+    - Если не начался — без счёта, можно добавить “⏳”
+    """
+    t = (title or "").strip() or "Матч"
+    sc = (score or "").strip()
+    st = (status or "").strip().lower()
+
+    is_live = st in {"live", "inprogress", "in_progress"}
+    is_done = st in {"finished", "ended"}
+    is_ns = st in {"notstarted", "not_started", "scheduled"}
+
+    prefix = ""
+    if is_live:
+        prefix = "🟢 "
+    elif is_done:
+        prefix = "✅ "
+    elif is_ns:
+        prefix = "⏳ "
+
+    suffix = ""
+    if (is_live or is_done) and sc:
+        suffix = f"  {sc}"
+
+    out = f"{prefix}{t}{suffix}".strip()
+    # Telegram inline button limit не документирован жёстко, но лучше резать
+    if len(out) > 58:
+        out = out[:57] + "…"
+    return out
 
 
 async def call_agent_local(user_id: int, text: str) -> str:
-    """
-    Вызываем локального агента (src/parsing.py).
-    """
+    """Вызываем локального агента (src/parsing.py)."""
     from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
+
     return await run_dialog_agent(user_id, text)
 
 
@@ -149,6 +191,11 @@ def kb_main_menu() -> InlineKeyboardMarkup:
 
 
 def kb_sports() -> InlineKeyboardMarkup:
+    """
+    Меню выбора спорта:
+    - доступные: SPORT:<slug>
+    - недоступные: SPORT_LOCKED:<slug> (или скрываем)
+    """
     rows: List[List[InlineKeyboardButton]] = []
 
     for slug in ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]:
@@ -165,6 +212,7 @@ def kb_sports() -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
+    """Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>"""
     mid = str(match_id).strip()
     rows = [
         [
@@ -177,46 +225,45 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("Фора", callback_data=f"UI:{mid}:pre:handicap"),
         ],
         [InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh")],
-        [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES_MENU")],
+        # ВАЖНО: назад должен возвращать в ПОСЛЕДНИЙ экран матчей, а не в выбор спорта
+        [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
         [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
-# Navigation: League -> Matches (paged)
+# Navigation: Country -> League -> Matches (paged)
 # ============================================================
 @dataclass
-class _LeagueNavState:
+class _NavState:
     sport: str
     today_iso: str
-    league_by_key: Dict[str, Dict[str, str]]          # lkey -> {"league":..,"country":..}
-    match_ids_by_league: Dict[str, List[str]]         # lkey -> [match_id..]
-    match_meta: Dict[str, Dict[str, str]]             # match_id -> meta
+    # ckey -> country
+    country_by_key: Dict[str, str]
+    # (ckey,lkey) -> league
+    league_by_key: Dict[Tuple[str, str], str]
+    # (ckey,lkey) -> [match_id,...]
+    match_ids_by_league: Dict[Tuple[str, str], List[str]]
+    # match_id -> meta
+    match_meta: Dict[str, Dict[str, str]]
+    # последний экран (для BACK:MATCHES)
+    last_screen: str  # "COUNTRIES" | "LEAGUES" | "MATCHES"
+    last_ckey: str = ""
+    last_lkey: str = ""
+    last_page: int = 1
 
 
-_NAV_BY_USER: Dict[int, _LeagueNavState] = {}
+_NAV_BY_USER: Dict[int, _NavState] = {}
+_PER_PAGE = 12
 
 
-def _norm_country(country: str) -> str:
-    c = (country or "").strip()
-    if not c or c.lower() in {"other", "unknown", "none", "null"}:
-        return "Other"
-    return c
-
-
-def _norm_league(league: str) -> str:
-    l = (league or "").strip()
-    if not l or l.lower() in {"other", "unknown", "none", "null"}:
-        return "Other"
-    return l
-
-
-def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _LeagueNavState:
+def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
     today_iso = _msk_today_iso()
 
-    league_by_key: Dict[str, Dict[str, str]] = {}
-    match_ids_by_league: Dict[str, List[str]] = {}
+    country_by_key: Dict[str, str] = {}
+    league_by_key: Dict[Tuple[str, str], str] = {}
+    match_ids_by_league: Dict[Tuple[str, str], List[str]] = {}
     match_meta: Dict[str, Dict[str, str]] = {}
 
     for m in matches:
@@ -224,13 +271,17 @@ def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -
         if not mid:
             continue
 
-        league = _norm_league(str(getattr(m, "league", "") or ""))
-        country = _norm_country(str(getattr(m, "country", "") or ""))
+        # country желательно отдавать из sport_api.py. если нет — Other.
+        country = (getattr(m, "country", "") or "").strip() or "Other"
+        league_raw = (getattr(m, "league", "") or "").strip() or "Other"
+        league = _league_ru(league_raw)
 
-        lkey = _short_key(f"{league}::{country}", n=10)
+        ckey = _short_key(country)
+        lkey = _short_key(f"{country}::{league}")
 
-        league_by_key[lkey] = {"league": league, "country": country}
-        match_ids_by_league.setdefault(lkey, []).append(mid)
+        country_by_key[ckey] = country
+        league_by_key[(ckey, lkey)] = league
+        match_ids_by_league.setdefault((ckey, lkey), []).append(mid)
 
         match_meta[mid] = {
             "title": str(getattr(m, "title", "") or f"Матч {mid}"),
@@ -241,166 +292,155 @@ def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -
             "start_time": str(getattr(m, "start_time", "") or ""),
         }
 
-    for lkey, ids in match_ids_by_league.items():
-        ids.sort(key=lambda _mid: (match_meta.get(_mid) or {}).get("start_time") or "")
+    # сортировка матчей по start_time (как строка ISO)
+    for key, ids in match_ids_by_league.items():
 
-    return _LeagueNavState(
+        def _sk(mid_: str) -> str:
+            return (match_meta.get(mid_) or {}).get("start_time") or ""
+
+        ids.sort(key=_sk)
+
+    return _NavState(
         sport=sport_slug,
         today_iso=today_iso,
+        country_by_key=country_by_key,
         league_by_key=league_by_key,
         match_ids_by_league=match_ids_by_league,
         match_meta=match_meta,
+        last_screen="COUNTRIES",
+        last_ckey="",
+        last_lkey="",
+        last_page=1,
     )
 
 
-def _league_label(league: str, country: str) -> str:
-    league = league or "Other"
-    country = country or "Other"
-    if league == "Other" and country == "Other":
-        return "Другие"
-    if country == "Other":
-        return league
-    if league == "Other":
-        return f"{country} • Другие"
-    return f"{league} • {country}"
-
-
-def _kb_leagues(user_id: int, sport_slug: str, page: int) -> InlineKeyboardMarkup:
-    st = _NAV_BY_USER.get(user_id)
-    rows: List[List[InlineKeyboardButton]] = []
-
-    if not st:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-        return InlineKeyboardMarkup(rows)
-
-    items: List[Tuple[str, int]] = []
-    for lkey, ids in st.match_ids_by_league.items():
-        info = st.league_by_key.get(lkey) or {"league": "Other", "country": "Other"}
-        league = info.get("league", "Other")
-        country = info.get("country", "Other")
-        weight = 1 if (league == "Other" and country == "Other") else 0
-        items.append((lkey, len(ids) * 1000 - weight))
-    items.sort(key=lambda x: x[1], reverse=True)
-
-    total = len(items)
-    pages = max(1, (total + LEAGUES_PER_PAGE - 1) // LEAGUES_PER_PAGE)
-    page = max(1, min(page, pages))
-
-    start = (page - 1) * LEAGUES_PER_PAGE
-    chunk = items[start : start + LEAGUES_PER_PAGE]
-
-    for lkey, score in chunk:
-        n = max(0, score // 1000)
-        info = st.league_by_key.get(lkey) or {"league": "Other", "country": "Other"}
-        label = _league_label(info.get("league", "Other"), info.get("country", "Other"))
-        btn = label if len(label) <= 42 else (label[:41] + "…")
-        rows.append([InlineKeyboardButton(f"{btn} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{lkey}:1")])
-
-    nav_row: List[InlineKeyboardButton] = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"NAV:LEAGUES_PAGE:{sport_slug}:{page-1}"))
-    nav_row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="NOOP"))
-    if page < pages:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"NAV:LEAGUES_PAGE:{sport_slug}:{page+1}"))
-    rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _kb_matches(user_id: int, sport_slug: str, lkey: str, page: int) -> InlineKeyboardMarkup:
+def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
     rows: List[List[InlineKeyboardButton]] = []
     if not st:
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
         return InlineKeyboardMarkup(rows)
 
-    ids = st.match_ids_by_league.get(lkey, [])
-    total = len(ids)
-    pages = max(1, (total + MATCHES_PER_PAGE - 1) // MATCHES_PER_PAGE)
-    page = max(1, min(page, pages))
+    counts: List[Tuple[str, int]] = []
+    for ckey in st.country_by_key.keys():
+        n = 0
+        for (ck, lk), ids in st.match_ids_by_league.items():
+            if ck == ckey:
+                n += len(ids)
+        counts.append((ckey, n))
+    counts.sort(key=lambda x: x[1], reverse=True)
 
-    start = (page - 1) * MATCHES_PER_PAGE
-    chunk = ids[start : start + MATCHES_PER_PAGE]
+    buf: List[InlineKeyboardButton] = []
+    for ckey, n in counts[:18]:
+        cname = st.country_by_key.get(ckey, "Other")
+        buf.append(InlineKeyboardButton(f"{cname} ({n})", callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}"))
+        if len(buf) == 2:
+            rows.append(buf)
+            buf = []
+    if buf:
+        rows.append(buf)
 
-    for mid in chunk:
-        meta = st.match_meta.get(mid) or {}
-        title = meta.get("title") or f"Матч {mid}"
-        status = (meta.get("status") or "").lower()
-        score = meta.get("score") or ""
-        tm = _parse_time_msk(meta.get("start_time") or "")
-
-        badge = ""
-        if status in {"live", "inprogress", "in_progress"}:
-            badge = "🟢 "
-        elif status in {"finished", "ended"}:
-            badge = "✅ "
-        elif status in {"canceled", "cancelled"}:
-            badge = "⛔ "
-
-        btn = title
-        if tm:
-            btn = f"{tm} {btn}"
-        if score:
-            btn = f"{btn} ({score})"
-        btn = f"{badge}{btn}".strip()
-
-        if len(btn) > 58:
-            btn = btn[:57] + "…"
-
-        rows.append([InlineKeyboardButton(btn, callback_data=f"MATCH:{sport_slug}:{mid}")])
-
-    nav_row: List[InlineKeyboardButton] = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"NAV:MATCHES_PAGE:{sport_slug}:{lkey}:{page-1}"))
-    nav_row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="NOOP"))
-    if page < pages:
-        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"NAV:MATCHES_PAGE:{sport_slug}:{lkey}:{page+1}"))
-    rows.append(nav_row)
-
-    rows.append([InlineKeyboardButton("⬅️ Лиги", callback_data=f"BACK:LEAGUES:{sport_slug}:1")])
+    rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
 
 
-def _text_leagues(user_id: int, sport_slug: str, page: int) -> str:
-    title = SPORT_LABELS.get(sport_slug, sport_slug)
+def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
-    today_iso = st.today_iso if st else _msk_today_iso()
+    rows: List[List[InlineKeyboardButton]] = []
+    if not st:
+        rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
+        return InlineKeyboardMarkup(rows)
 
-    total_leagues = len(st.match_ids_by_league) if st else 0
-    pages = max(1, (total_leagues + LEAGUES_PER_PAGE - 1) // LEAGUES_PER_PAGE)
+    items: List[Tuple[str, int]] = []
+    for (ck, lk), lname in st.league_by_key.items():
+        if ck != ckey:
+            continue
+        n = len(st.match_ids_by_league.get((ck, lk), []))
+        items.append((lk, n))
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    for lk, n in items[:30]:
+        lname = st.league_by_key.get((ckey, lk), "Другое")
+        rows.append([InlineKeyboardButton(f"{lname} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{ckey}:{lk}")])
+
+    rows.append([InlineKeyboardButton("⬅️ Страны", callback_data=f"BACK:COUNTRIES:{sport_slug}")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_matches(user_id: int, sport_slug: str, ckey: str, lkey: str, page: int) -> InlineKeyboardMarkup:
+    st = _NAV_BY_USER.get(user_id)
+    rows: List[List[InlineKeyboardButton]] = []
+    if not st:
+        rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
+        return InlineKeyboardMarkup(rows)
+
+    ids = st.match_ids_by_league.get((ckey, lkey), [])
+    total = len(ids)
+    pages = max(1, (total + _PER_PAGE - 1) // _PER_PAGE)
     page = max(1, min(page, pages))
 
-    return (
-        f"🏟 Матчи сегодня (по МСК) — {title}\n"
-        f"Дата: {today_iso}\n\n"
-        f"Выбери лигу:\n"
-        f"Страница {page}/{pages}"
-    )
+    start = (page - 1) * _PER_PAGE
+    chunk = ids[start : start + _PER_PAGE]
+
+    # кнопки матчей с командами + счётом/статусом
+    for mid in chunk:
+        meta = st.match_meta.get(mid) or {}
+        title = meta.get("title") or f"Матч {mid}"
+        score = meta.get("score") or ""
+        status = meta.get("status") or ""
+        btn_title = _compact_match_btn_title(title, score, status)
+        rows.append([InlineKeyboardButton(btn_title, callback_data=f"MATCH:{sport_slug}:{mid}")])
+
+    nav_row: List[InlineKeyboardButton] = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"NAV:PAGE:{sport_slug}:{ckey}:{lkey}:{page-1}"))
+    nav_row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="NOOP"))
+    if page < pages:
+        nav_row.append(InlineKeyboardButton("➡️", callback_data=f"NAV:PAGE:{sport_slug}:{ckey}:{lkey}:{page+1}"))
+    rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("⬅️ Лиги", callback_data=f"BACK:LEAGUES:{sport_slug}:{ckey}")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _text_matches(user_id: int, lkey: str, page: int) -> str:
+def _text_countries(user_id: int, sport_slug: str) -> str:
+    st = _NAV_BY_USER.get(user_id)
+    title = SPORT_LABELS.get(sport_slug, sport_slug)
+    if not st:
+        return f"🏟 Матчи сегодня (по МСК) — {title}\nДата: {_msk_today_iso()}\n\nНет данных."
+    return f"🏟 Матчи сегодня (по МСК) — {title}\nДата: {st.today_iso}\n\nВыбери страну:"
+
+
+def _text_leagues(user_id: int, ckey: str) -> str:
     st = _NAV_BY_USER.get(user_id)
     if not st:
         return "Нет данных."
+    country = st.country_by_key.get(ckey, "Other")
+    return f"🏳️ Страна: {country}\n\nВыбери лигу:"
 
-    info = st.league_by_key.get(lkey) or {"league": "Other", "country": "Other"}
-    label = _league_label(info.get("league", "Other"), info.get("country", "Other"))
 
-    ids = st.match_ids_by_league.get(lkey, [])
+def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
+    st = _NAV_BY_USER.get(user_id)
+    if not st:
+        return "Нет данных."
+    country = st.country_by_key.get(ckey, "Other")
+    league = st.league_by_key.get((ckey, lkey), "Другое")
+    ids = st.match_ids_by_league.get((ckey, lkey), [])
     total = len(ids)
-    pages = max(1, (total + MATCHES_PER_PAGE - 1) // MATCHES_PER_PAGE)
+    pages = max(1, (total + _PER_PAGE - 1) // _PER_PAGE)
     page = max(1, min(page, pages))
-
     return (
-        f"🏆 {label}\n"
+        f"🏳️ {country}\n"
+        f"🏆 {league}\n"
         f"Матчи: {total} • Страница {page}/{pages}\n\n"
         "Нажми матч ниже 👇"
     )
 
 
-async def _render_sport_leagues_root(user_id: int, sport_slug: str, page: int = 1) -> Tuple[str, InlineKeyboardMarkup]:
+async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
     from ..integrations.sport_api import SportAPIClient, SportAPIError
 
     today = datetime.now(MSK).date()
@@ -419,8 +459,9 @@ async def _render_sport_leagues_root(user_id: int, sport_slug: str, page: int = 
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")]])
         return text, kb
 
-    _NAV_BY_USER[user_id] = _build_league_nav_state(user_id, sport_slug, matches)
-    return _text_leagues(user_id, sport_slug, page), _kb_leagues(user_id, sport_slug, page)
+    st = _build_nav_state(user_id, sport_slug, matches)
+    _NAV_BY_USER[user_id] = st
+    return _text_countries(user_id, sport_slug), _kb_countries(user_id, sport_slug)
 
 
 # ============================================================
@@ -428,7 +469,8 @@ async def _render_sport_leagues_root(user_id: int, sport_slug: str, page: int = 
 # ============================================================
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "Привет! Выбери раздел 👇"
-    await update.message.reply_text(text, reply_markup=kb_main_menu())
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb_main_menu())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,10 +482,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
+    # быстрый вход в матчи
     if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
+    # остальное — в агента
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
@@ -451,6 +495,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_main_menu(),
     )
+
+
+def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    BACK:MATCHES из матча -> возвращаем пользователя туда, где он был:
+    - список стран / лиг / матчей (с текущими ключами и страницей)
+    """
+    st = _NAV_BY_USER.get(user_id)
+    if not st:
+        return "🏟 Выбери спорт:", kb_sports()
+
+    sport = st.sport
+    if st.last_screen == "COUNTRIES":
+        return _text_countries(user_id, sport), _kb_countries(user_id, sport)
+
+    if st.last_screen == "LEAGUES" and st.last_ckey:
+        return _text_leagues(user_id, st.last_ckey), _kb_leagues(user_id, sport, st.last_ckey)
+
+    if st.last_screen == "MATCHES" and st.last_ckey and st.last_lkey:
+        return (
+            _text_matches(user_id, st.last_ckey, st.last_lkey, st.last_page),
+            _kb_matches(user_id, sport, st.last_ckey, st.last_lkey, st.last_page),
+        )
+
+    return _text_countries(user_id, sport), _kb_countries(user_id, sport)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -478,6 +547,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data in {"NOOP", ""}:
         return
 
+    # BACK:MENU
     if data == "BACK:MENU":
         try:
             await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
@@ -485,6 +555,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
         return
 
+    # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
         text = "🏟 Выбери спорт:"
         try:
@@ -493,11 +564,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(text, reply_markup=kb_sports())
         return
 
+    # BACK:MATCHES => вернуться на последний экран матчей (а не в выбор спорта)
+    if data == "BACK:MATCHES":
+        text, kb = _nav_back_to_last(user_id)
+        txt = _truncate_tg(text)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # MENU shortcuts
     if data == "MENU:AI":
         reply = (
             "Как пользоваться:\n"
             "1) 🏟 Матчи сегодня\n"
-            "2) спорт → лига → матч\n"
+            "2) спорт → страна → лига → матч\n"
             "3) в матче нажми: PRE / LIVE / рынки\n\n"
             "Диагностика: llm ping, env, version, last_error"
         )
@@ -527,12 +609,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "MENU:PREMIUM":
         from ..ui_text import text_premium
+
         try:
             await q.edit_message_text(text_premium(), reply_markup=kb_main_menu())
         except Exception:
             await q.message.reply_text(text_premium(), reply_markup=kb_main_menu())
         return
 
+    # SPORT_LOCKED
     if data.startswith("SPORT_LOCKED:"):
         slug = data.split(":", 1)[1].strip().lower()
         title = SPORT_LABELS.get(slug, slug)
@@ -546,6 +630,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(txt, reply_markup=kb_sports())
         return
 
+    # SPORT
     if data.startswith("SPORT:"):
         sport_slug = data.split(":", 1)[1].strip().lower()
         if not _is_allowed_sport(sport_slug):
@@ -557,7 +642,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await q.message.reply_text(txt, reply_markup=kb_sports())
             return
 
-        text, kb = await _render_sport_leagues_root(user_id, sport_slug, page=1)
+        text, kb = await _render_sport_nav_root(user_id, sport_slug)
         txt = _truncate_tg(text)
         try:
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -565,23 +650,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    if data.startswith("NAV:LEAGUES_PAGE:"):
+    # NAV:COUNTRY
+    if data.startswith("NAV:COUNTRY:"):
         parts = data.split(":")
         if len(parts) < 4:
             return
         sport_slug = parts[2].strip().lower()
-        try:
-            page = int(parts[3].strip())
-        except Exception:
-            page = 1
+        ckey = parts[3].strip()
 
         st = _NAV_BY_USER.get(user_id)
-        if not st or st.sport != sport_slug:
-            text, kb = await _render_sport_leagues_root(user_id, sport_slug, page=page)
-        else:
-            text = _text_leagues(user_id, sport_slug, page=page)
-            kb = _kb_leagues(user_id, sport_slug, page=page)
+        if st:
+            st.last_screen = "LEAGUES"
+            st.last_ckey = ckey
+            st.last_lkey = ""
+            st.last_page = 1
 
+        text = _text_leagues(user_id, ckey)
+        kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
         try:
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -589,20 +674,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
+    # NAV:LEAGUE
     if data.startswith("NAV:LEAGUE:"):
         parts = data.split(":")
         if len(parts) < 5:
             return
         sport_slug = parts[2].strip().lower()
-        lkey = parts[3].strip()
-        try:
-            page = int(parts[4].strip())
-        except Exception:
-            page = 1
+        ckey = parts[3].strip()
+        lkey = parts[4].strip()
 
-        text = _text_matches(user_id, lkey, page=page)
-        kb = _kb_matches(user_id, sport_slug, lkey, page=page)
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "MATCHES"
+            st.last_ckey = ckey
+            st.last_lkey = lkey
+            st.last_page = 1
 
+        text = _text_matches(user_id, ckey, lkey, page=1)
+        kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=1)
         txt = _truncate_tg(text)
         try:
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -610,20 +699,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    if data.startswith("NAV:MATCHES_PAGE:"):
+    # NAV:PAGE
+    if data.startswith("NAV:PAGE:"):
         parts = data.split(":")
-        if len(parts) < 5:
+        if len(parts) < 6:
             return
         sport_slug = parts[2].strip().lower()
-        lkey = parts[3].strip()
+        ckey = parts[3].strip()
+        lkey = parts[4].strip()
         try:
-            page = int(parts[4].strip())
+            page = int(parts[5].strip())
         except Exception:
             page = 1
 
-        text = _text_matches(user_id, lkey, page=page)
-        kb = _kb_matches(user_id, sport_slug, lkey, page=page)
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "MATCHES"
+            st.last_ckey = ckey
+            st.last_lkey = lkey
+            st.last_page = page
 
+        text = _text_matches(user_id, ckey, lkey, page=page)
+        kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=page)
         txt = _truncate_tg(text)
         try:
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -631,19 +728,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
+    # BACK:COUNTRIES
+    if data.startswith("BACK:COUNTRIES:"):
+        parts = data.split(":")
+        sport_slug = parts[2].strip().lower() if len(parts) >= 3 else "ice-hockey"
+
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "COUNTRIES"
+            st.last_ckey = ""
+            st.last_lkey = ""
+            st.last_page = 1
+
+        text = _text_countries(user_id, sport_slug)
+        kb = _kb_countries(user_id, sport_slug)
+        txt = _truncate_tg(text)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # BACK:LEAGUES
     if data.startswith("BACK:LEAGUES:"):
         parts = data.split(":")
         if len(parts) < 4:
             return
         sport_slug = parts[2].strip().lower()
-        try:
-            page = int(parts[3].strip())
-        except Exception:
-            page = 1
+        ckey = parts[3].strip()
 
-        text = _text_leagues(user_id, sport_slug, page=page)
-        kb = _kb_leagues(user_id, sport_slug, page=page)
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "LEAGUES"
+            st.last_ckey = ckey
+            st.last_lkey = ""
+            st.last_page = 1
 
+        text = _text_leagues(user_id, ckey)
+        kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
         try:
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -651,7 +773,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
+    # MATCH open
     if data.startswith("MATCH:"):
+        # MATCH:<sport_slug>:<match_id>
         parts = data.split(":")
         if len(parts) >= 3:
             sport_slug = parts[1].strip().lower()
@@ -660,6 +784,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sport_slug = "ice-hockey"
             match_id = data.split(":", 1)[1].strip()
 
+        # прогреваем контекст для parsing.py
         try:
             await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
         except Exception:
@@ -682,7 +807,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
+    # UI actions
     if data.startswith("UI:"):
+        # UI:<match_id>:<pre|live>:<action>
         parts = data.split(":")
         if len(parts) < 4:
             try:
@@ -712,6 +839,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
+    # fallback
     try:
         await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
     except Exception:
@@ -733,6 +861,9 @@ def create_application() -> Application:
 
 
 async def telegram_startup() -> None:
+    """
+    Вызывай это из src/service.py на старте ИЛИ через mount_telegram_routes (startup event).
+    """
     global _telegram_app
     if _telegram_app is not None:
         return
@@ -772,6 +903,9 @@ async def telegram_shutdown() -> None:
 # ============================================================
 @router.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request) -> Dict[str, Any]:
+    """
+    FastAPI endpoint для Telegram webhook.
+    """
     if _telegram_app is None:
         await telegram_startup()
 
@@ -782,12 +916,28 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
 
 
 # ============================================================
-# Backward-compatible API for src/service.py
+# Mount helper (ВАЖНО: это ждёт src/service.py)
 # ============================================================
 def mount_telegram_routes(app: FastAPI) -> None:
     """
-    ВАЖНО: src/service.py импортирует mount_telegram_routes.
-    Поэтому оставляем эту функцию как контракт.
+    src/service.py ожидает: from .telegram_bot.app import mount_telegram_routes
+
+    Здесь:
+    - подключаем router
+    - добавляем lifecycle события (на всякий случай)
     """
     app.include_router(router)
-    logger.info("Telegram routes mounted.")
+
+    @app.on_event("startup")
+    async def _tg_startup_event() -> None:  # noqa: B902
+        try:
+            await telegram_startup()
+        except Exception:
+            logger.exception("Telegram startup failed")
+
+    @app.on_event("shutdown")
+    async def _tg_shutdown_event() -> None:  # noqa: B902
+        try:
+            await telegram_shutdown()
+        except Exception:
+            logger.exception("Telegram shutdown failed")
