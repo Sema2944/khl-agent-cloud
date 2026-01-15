@@ -263,9 +263,7 @@ def _build_index_for_user(user_id: int) -> Dict[str, Any]:
     # стабильный порядок внутри лиг: по start_time (если есть) иначе как пришло
     for c, leagues in idx.items():
         for lg, ids in leagues.items():
-            ids.sort(
-                key=lambda _id: str((cache.get(_id) or {}).get("start_time") or "")
-            )
+            ids.sort(key=lambda _id: str((cache.get(_id) or {}).get("start_time") or ""))
     return idx
 
 
@@ -377,7 +375,6 @@ def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
     elif "/" in tail:
         parts = [p.strip() for p in tail.split("/")]
     else:
-        # если без разделителя — не принимаем
         return None
 
     if len(parts) < 2:
@@ -398,6 +395,7 @@ def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
 # API: матчи / матч / oddsBase
 # -----------------------------
 async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
+    # ВАЖНО: импорт внутри функции (избежать циклов)
     from .integrations.sport_api import SportAPIClient, SportAPIError
 
     sport_slug = (sport_slug or "").strip().lower()
@@ -441,20 +439,18 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     # кешируем матчи (чтобы потом по MATCH:<id> понять sport/league/title)
     _MATCH_CACHE_BY_USER[user_id] = {}
     for m in matches:
-        # ВАЖНО: страна может отсутствовать в данных => будет Other
-        # Если позже добавишь country в MatchItem — оно автоматически начнёт группировать
         _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
-            "sport": m.sport_slug,
-            "title": m.title,
-            "league": m.league,
-            "status": m.status,
-            "start_time": m.start_time,
-            "score": m.score,
-            "odds_base": m.odds_base,
-            "country": "",  # если в MatchItem появится m.country — поставь тут: m.country
+            "sport": getattr(m, "sport_slug", sport_slug),
+            "title": getattr(m, "title", f"Матч {m.id}"),
+            "league": getattr(m, "league", ""),
+            "status": getattr(m, "status", ""),
+            "start_time": getattr(m, "start_time", ""),
+            "score": getattr(m, "score", ""),
+            "odds_base": getattr(m, "odds_base", None),
+            # если позже добавишь country в MatchItem — оно начнёт группировать автоматически
+            "country": getattr(m, "country", "") if hasattr(m, "country") else "",
         }
 
-    # по умолчанию: показываем страны (короткий экран, не ломает телеграм-лимит)
     _ACTIVE_COUNTRY_BY_USER[user_id] = ""
     _ACTIVE_LEAGUE_BY_USER[user_id] = ""
     _ACTIVE_PAGE_BY_USER[user_id] = 1
@@ -514,12 +510,6 @@ def _format_match_hub_text(
 
 
 async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
-    """
-    Возвращает: sport, title, league, status, start_time, score, odds_base
-    1) пробуем кеш пользователя
-    2) если нет — пробуем последний выбранный sport -> match_details
-    3) иначе минимум
-    """
     match_id = str(match_id).strip()
     cached = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(match_id)
     if cached:
@@ -534,13 +524,14 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
             d = await api.match_details(sport, match_id)
             return {
                 "id": match_id,
-                "sport": d.sport_slug,
-                "title": d.title,
-                "league": d.league,
-                "status": d.status,
-                "start_time": d.start_time,
-                "score": d.score,
-                "odds_base": d.odds_base,
+                "sport": getattr(d, "sport_slug", sport),
+                "title": getattr(d, "title", f"Матч {match_id}"),
+                "league": getattr(d, "league", ""),
+                "status": getattr(d, "status", ""),
+                "start_time": getattr(d, "start_time", ""),
+                "score": getattr(d, "score", ""),
+                "odds_base": getattr(d, "odds_base", None),
+                "country": getattr(d, "country", "") if hasattr(d, "country") else "",
             }
         except Exception:
             pass
@@ -554,15 +545,11 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
         "start_time": "",
         "score": "",
         "odds_base": None,
+        "country": "",
     }
 
 
 def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    """
-    Берём oddsBase из match_details (если есть).
-    PRE: можно числа
-    LIVE: минимизируем числа (не показываем odds), оставляем названия и change
-    """
     ob = match_meta.get("odds_base")
     if not isinstance(ob, dict):
         return {"odds": {"present": False}}
@@ -571,10 +558,13 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
     if not isinstance(markets, list):
         return {"odds": {"present": True, "markets": []}}
 
+    # ЖЁСТКО режем, чтобы LLM не таймаутил
+    max_markets = 4 if (mode or "").lower() == "live" else 5
+    max_choices = 4 if (mode or "").lower() == "live" else 5
+
     if (mode or "").lower() != "live":
-        # PRE — отдаём как есть, но ограничим размер
         slim: List[Dict[str, Any]] = []
-        for m in markets[:8]:
+        for m in markets[:max_markets]:
             if not isinstance(m, dict):
                 continue
             mm = {"name": m.get("name"), "marketId": m.get("marketId")}
@@ -586,15 +576,14 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
                         "odd": c.get("odd"),
                         "change": c.get("change"),
                     }
-                    for c in ch[:8]
+                    for c in ch[:max_choices]
                     if isinstance(c, dict)
                 ]
             slim.append(mm)
         return {"odds": {"present": True, "markets": slim}}
 
-    # LIVE — без odd
     slim_live: List[Dict[str, Any]] = []
-    for m in markets[:8]:
+    for m in markets[:max_markets]:
         if not isinstance(m, dict):
             continue
         mm = {"name": m.get("name")}
@@ -605,7 +594,7 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
                     "name": c.get("name"),
                     "change": c.get("change"),
                 }
-                for c in ch[:8]
+                for c in ch[:max_choices]
                 if isinstance(c, dict)
             ]
         slim_live.append(mm)
@@ -742,7 +731,6 @@ def _hash_cache_key(match_id: str, mode: str, action: str, cur_snap: Dict[str, A
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     match_meta = await _get_match_context(user_id, match_id)
 
-    # снапшот: статус/счёт/oddsBase
     cur_snap = {
         "status": match_meta.get("status"),
         "start_time": match_meta.get("start_time"),
@@ -874,7 +862,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-14 v10 (countries/leagues navigation + telegram truncation)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-15 v10 (countries/leagues navigation + LLM snapshot slim)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -911,7 +899,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # admin strategy
     if norm.startswith("админ"):
-        _, msg = _try_admin_update_strategy(user_id, text_raw)
+        ok, msg = _try_admin_update_strategy(user_id, text_raw)
         return _md_safe_text(msg)
 
     # strategy
@@ -921,7 +909,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # --------- NAV: страна / лига ----------
     ctry = _parse_nav_country(text_raw)
     if ctry:
-        # нормализуем по существующим ключам (если отличаются регистром)
         idx = _build_index_for_user(user_id)
         hit = None
         for k in idx.keys():
@@ -937,7 +924,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         country, league, page = lg
         idx = _build_index_for_user(user_id)
 
-        # нормализуем по ключам
         c_hit = None
         for k in idx.keys():
             if k.lower() == country.lower():
