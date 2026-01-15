@@ -37,10 +37,18 @@ if not LLM_PROMPT_PREFIX:
         "Пиши коротко, списками."
     )
 
+# -----------------------------
+# TTL policy for LLM caching
+# -----------------------------
+TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # 15 минут
+TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())     # 25 секунд
+
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
 _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
-_LIVE_SNAPSHOT_BY_USER_MATCH: Dict[str, Dict[str, Any]] = {}
+
+# LIVE snapshot should be GLOBAL PER MATCH (not per user) — иначе кеш развалится
+_LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
 
 # кеш матчей "сегодня" по пользователю: match_id -> meta
 _MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -61,10 +69,6 @@ API_SPORTS_LABELS = {
 
 # чтобы Telegram не ругался Message is too long (ограничение ~4096)
 TELEGRAM_MAX_CHARS = 3800
-
-
-def _snap_key(user_id: int, match_id: str) -> str:
-    return f"{user_id}:{match_id}"
 
 
 def _now_ts() -> int:
@@ -369,7 +373,6 @@ def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
         return None
 
     tail = m.group(2).strip()
-    # split by | or /
     if "|" in tail:
         parts = [p.strip() for p in tail.split("|")]
     elif "/" in tail:
@@ -395,7 +398,6 @@ def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
 # API: матчи / матч / oddsBase
 # -----------------------------
 async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
-    # ВАЖНО: импорт внутри функции (избежать циклов)
     from .integrations.sport_api import SportAPIClient, SportAPIError
 
     sport_slug = (sport_slug or "").strip().lower()
@@ -436,7 +438,6 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             )
         )
 
-    # кешируем матчи (чтобы потом по MATCH:<id> понять sport/league/title)
     _MATCH_CACHE_BY_USER[user_id] = {}
     for m in matches:
         _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
@@ -447,7 +448,6 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "start_time": getattr(m, "start_time", ""),
             "score": getattr(m, "score", ""),
             "odds_base": getattr(m, "odds_base", None),
-            # если позже добавишь country в MatchItem — оно начнёт группировать автоматически
             "country": getattr(m, "country", "") if hasattr(m, "country") else "",
         }
 
@@ -640,6 +640,9 @@ def _build_ui_prompt(
         "",
         f"Текущий снапшот (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
     ]
+
+    # prev_snap добавляем в prompt (полезно для логики движения),
+    # но ВАЖНО: cache_key НЕ должен зависеть от prev_snap
     if prev_snap:
         base.append(f"Предыдущий снапшот (JSON): {json.dumps(prev_snap, ensure_ascii=False)}")
 
@@ -722,14 +725,31 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     return "\n".join(lines)
 
 
-def _hash_cache_key(match_id: str, mode: str, action: str, cur_snap: Dict[str, Any], prev_snap: Optional[Dict[str, Any]]) -> str:
-    payload = {"m": match_id, "mode": mode, "action": action, "cur": cur_snap, "prev": prev_snap}
+def _hash_cache_key(match_id: str, sport_slug: str, mode: str, action: str, cur_snap: Dict[str, Any]) -> str:
+    """
+    КЛЮЧЕВОЕ:
+    - cache_key НЕ должен зависеть от user_id
+    - cache_key НЕ должен зависеть от prev_snap (иначе 100 пользователей => 100 ключей)
+    - cache_key зависит от текущего снапшота (если данные меняются — меняется hash)
+    """
+    payload = {
+        "m": str(match_id),
+        "sport": str(sport_slug or ""),
+        "mode": str(mode or ""),
+        "action": str(action or ""),
+        "cur": cur_snap,
+    }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     match_meta = await _get_match_context(user_id, match_id)
+
+    sport_slug = str(match_meta.get("sport") or "").strip().lower()
+    match_id = str(match_meta.get("id") or match_id).strip()
+    mode = (mode or "pre").strip().lower()
+    action = (action or "overview").strip().lower()
 
     cur_snap = {
         "status": match_meta.get("status"),
@@ -739,27 +759,30 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     }
 
     prev_snap = None
-    force_refresh = False
 
-    if (mode or "").lower() == "live":
-        k = _snap_key(user_id, match_id)
-        prev_snap = (_LIVE_SNAPSHOT_BY_USER_MATCH.get(k) or {}).get("snap")
+    if mode == "live":
+        # prev_snap общий на матч
+        prev_snap = _LIVE_SNAPSHOT_BY_MATCH.get(match_id)
 
+        # refresh: обновляем глобальный снапшот и переводим в overview
+        # ВАЖНО: не добавляем timestamp в cache_key — иначе кеш ломается
         if action == "refresh":
-            _LIVE_SNAPSHOT_BY_USER_MATCH[k] = {"ts": _now_ts(), "snap": cur_snap}
+            _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             action = "overview"
-            force_refresh = True
 
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
-    h = _hash_cache_key(match_id, mode, action, cur_snap, prev_snap)
-    suffix = f":r{_now_ts()}" if force_refresh else ""
-    cache_key = f"v10:ui:{match_id}:{mode}:{action}:{h}{suffix}"
 
-    schema = "ui_live" if (mode or "").lower() == "live" else "ui_pre"
+    h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
+    cache_key = f"v11:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+
+    schema = "ui_live" if mode == "live" else "ui_pre"
+    ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
+
     analysis, meta = await analyze_with_llm_cached(
         prompt,
         cache_key=cache_key,
         schema=schema,
+        ttl_s=int(ttl_s),
         user_id=user_id,
     )
 
@@ -816,6 +839,8 @@ def _format_env_status() -> str:
         "LLM_ENABLED",
         "LLM_PROVIDER",
         "OPENAI_MODEL",
+        "LLM_CACHE_TTL_S",
+        "LLM_CACHE_TTL_LIVE_S",
     ]
     lines = ["🔧 ENV status"]
     for k in keys:
@@ -831,7 +856,7 @@ async def _llm_ping(user_id: int) -> str:
     prompt = "Верни корректный JSON по ui_pre схеме. Все ключи непустые."
     analysis, meta = await analyze_with_llm_cached(
         prompt,
-        cache_key=f"diag:ping:{int(time.time())}",
+        cache_key="diag:ping:ui_pre",
         schema="ui_pre",
         ttl_s=0,
         user_id=user_id,
@@ -862,7 +887,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-15 v10 (countries/leagues navigation + LLM snapshot slim)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-15 v11 (global cache_key + TTL pre/live + global live snapshot)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
