@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, FastAPI, Request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -66,6 +66,7 @@ MAIN_MENU_TEXT = "Главное меню"
 # Telegram Application (создаётся в telegram_startup)
 # ============================================================
 _telegram_app: Optional[Application] = None
+
 router = APIRouter()
 
 
@@ -114,12 +115,10 @@ def _parse_time_msk(start_time: str) -> str:
     s = str(start_time).strip()
     if not s:
         return ""
-    # частый случай: ...Z
     s2 = s.replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(s2)
         if dt.tzinfo is None:
-            # если пришло без TZ — считаем что UTC
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         dt = dt.astimezone(MSK)
         return dt.strftime("%H:%M")
@@ -150,11 +149,6 @@ def kb_main_menu() -> InlineKeyboardMarkup:
 
 
 def kb_sports() -> InlineKeyboardMarkup:
-    """
-    Меню выбора спорта:
-    - доступные: SPORT:<slug>
-    - недоступные: SPORT_LOCKED:<slug> (или скрываем)
-    """
     rows: List[List[InlineKeyboardButton]] = []
 
     for slug in ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]:
@@ -171,9 +165,6 @@ def kb_sports() -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>
-    """
     mid = str(match_id).strip()
     rows = [
         [
@@ -199,9 +190,9 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
 class _LeagueNavState:
     sport: str
     today_iso: str
-    league_by_key: Dict[str, Dict[str, str]]  # lkey -> {"league":..,"country":..}
-    match_ids_by_league: Dict[str, List[str]]  # lkey -> [match_id..]
-    match_meta: Dict[str, Dict[str, str]]  # match_id -> meta
+    league_by_key: Dict[str, Dict[str, str]]          # lkey -> {"league":..,"country":..}
+    match_ids_by_league: Dict[str, List[str]]         # lkey -> [match_id..]
+    match_meta: Dict[str, Dict[str, str]]             # match_id -> meta
 
 
 _NAV_BY_USER: Dict[int, _LeagueNavState] = {}
@@ -236,7 +227,6 @@ def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -
         league = _norm_league(str(getattr(m, "league", "") or ""))
         country = _norm_country(str(getattr(m, "country", "") or ""))
 
-        # ключ лиги — устойчивый и короткий
         lkey = _short_key(f"{league}::{country}", n=10)
 
         league_by_key[lkey] = {"league": league, "country": country}
@@ -251,7 +241,6 @@ def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -
             "start_time": str(getattr(m, "start_time", "") or ""),
         }
 
-    # сортировка матчей внутри лиги — по времени (строкой ISO)
     for lkey, ids in match_ids_by_league.items():
         ids.sort(key=lambda _mid: (match_meta.get(_mid) or {}).get("start_time") or "")
 
@@ -265,9 +254,6 @@ def _build_league_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -
 
 
 def _league_label(league: str, country: str) -> str:
-    """
-    Как показываем лигу пользователю.
-    """
     league = league or "Other"
     country = country or "Other"
     if league == "Other" and country == "Other":
@@ -292,7 +278,6 @@ def _kb_leagues(user_id: int, sport_slug: str, page: int) -> InlineKeyboardMarku
         info = st.league_by_key.get(lkey) or {"league": "Other", "country": "Other"}
         league = info.get("league", "Other")
         country = info.get("country", "Other")
-        # "Other/Other" уводим вниз
         weight = 1 if (league == "Other" and country == "Other") else 0
         items.append((lkey, len(ids) * 1000 - weight))
     items.sort(key=lambda x: x[1], reverse=True)
@@ -308,10 +293,7 @@ def _kb_leagues(user_id: int, sport_slug: str, page: int) -> InlineKeyboardMarku
         n = max(0, score // 1000)
         info = st.league_by_key.get(lkey) or {"league": "Other", "country": "Other"}
         label = _league_label(info.get("league", "Other"), info.get("country", "Other"))
-        # коротко
-        btn = label
-        if len(btn) > 42:
-            btn = btn[:41] + "…"
+        btn = label if len(label) <= 42 else (label[:41] + "…")
         rows.append([InlineKeyboardButton(f"{btn} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{lkey}:1")])
 
     nav_row: List[InlineKeyboardButton] = []
@@ -356,7 +338,6 @@ def _kb_matches(user_id: int, sport_slug: str, lkey: str, page: int) -> InlineKe
         elif status in {"canceled", "cancelled"}:
             badge = "⛔ "
 
-        # строка кнопки: "19:45 🟢 Team — Team (0:0)"
         btn = title
         if tm:
             btn = f"{tm} {btn}"
@@ -459,12 +440,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-    # быстрый вход в матчи
     if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # остальное — в агента
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
@@ -499,7 +478,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data in {"NOOP", ""}:
         return
 
-    # BACK
     if data == "BACK:MENU":
         try:
             await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
@@ -515,7 +493,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(text, reply_markup=kb_sports())
         return
 
-    # MENU shortcuts
     if data == "MENU:AI":
         reply = (
             "Как пользоваться:\n"
@@ -550,14 +527,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "MENU:PREMIUM":
         from ..ui_text import text_premium
-
         try:
             await q.edit_message_text(text_premium(), reply_markup=kb_main_menu())
         except Exception:
             await q.message.reply_text(text_premium(), reply_markup=kb_main_menu())
         return
 
-    # SPORT locked
     if data.startswith("SPORT_LOCKED:"):
         slug = data.split(":", 1)[1].strip().lower()
         title = SPORT_LABELS.get(slug, slug)
@@ -571,7 +546,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(txt, reply_markup=kb_sports())
         return
 
-    # SPORT selection (только разрешённые)
     if data.startswith("SPORT:"):
         sport_slug = data.split(":", 1)[1].strip().lower()
         if not _is_allowed_sport(sport_slug):
@@ -591,9 +565,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # NAV: leagues pages
     if data.startswith("NAV:LEAGUES_PAGE:"):
-        # NAV:LEAGUES_PAGE:<sport>:<page>
         parts = data.split(":")
         if len(parts) < 4:
             return
@@ -604,7 +576,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             page = 1
 
         st = _NAV_BY_USER.get(user_id)
-        # если стейта нет — перезагрузим
         if not st or st.sport != sport_slug:
             text, kb = await _render_sport_leagues_root(user_id, sport_slug, page=page)
         else:
@@ -618,9 +589,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # NAV: open league (page 1 default)
     if data.startswith("NAV:LEAGUE:"):
-        # NAV:LEAGUE:<sport>:<lkey>:<page>
         parts = data.split(":")
         if len(parts) < 5:
             return
@@ -641,9 +610,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # NAV: matches page
     if data.startswith("NAV:MATCHES_PAGE:"):
-        # NAV:MATCHES_PAGE:<sport>:<lkey>:<page>
         parts = data.split(":")
         if len(parts) < 5:
             return
@@ -664,9 +631,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # BACK to leagues
     if data.startswith("BACK:LEAGUES:"):
-        # BACK:LEAGUES:<sport>:<page>
         parts = data.split(":")
         if len(parts) < 4:
             return
@@ -686,9 +651,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # MATCH open
     if data.startswith("MATCH:"):
-        # MATCH:<sport_slug>:<match_id>
         parts = data.split(":")
         if len(parts) >= 3:
             sport_slug = parts[1].strip().lower()
@@ -697,7 +660,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sport_slug = "ice-hockey"
             match_id = data.split(":", 1)[1].strip()
 
-        # прогреваем контекст для parsing.py (кеш матчей на день)
         try:
             await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
         except Exception:
@@ -720,9 +682,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
-    # UI actions
     if data.startswith("UI:"):
-        # UI:<match_id>:<pre|live>:<action>
         parts = data.split(":")
         if len(parts) < 4:
             try:
@@ -752,7 +712,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
-    # fallback
     try:
         await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
     except Exception:
@@ -774,9 +733,6 @@ def create_application() -> Application:
 
 
 async def telegram_startup() -> None:
-    """
-    Вызывай это из src/service.py на старте.
-    """
     global _telegram_app
     if _telegram_app is not None:
         return
@@ -816,9 +772,6 @@ async def telegram_shutdown() -> None:
 # ============================================================
 @router.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    """
-    FastAPI endpoint для Telegram webhook.
-    """
     if _telegram_app is None:
         await telegram_startup()
 
@@ -826,3 +779,15 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
     update = Update.de_json(data, _telegram_app.bot)  # type: ignore[arg-type]
     await _telegram_app.process_update(update)  # type: ignore[union-attr]
     return {"ok": True}
+
+
+# ============================================================
+# Backward-compatible API for src/service.py
+# ============================================================
+def mount_telegram_routes(app: FastAPI) -> None:
+    """
+    ВАЖНО: src/service.py импортирует mount_telegram_routes.
+    Поэтому оставляем эту функцию как контракт.
+    """
+    app.include_router(router)
+    logger.info("Telegram routes mounted.")
