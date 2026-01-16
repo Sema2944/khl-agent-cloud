@@ -40,8 +40,8 @@ if not LLM_PROMPT_PREFIX:
 # -----------------------------
 # TTL policy for LLM caching
 # -----------------------------
-TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # 15 минут
-TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())     # 25 секунд
+TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())  # 15 минут
+TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())  # 25 секунд
 
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
 _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
@@ -114,6 +114,57 @@ def db_session() -> Session:
             gen.close()
         except Exception:
             pass
+
+
+# -----------------------------
+# Hockey context helpers (KHL heuristic)
+# -----------------------------
+def _extract_teams_from_title(title: str) -> Tuple[str, str]:
+    """
+    Пытаемся вытащить команды из строки матча.
+    Поддерживаем: "СКА — ЦСКА", "СКА - ЦСКА", "СКА vs ЦСКА"
+    """
+    t = (title or "").strip()
+    if not t:
+        return "", ""
+    for sep in (" — ", " - ", " – ", " vs ", " VS ", " v ", " V "):
+        if sep in t:
+            a, b = t.split(sep, 1)
+            return a.strip(), b.strip()
+    return "", ""
+
+
+def _league_key_from_text(league_name: str) -> str:
+    s = (league_name or "").upper()
+    if "КХЛ" in s or "KHL" in s:
+        return "KHL"
+    if "NHL" in s:
+        return "NHL"
+    return "OTHER"
+
+
+def _hockey_context_lines(match_meta: Dict[str, Any]) -> List[str]:
+    """
+    Возвращает список строк контекста (эвристика).
+    Без падений: если модуль не найден/ошибка — вернём пусто.
+    """
+    try:
+        from .hockey_logic import build_match_context_notes
+    except Exception:
+        return []
+
+    title = str(match_meta.get("title") or "")
+    league = str(match_meta.get("league") or "")
+    t1, t2 = _extract_teams_from_title(title)
+    if not t1 or not t2:
+        return []
+
+    league_key = _league_key_from_text(league)
+    try:
+        notes = build_match_context_notes(t1, t2, league=league_key)  # type: ignore[arg-type]
+        return [x for x in notes if str(x).strip()]
+    except Exception:
+        return []
 
 
 # -----------------------------
@@ -628,7 +679,8 @@ def _build_ui_prompt(
         "- НЕ давай прогнозов и рекомендаций по ставкам",
         "- НЕ используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%",
         "- В LIVE не показывай коэффициенты и числа — только направление и логику",
-        "- Ответ короткий. Списками.",
+        "- Пиши языком трейдинга линии: импульс, откат, перекладка риска, дисбаланс, подтверждение, ликвидность.",
+        "- Ответ структурированный, но без призывов к действию.",
         "",
         f"Матч: {title}" + (f" ({league})" if league else ""),
         f"sport: {sport}",
@@ -637,6 +689,18 @@ def _build_ui_prompt(
         f"match_id: {match_id}",
         f"mode: {mode}",
         f"action: {action}",
+    ]
+
+    # турнирный контекст (эвристика)
+    extra_ctx = match_meta.get("tournament_notes") or []
+    if isinstance(extra_ctx, list) and extra_ctx:
+        base += [
+            "",
+            "Турнирный контекст (эвристика, не прогноз):",
+            *[f"- {x}" for x in extra_ctx[:10]],
+        ]
+
+    base += [
         "",
         f"Текущий снапшот (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
     ]
@@ -649,8 +713,18 @@ def _build_ui_prompt(
     if mode == "live":
         base += [
             "",
-            "Верни СТРОГО JSON (без markdown) с полями:",
-            '{"title": "...", "context": ["..."], "markets": [{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
+            "Верни СТРОГО JSON (без markdown) по схеме:",
+            '{"title":"...","context":["..."],"markets":[{"name":"...","direction":"up|down|flat|unknown","logic":"..."}],"risks":["..."],"disclaimer":"..."}',
+            "",
+            "Требования к контенту (LIVE):",
+            "- Никаких рекомендаций, прогнозов и призывов к действию.",
+            "- В markets обязательно добавь блоки:",
+            '  1) name="Факторы в пользу фаворита" (logic: 4–6 буллетов, без призывов)',
+            '  2) name="Факторы против фаворита" (logic: 4–6 буллетов)',
+            '  3) name="Турнирный контекст" (logic: 3–6 буллетов, используй переданный контекст)',
+            '  4) name="Чек-лист решения" (logic: 4–6 буллетов)',
+            "- direction ставь осмысленно, но если данных недостаточно — unknown.",
+            "- В LIVE не показывай числа/коэффициенты, только направление/логика.",
         ]
     else:
         base += [
@@ -672,7 +746,9 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
             "ℹ️ Аналитический материал. Не является рекомендацией."
         )
 
-    title = str(analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")).strip()
+    title = str(
+        analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")
+    ).strip()
     lines: list[str] = [title]
 
     if analysis.get("summary"):
@@ -681,28 +757,28 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
     ctx = analysis.get("context") or []
     if ctx:
         lines.append("")
-        for x in ctx[:6]:
+        for x in ctx[:8]:
             lines.append(f"• {x}")
 
     kf = analysis.get("key_factors") or []
     if kf:
         lines.append("")
         lines.append("Факторы")
-        for x in kf[:6]:
+        for x in kf[:8]:
             lines.append(f"• {x}")
 
     ll = analysis.get("line_logic") or []
     if ll:
         lines.append("")
         lines.append("Логика линии")
-        for x in ll[:6]:
+        for x in ll[:8]:
             lines.append(f"• {x}")
 
     mk = analysis.get("markets") or []
     if mk:
         lines.append("")
         lines.append("Ключевые рынки")
-        for item in mk[:4]:
+        for item in mk[:6]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "Market"))
@@ -710,16 +786,19 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
             logic = str(item.get("logic", "")).strip()
             lines.append(f"— {name}: {direction}")
             if logic:
+                # допускаем, что LLM вернёт мульти-буллеты одной строкой
                 lines.append(f"  {logic}")
 
     risks = analysis.get("risks") or []
     if risks:
         lines.append("")
         lines.append("Риски")
-        for r in risks[:6]:
+        for r in risks[:8]:
             lines.append(f"• {r}")
 
-    disclaimer = str(analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией.").strip()
+    disclaimer = str(
+        analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией."
+    ).strip()
     lines.append("")
     lines.append(disclaimer)
     return "\n".join(lines)
@@ -745,6 +824,10 @@ def _hash_cache_key(match_id: str, sport_slug: str, mode: str, action: str, cur_
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     match_meta = await _get_match_context(user_id, match_id)
+
+    # inject tournament context (safe, no crashes)
+    match_meta = dict(match_meta)
+    match_meta["tournament_notes"] = _hockey_context_lines(match_meta)
 
     sport_slug = str(match_meta.get("sport") or "").strip().lower()
     match_id = str(match_meta.get("id") or match_id).strip()
@@ -773,7 +856,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
 
     h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
-    cache_key = f"v11:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+    cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
     schema = "ui_live" if mode == "live" else "ui_pre"
     ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
@@ -887,7 +970,9 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-15 v11 (global cache_key + TTL pre/live + global live snapshot)")
+        return _md_safe_text(
+            "✅ parsing.py version: 2026-01-16 v12 (TTL pre/live + global cache_key + global live snapshot + hockey context)"
+        )
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
