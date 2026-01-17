@@ -117,57 +117,6 @@ def db_session() -> Session:
 
 
 # -----------------------------
-# Hockey context helpers (KHL heuristic)
-# -----------------------------
-def _extract_teams_from_title(title: str) -> Tuple[str, str]:
-    """
-    Пытаемся вытащить команды из строки матча.
-    Поддерживаем: "СКА — ЦСКА", "СКА - ЦСКА", "СКА vs ЦСКА"
-    """
-    t = (title or "").strip()
-    if not t:
-        return "", ""
-    for sep in (" — ", " - ", " – ", " vs ", " VS ", " v ", " V "):
-        if sep in t:
-            a, b = t.split(sep, 1)
-            return a.strip(), b.strip()
-    return "", ""
-
-
-def _league_key_from_text(league_name: str) -> str:
-    s = (league_name or "").upper()
-    if "КХЛ" in s or "KHL" in s:
-        return "KHL"
-    if "NHL" in s:
-        return "NHL"
-    return "OTHER"
-
-
-def _hockey_context_lines(match_meta: Dict[str, Any]) -> List[str]:
-    """
-    Возвращает список строк контекста (эвристика).
-    Без падений: если модуль не найден/ошибка — вернём пусто.
-    """
-    try:
-        from .hockey_logic import build_match_context_notes
-    except Exception:
-        return []
-
-    title = str(match_meta.get("title") or "")
-    league = str(match_meta.get("league") or "")
-    t1, t2 = _extract_teams_from_title(title)
-    if not t1 or not t2:
-        return []
-
-    league_key = _league_key_from_text(league)
-    try:
-        notes = build_match_context_notes(t1, t2, league=league_key)  # type: ignore[arg-type]
-        return [x for x in notes if str(x).strip()]
-    except Exception:
-        return []
-
-
-# -----------------------------
 # Профиль / банк
 # -----------------------------
 def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str:
@@ -679,8 +628,7 @@ def _build_ui_prompt(
         "- НЕ давай прогнозов и рекомендаций по ставкам",
         "- НЕ используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%",
         "- В LIVE не показывай коэффициенты и числа — только направление и логику",
-        "- Пиши языком трейдинга линии: импульс, откат, перекладка риска, дисбаланс, подтверждение, ликвидность.",
-        "- Ответ структурированный, но без призывов к действию.",
+        "- Ответ структурированный. Без markdown. Коротко, но информативно.",
         "",
         f"Матч: {title}" + (f" ({league})" if league else ""),
         f"sport: {sport}",
@@ -689,18 +637,6 @@ def _build_ui_prompt(
         f"match_id: {match_id}",
         f"mode: {mode}",
         f"action: {action}",
-    ]
-
-    # турнирный контекст (эвристика)
-    extra_ctx = match_meta.get("tournament_notes") or []
-    if isinstance(extra_ctx, list) and extra_ctx:
-        base += [
-            "",
-            "Турнирный контекст (эвристика, не прогноз):",
-            *[f"- {x}" for x in extra_ctx[:10]],
-        ]
-
-    base += [
         "",
         f"Текущий снапшот (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
     ]
@@ -716,21 +652,35 @@ def _build_ui_prompt(
             "Верни СТРОГО JSON (без markdown) по схеме:",
             '{"title":"...","context":["..."],"markets":[{"name":"...","direction":"up|down|flat|unknown","logic":"..."}],"risks":["..."],"disclaimer":"..."}',
             "",
-            "Требования к контенту (LIVE):",
+            "Ограничения (LIVE):",
             "- Никаких рекомендаций, прогнозов и призывов к действию.",
-            "- В markets обязательно добавь блоки:",
-            '  1) name="Факторы в пользу фаворита" (logic: 4–6 буллетов, без призывов)',
-            '  2) name="Факторы против фаворита" (logic: 4–6 буллетов)',
-            '  3) name="Турнирный контекст" (logic: 3–6 буллетов, используй переданный контекст)',
-            '  4) name="Чек-лист решения" (logic: 4–6 буллетов)',
-            "- direction ставь осмысленно, но если данных недостаточно — unknown.",
-            "- В LIVE не показывай числа/коэффициенты, только направление/логика.",
+            "- В LIVE не показывай числа/коэффициенты — только направление и логику.",
         ]
+
+        if action == "pro":
+            base += [
+                "",
+                "Формат LIVE PRO (обязательно):",
+                "- В markets верни 4 блока (каждый отдельным объектом):",
+                '  1) name="Факторы в пользу фаворита" (logic: 5–8 коротких буллетов)',
+                '  2) name="Факторы против фаворита" (logic: 5–8 коротких буллетов)',
+                '  3) name="Турнирный контекст" (logic: 4–7 буллетов; если данных мало — честно напиши что нужно подтвердить)',
+                '  4) name="Чек-лист решения" (logic: 5–8 буллетов: что подтвердить / что ломает сценарий / триггеры отката)',
+                "- direction ставь осмысленно; если данных мало — unknown.",
+                "- Пиши языком трейдинга линии: импульс, откат, перекладка риска, дисбаланс, подтверждение.",
+            ]
+        else:
+            base += [
+                "",
+                "Формат LIVE (обычный):",
+                "- markets: 2–4 ключевых наблюдения (короче, чем PRO).",
+            ]
+
     else:
         base += [
             "",
             "Верни СТРОГО JSON (без markdown) с полями:",
-            '{"title": "...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}',
+            '{"title":"...","summary":"...","key_factors":["..."],"line_logic":["..."],"risks":["..."],"disclaimer":"..."}',
         ]
 
     return "\n".join(base)
@@ -746,59 +696,72 @@ def _render_ui_json(analysis: Any, mode: str) -> str:
             "ℹ️ Аналитический материал. Не является рекомендацией."
         )
 
-    title = str(
-        analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")
-    ).strip()
+    title = str(analysis.get("title") or ("🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор")).strip()
     lines: list[str] = [title]
 
     if analysis.get("summary"):
         lines += ["", str(analysis["summary"]).strip()]
 
     ctx = analysis.get("context") or []
-    if ctx:
+    if isinstance(ctx, list) and ctx:
         lines.append("")
         for x in ctx[:8]:
             lines.append(f"• {x}")
 
     kf = analysis.get("key_factors") or []
-    if kf:
+    if isinstance(kf, list) and kf:
         lines.append("")
         lines.append("Факторы")
         for x in kf[:8]:
             lines.append(f"• {x}")
 
     ll = analysis.get("line_logic") or []
-    if ll:
+    if isinstance(ll, list) and ll:
         lines.append("")
         lines.append("Логика линии")
         for x in ll[:8]:
             lines.append(f"• {x}")
 
     mk = analysis.get("markets") or []
-    if mk:
+    if isinstance(mk, list) and mk:
         lines.append("")
-        lines.append("Ключевые рынки")
+        lines.append("Блоки")
         for item in mk[:6]:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name", "Market"))
-            direction = str(item.get("direction", "unknown"))
-            logic = str(item.get("logic", "")).strip()
+            name = str(item.get("name", "Блок")).strip()
+            direction = str(item.get("direction", "unknown")).strip()
+            logic_val = item.get("logic")
+
             lines.append(f"— {name}: {direction}")
-            if logic:
-                # допускаем, что LLM вернёт мульти-буллеты одной строкой
-                lines.append(f"  {logic}")
+
+            # logic может быть строкой или списком буллетов
+            if isinstance(logic_val, list):
+                for b in logic_val[:12]:
+                    s = str(b).strip()
+                    if s:
+                        lines.append(f"  • {s}")
+            else:
+                logic = str(logic_val or "").strip()
+                if logic:
+                    # если модель вернула многострочный текст — аккуратно распечатаем
+                    for ln in logic.splitlines():
+                        ln = ln.strip()
+                        if ln:
+                            # если уже с буллетом — не дублируем
+                            if ln.startswith(("•", "-", "—")):
+                                lines.append(f"  {ln}")
+                            else:
+                                lines.append(f"  • {ln}")
 
     risks = analysis.get("risks") or []
-    if risks:
+    if isinstance(risks, list) and risks:
         lines.append("")
         lines.append("Риски")
-        for r in risks[:8]:
+        for r in risks[:10]:
             lines.append(f"• {r}")
 
-    disclaimer = str(
-        analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией."
-    ).strip()
+    disclaimer = str(analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией.").strip()
     lines.append("")
     lines.append(disclaimer)
     return "\n".join(lines)
@@ -824,10 +787,6 @@ def _hash_cache_key(match_id: str, sport_slug: str, mode: str, action: str, cur_
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     match_meta = await _get_match_context(user_id, match_id)
-
-    # inject tournament context (safe, no crashes)
-    match_meta = dict(match_meta)
-    match_meta["tournament_notes"] = _hockey_context_lines(match_meta)
 
     sport_slug = str(match_meta.get("sport") or "").strip().lower()
     match_id = str(match_meta.get("id") or match_id).strip()
@@ -859,7 +818,12 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
     schema = "ui_live" if mode == "live" else "ui_pre"
-    ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
+
+    # TTL: для LIVE PRO можно держать чуть дольше, чтобы не душить RPM
+    if mode == "live":
+        ttl_s = int(TTL_LIVE_S * 2) if action == "pro" else int(TTL_LIVE_S)
+    else:
+        ttl_s = int(TTL_PRE_S)
 
     analysis, meta = await analyze_with_llm_cached(
         prompt,
@@ -897,6 +861,12 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
         return ("pre", "handicap")
     if "связк" in s:
         return ("pre", "links")
+
+    # PRO (если написали просто "pro" — считаем LIVE PRO)
+    if "pro" in s:
+        if "pre" in s or "прематч" in s:
+            return ("pre", "pro")
+        return ("live", "pro")
 
     # live
     if ("обнов" in s or "refresh" in s) and ("live" in s or "лайв" in s):
@@ -971,7 +941,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # diag
     if norm == "version":
         return _md_safe_text(
-            "✅ parsing.py version: 2026-01-16 v12 (TTL pre/live + global cache_key + global live snapshot + hockey context)"
+            "✅ parsing.py version: 2026-01-16 v12 (LIVE PRO action + expanded ui_live JSON blocks + ttl tuning)"
         )
     if norm == "env":
         return _md_safe_text(_format_env_status())
@@ -1132,6 +1102,8 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         "• стратегия\n"
         "• профиль\n"
         "• мой банк 100000\n\n"
+        "LIVE PRO:\n"
+        "• клик: pro  (или кнопка LIVE PRO в матче)\n\n"
         "Диагностика:\n"
         "• llm ping / env / version / last_error\n\n"
         "ℹ️ Аналитический материал. Не является рекомендацией."
