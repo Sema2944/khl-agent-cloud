@@ -214,16 +214,18 @@ def kb_sports() -> InlineKeyboardMarkup:
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
     """Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>"""
     mid = str(match_id).strip()
-    rows = [
-        [
-            InlineKeyboardButton("📊 Обзор (PRE)", callback_data=f"UI:{mid}:pre:overview"),
-            InlineKeyboardButton("🟢 LIVE", callback_data=f"UI:{mid}:live:overview"),
-        ],
-        [
-            InlineKeyboardButton("1X2", callback_data=f"UI:{mid}:pre:moneyline"),
-            InlineKeyboardButton("Тотал", callback_data=f"UI:{mid}:pre:total"),
-            InlineKeyboardButton("Фора", callback_data=f"UI:{mid}:pre:handicap"),
-        ],
+    rows =kb = [
+    [
+        InlineKeyboardButton("📊 PRE-обзор", callback_data=f"UI:{match_id}:pre:overview"),
+        InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{match_id}:live:overview"),
+    ],
+    [
+        InlineKeyboardButton("🟢 LIVE PRO", callback_data=f"UI:{match_id}:live:pro"),
+    ],
+    [
+        InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{match_id}:live:refresh"),
+    ],
+]
         [InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh")],
         # ВАЖНО: назад должен возвращать в ПОСЛЕДНИЙ экран матчей, а не в выбор спорта
         [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
