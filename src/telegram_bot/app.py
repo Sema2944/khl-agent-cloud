@@ -176,6 +176,36 @@ async def call_agent_local(user_id: int, text: str) -> str:
 
 
 # ============================================================
+# PRO gating (без оплат пока)
+# ============================================================
+PRO_USER_IDS = {
+    int(x.strip())
+    for x in (os.getenv("PRO_USER_IDS") or "").split(",")
+    if x.strip().isdigit()
+}
+
+def is_pro(user_id: int) -> bool:
+    # 1) явный allowlist
+    if user_id in PRO_USER_IDS:
+        return True
+    # 2) опционально: админ всегда PRO
+    admin_id = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
+    if admin_id and user_id == admin_id:
+        return True
+    return False
+
+
+def kb_pro_upsell(match_id: str) -> InlineKeyboardMarkup:
+    mid = str(match_id).strip()
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("⭐ Оформить PRO", callback_data="MENU:PREMIUM")],
+        [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
 # Keyboards
 # ============================================================
 def kb_main_menu() -> InlineKeyboardMarkup:
@@ -729,50 +759,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # BACK:COUNTRIES
-    if data.startswith("BACK:COUNTRIES:"):
-        parts = data.split(":")
-        sport_slug = parts[2].strip().lower() if len(parts) >= 3 else "ice-hockey"
-
-        st = _NAV_BY_USER.get(user_id)
-        if st:
-            st.last_screen = "COUNTRIES"
-            st.last_ckey = ""
-            st.last_lkey = ""
-            st.last_page = 1
-
-        text = _text_countries(user_id, sport_slug)
-        kb = _kb_countries(user_id, sport_slug)
-        txt = _truncate_tg(text)
+    # UI actions
+if data.startswith("UI:"):
+    # UI:<match_id>:<pre|live>:<action>
+    parts = data.split(":")
+    if len(parts) < 4:
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
         return
 
-    # BACK:LEAGUES
-    if data.startswith("BACK:LEAGUES:"):
-        parts = data.split(":")
-        if len(parts) < 4:
-            return
-        sport_slug = parts[2].strip().lower()
-        ckey = parts[3].strip()
+    match_id = parts[1].strip()
+    mode = parts[2].strip().lower()
+    action = parts[3].strip().lower()
 
-        st = _NAV_BY_USER.get(user_id)
-        if st:
-            st.last_screen = "LEAGUES"
-            st.last_ckey = ckey
-            st.last_lkey = ""
-            st.last_page = 1
+    # ---- PRO gating только для live:pro ----
+    if mode == "live" and action == "pro" and not is_pro(user_id):
+        # превью = обычный live overview (быстро, не ломает схему)
+        preview = await call_agent_local(user_id, f"ui match {match_id} live overview")
+        txt = _truncate_tg(preview)
 
-        text = _text_leagues(user_id, ckey)
-        kb = _kb_leagues(user_id, sport_slug, ckey)
-        txt = _truncate_tg(text)
+        upsell = (
+            "\n\n⭐ *LIVE PRO закрыт*\n"
+            "В PRO доступно:\n"
+            "• Факторы *за/против* фаворита\n"
+            "• Сценарии развития и условия “сломается/подтвердится”\n"
+            "• Более детальная логика по рынкам\n"
+        )
+        out = _truncate_tg(txt + upsell)
+
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(
+                _safe_markdown(out),
+                reply_markup=kb_pro_upsell(match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(
+                _safe_markdown(out),
+                reply_markup=kb_pro_upsell(match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
+
+    # PRO или не про-экшен
+    reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
+    txt = _truncate_tg(reply)
+
+    try:
+        await q.edit_message_text(
+            _safe_markdown(txt),
+            reply_markup=kb_match_hub(match_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        await q.message.reply_text(
+            _safe_markdown(txt),
+            reply_markup=kb_match_hub(match_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return
+
 
     # MATCH open
     if data.startswith("MATCH:"):
