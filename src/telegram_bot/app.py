@@ -163,7 +163,6 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
         suffix = f"  {sc}"
 
     out = f"{prefix}{t}{suffix}".strip()
-    # Telegram inline button limit не документирован жёстко, но лучше резать
     if len(out) > 58:
         out = out[:57] + "…"
     return out
@@ -212,21 +211,21 @@ def kb_sports() -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>"""
+    """
+    Клавиатура внутри матча:
+    UI:<match_id>:<pre|live>:<action>
+    """
     mid = str(match_id).strip()
-    rows =kb = [
-    [
-        InlineKeyboardButton("📊 PRE-обзор", callback_data=f"UI:{match_id}:pre:overview"),
-        InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{match_id}:live:overview"),
-    ],
-    [
-        InlineKeyboardButton("🟢 LIVE PRO", callback_data=f"UI:{match_id}:live:pro"),
-    ],
-    [
-        InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{match_id}:live:refresh"),
-    ],
-]
-        [InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh")],
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("📊 PRE-обзор", callback_data=f"UI:{mid}:pre:overview"),
+            InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{mid}:live:overview"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh"),
+            InlineKeyboardButton("⭐ LIVE PRO", callback_data=f"UI:{mid}:live:pro"),
+        ],
         # ВАЖНО: назад должен возвращать в ПОСЛЕДНИЙ экран матчей, а не в выбор спорта
         [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
         [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
@@ -355,7 +354,7 @@ def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarku
         return InlineKeyboardMarkup(rows)
 
     items: List[Tuple[str, int]] = []
-    for (ck, lk), lname in st.league_by_key.items():
+    for (ck, lk), _lname in st.league_by_key.items():
         if ck != ckey:
             continue
         n = len(st.match_ids_by_league.get((ck, lk), []))
