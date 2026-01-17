@@ -81,7 +81,6 @@ _telegram_app: Optional[Application] = None
 
 router = APIRouter()
 
-
 # ============================================================
 # Helpers
 # ============================================================
@@ -184,11 +183,10 @@ PRO_USER_IDS = {
     if x.strip().isdigit()
 }
 
+
 def is_pro(user_id: int) -> bool:
-    # 1) явный allowlist
     if user_id in PRO_USER_IDS:
         return True
-    # 2) опционально: админ всегда PRO
     admin_id = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
     if admin_id and user_id == admin_id:
         return True
@@ -241,22 +239,19 @@ def kb_sports() -> InlineKeyboardMarkup:
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура внутри матча:
-    UI:<match_id>:<pre|live>:<action>
-    """
+    """Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>"""
     mid = str(match_id).strip()
-
     rows: List[List[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton("📊 PRE-обзор", callback_data=f"UI:{mid}:pre:overview"),
             InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{mid}:live:overview"),
         ],
         [
-            InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh"),
             InlineKeyboardButton("⭐ LIVE PRO", callback_data=f"UI:{mid}:live:pro"),
         ],
-        # ВАЖНО: назад должен возвращать в ПОСЛЕДНИЙ экран матчей, а не в выбор спорта
+        [
+            InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh"),
+        ],
         [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
         [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
     ]
@@ -270,15 +265,10 @@ def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
 class _NavState:
     sport: str
     today_iso: str
-    # ckey -> country
     country_by_key: Dict[str, str]
-    # (ckey,lkey) -> league
     league_by_key: Dict[Tuple[str, str], str]
-    # (ckey,lkey) -> [match_id,...]
     match_ids_by_league: Dict[Tuple[str, str], List[str]]
-    # match_id -> meta
     match_meta: Dict[str, Dict[str, str]]
-    # последний экран (для BACK:MATCHES)
     last_screen: str  # "COUNTRIES" | "LEAGUES" | "MATCHES"
     last_ckey: str = ""
     last_lkey: str = ""
@@ -302,7 +292,6 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         if not mid:
             continue
 
-        # country желательно отдавать из sport_api.py. если нет — Other.
         country = (getattr(m, "country", "") or "").strip() or "Other"
         league_raw = (getattr(m, "league", "") or "").strip() or "Other"
         league = _league_ru(league_raw)
@@ -323,7 +312,6 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
             "start_time": str(getattr(m, "start_time", "") or ""),
         }
 
-    # сортировка матчей по start_time (как строка ISO)
     for key, ids in match_ids_by_league.items():
 
         def _sk(mid_: str) -> str:
@@ -349,7 +337,7 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
     rows: List[List[InlineKeyboardButton]] = []
     if not st:
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")])
+        rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
         return InlineKeyboardMarkup(rows)
 
     counts: List[Tuple[str, int]] = []
@@ -384,7 +372,7 @@ def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarku
         return InlineKeyboardMarkup(rows)
 
     items: List[Tuple[str, int]] = []
-    for (ck, lk), _lname in st.league_by_key.items():
+    for (ck, lk), lname in st.league_by_key.items():
         if ck != ckey:
             continue
         n = len(st.match_ids_by_league.get((ck, lk), []))
@@ -415,7 +403,6 @@ def _kb_matches(user_id: int, sport_slug: str, ckey: str, lkey: str, page: int) 
     start = (page - 1) * _PER_PAGE
     chunk = ids[start : start + _PER_PAGE]
 
-    # кнопки матчей с командами + счётом/статусом
     for mid in chunk:
         meta = st.match_meta.get(mid) or {}
         title = meta.get("title") or f"Матч {mid}"
@@ -487,7 +474,7 @@ async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, In
             "Не удалось получить матчи из API.\n"
             f"Причина: {str(e)[:250]}"
         )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES_MENU")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")]])
         return text, kb
 
     st = _build_nav_state(user_id, sport_slug, matches)
@@ -513,12 +500,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-    # быстрый вход в матчи
     if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # остальное — в агента
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
@@ -529,10 +514,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    BACK:MATCHES из матча -> возвращаем пользователя туда, где он был:
-    - список стран / лиг / матчей (с текущими ключами и страницей)
-    """
     st = _NAV_BY_USER.get(user_id)
     if not st:
         return "🏟 Выбери спорт:", kb_sports()
@@ -611,7 +592,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Как пользоваться:\n"
             "1) 🏟 Матчи сегодня\n"
             "2) спорт → страна → лига → матч\n"
-            "3) в матче нажми: PRE / LIVE / рынки\n\n"
+            "3) в матче нажми: PRE / LIVE / PRO\n\n"
             "Диагностика: llm ping, env, version, last_error"
         )
         try:
@@ -759,72 +740,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # UI actions
-if data.startswith("UI:"):
-    # UI:<match_id>:<pre|live>:<action>
-    parts = data.split(":")
-    if len(parts) < 4:
+    # BACK:COUNTRIES
+    if data.startswith("BACK:COUNTRIES:"):
+        parts = data.split(":")
+        sport_slug = parts[2].strip().lower() if len(parts) >= 3 else "ice-hockey"
+
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "COUNTRIES"
+            st.last_ckey = ""
+            st.last_lkey = ""
+            st.last_page = 1
+
+        text = _text_countries(user_id, sport_slug)
+        kb = _kb_countries(user_id, sport_slug)
+        txt = _truncate_tg(text)
         try:
-            await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    match_id = parts[1].strip()
-    mode = parts[2].strip().lower()
-    action = parts[3].strip().lower()
+    # BACK:LEAGUES
+    if data.startswith("BACK:LEAGUES:"):
+        parts = data.split(":")
+        if len(parts) < 4:
+            return
+        sport_slug = parts[2].strip().lower()
+        ckey = parts[3].strip()
 
-    # ---- PRO gating только для live:pro ----
-    if mode == "live" and action == "pro" and not is_pro(user_id):
-        # превью = обычный live overview (быстро, не ломает схему)
-        preview = await call_agent_local(user_id, f"ui match {match_id} live overview")
-        txt = _truncate_tg(preview)
+        st = _NAV_BY_USER.get(user_id)
+        if st:
+            st.last_screen = "LEAGUES"
+            st.last_ckey = ckey
+            st.last_lkey = ""
+            st.last_page = 1
 
-        upsell = (
-            "\n\n⭐ *LIVE PRO закрыт*\n"
-            "В PRO доступно:\n"
-            "• Факторы *за/против* фаворита\n"
-            "• Сценарии развития и условия “сломается/подтвердится”\n"
-            "• Более детальная логика по рынкам\n"
-        )
-        out = _truncate_tg(txt + upsell)
-
+        text = _text_leagues(user_id, ckey)
+        kb = _kb_leagues(user_id, sport_slug, ckey)
+        txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(
-                _safe_markdown(out),
-                reply_markup=kb_pro_upsell(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            await q.message.reply_text(
-                _safe_markdown(out),
-                reply_markup=kb_pro_upsell(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
-
-    # PRO или не про-экшен
-    reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
-    txt = _truncate_tg(reply)
-
-    try:
-        await q.edit_message_text(
-            _safe_markdown(txt),
-            reply_markup=kb_match_hub(match_id),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        await q.message.reply_text(
-            _safe_markdown(txt),
-            reply_markup=kb_match_hub(match_id),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    return
-
 
     # MATCH open
     if data.startswith("MATCH:"):
-        # MATCH:<sport_slug>:<match_id>
         parts = data.split(":")
         if len(parts) >= 3:
             sport_slug = parts[1].strip().lower()
@@ -833,7 +795,6 @@ if data.startswith("UI:"):
             sport_slug = "ice-hockey"
             match_id = data.split(":", 1)[1].strip()
 
-        # прогреваем контекст для parsing.py
         try:
             await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
         except Exception:
@@ -858,7 +819,6 @@ if data.startswith("UI:"):
 
     # UI actions
     if data.startswith("UI:"):
-        # UI:<match_id>:<pre|live>:<action>
         parts = data.split(":")
         if len(parts) < 4:
             try:
@@ -870,6 +830,34 @@ if data.startswith("UI:"):
         match_id = parts[1].strip()
         mode = parts[2].strip().lower()
         action = parts[3].strip().lower()
+
+        # ---- PRO gating только для live:pro ----
+        if mode == "live" and action == "pro" and not is_pro(user_id):
+            preview = await call_agent_local(user_id, f"ui match {match_id} live overview")
+            txt = _truncate_tg(preview)
+
+            upsell = (
+                "\n\n⭐ *LIVE PRO закрыт*\n"
+                "В PRO доступно:\n"
+                "• Факторы *за/против* фаворита\n"
+                "• Сценарии развития и условия “сломается/подтвердится”\n"
+                "• Более детальная логика по рынкам\n"
+            )
+            out = _truncate_tg(txt + upsell)
+
+            try:
+                await q.edit_message_text(
+                    _safe_markdown(out),
+                    reply_markup=kb_pro_upsell(match_id),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                await q.message.reply_text(
+                    _safe_markdown(out),
+                    reply_markup=kb_pro_upsell(match_id),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            return
 
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
@@ -910,9 +898,6 @@ def create_application() -> Application:
 
 
 async def telegram_startup() -> None:
-    """
-    Вызывай это из src/service.py на старте ИЛИ через mount_telegram_routes (startup event).
-    """
     global _telegram_app
     if _telegram_app is not None:
         return
@@ -952,9 +937,6 @@ async def telegram_shutdown() -> None:
 # ============================================================
 @router.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    """
-    FastAPI endpoint для Telegram webhook.
-    """
     if _telegram_app is None:
         await telegram_startup()
 
@@ -968,13 +950,6 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
 # Mount helper (ВАЖНО: это ждёт src/service.py)
 # ============================================================
 def mount_telegram_routes(app: FastAPI) -> None:
-    """
-    src/service.py ожидает: from .telegram_bot.app import mount_telegram_routes
-
-    Здесь:
-    - подключаем router
-    - добавляем lifecycle события (на всякий случай)
-    """
     app.include_router(router)
 
     @app.on_event("startup")
