@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,7 +13,6 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, FastAPI, Request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -33,18 +31,12 @@ MSK = ZoneInfo("Europe/Moscow")
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()  # https://xxxx.onrender.com
 WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
-WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()  # if set - use it, else PUBLIC_URL+WEBHOOK_PATH
+WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()  # если задан — используем его, иначе PUBLIC_URL+WEBHOOK_PATH
 
-# access by plan
 ALLOWED_SPORTS = [s.strip() for s in (os.getenv("ALLOWED_SPORTS") or "ice-hockey").split(",") if s.strip()]
 HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "").strip().lower() in {"1", "true", "yes", "on"}
 
-# Telegram message length safety
 TG_TEXT_LIMIT = int((os.getenv("TG_TEXT_LIMIT") or "3800").strip() or 3800)
-
-# callback debounce
-_LAST_CB_BY_USER: Dict[int, Tuple[str, float]] = {}
-_CB_DEBOUNCE_S = float((os.getenv("TG_CB_DEBOUNCE_S") or "1.0").strip() or 1.0)
 
 # ============================================================
 # UI labels
@@ -59,7 +51,6 @@ SPORT_LABELS = {
 }
 MAIN_MENU_TEXT = "Главное меню"
 
-# Basic RU mapping for common leagues
 LEAGUE_RU = {
     "NHL": "НХЛ",
     "KHL": "КХЛ",
@@ -81,11 +72,11 @@ def _league_ru(name: str) -> str:
 
 
 # ============================================================
-# Telegram Application (created in telegram_startup)
+# Telegram Application (создаётся в telegram_startup)
 # ============================================================
 _telegram_app: Optional[Application] = None
-router = APIRouter()
 
+router = APIRouter()
 
 # ============================================================
 # Helpers
@@ -100,7 +91,6 @@ def _msk_today_iso() -> str:
 
 
 def _safe_markdown(text: str) -> str:
-    """Minimal escaping for ParseMode.MARKDOWN."""
     s = text or ""
     s = s.replace("\\", "\\\\")
     s = s.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
@@ -141,12 +131,6 @@ def _fmt_status_ru(status: str) -> str:
 
 
 def _compact_match_btn_title(title: str, score: str, status: str) -> str:
-    """
-    Inline button label:
-    - Teams
-    - If LIVE/Finished show score
-    - If not started show ⏳
-    """
     t = (title or "").strip() or "Матч"
     sc = (score or "").strip()
     st = (status or "").strip().lower()
@@ -173,43 +157,21 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
     return out
 
 
+def _is_user_pro(user_id: int) -> bool:
+    """
+    Проверяем PRO через src/parsing.py (MVP whitelist).
+    Локальный импорт — чтобы не ловить циклы.
+    """
+    try:
+        from ..parsing import is_pro  # type: ignore
+        return bool(is_pro(user_id))
+    except Exception:
+        return False
+
+
 async def call_agent_local(user_id: int, text: str) -> str:
-    """Call local agent (src/parsing.py)."""
-    from ..parsing import run_dialog_agent  # local import to avoid cycles
-
+    from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
     return await run_dialog_agent(user_id, text)
-
-
-async def _safe_edit_or_send(
-    q,
-    *,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = None,
-) -> None:
-    """
-    Safe edit message:
-    - ignore "message is not modified"
-    - fallback to sendMessage when edit is not possible
-    """
-    try:
-        await q.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        return
-    except BadRequest as e:
-        msg = str(e).lower()
-        if "message is not modified" in msg:
-            return
-        if "message to edit not found" in msg or "message can't be edited" in msg:
-            pass
-        else:
-            pass
-    except Exception:
-        pass
-
-    try:
-        await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except Exception:
-        return
 
 
 # ============================================================
@@ -227,13 +189,7 @@ def kb_main_menu() -> InlineKeyboardMarkup:
 
 
 def kb_sports() -> InlineKeyboardMarkup:
-    """
-    Sport picker:
-    - allowed: SPORT:<slug>
-    - locked: SPORT_LOCKED:<slug> (or hidden)
-    """
     rows: List[List[InlineKeyboardButton]] = []
-
     for slug in ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]:
         title = SPORT_LABELS.get(slug, slug)
         if _is_allowed_sport(slug):
@@ -247,23 +203,44 @@ def kb_sports() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
-    """Match screen keyboard: UI:<match_id>:<pre|live>:<action>"""
+def kb_match_hub(user_id: int, match_id: str) -> InlineKeyboardMarkup:
+    """
+    Клавиатура внутри матча: UI:<match_id>:<pre|live>:<action>
+    + PRO-gating: если не PRO — ведём на BUY:PRO
+    """
     mid = str(match_id).strip()
+    pro = _is_user_pro(user_id)
+
     rows: List[List[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton("📊 PRE-обзор", callback_data=f"UI:{mid}:pre:overview"),
             InlineKeyboardButton("🟢 LIVE-обзор", callback_data=f"UI:{mid}:live:overview"),
         ],
-        [
-            InlineKeyboardButton("🟢 LIVE PRO", callback_data=f"UI:{mid}:live:pro"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh"),
-        ],
-        # IMPORTANT: back returns to last matches screen, not sports picker
-        [InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+    ]
+
+    if pro:
+        rows.append([InlineKeyboardButton("🟢 LIVE PRO", callback_data=f"UI:{mid}:live:pro")])
+    else:
+        rows.append([InlineKeyboardButton("🔒 LIVE PRO", callback_data="BUY:PRO")])
+        rows.append([InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")])
+
+    rows.append([InlineKeyboardButton("🔄 Обновить LIVE", callback_data=f"UI:{mid}:live:refresh")])
+    rows.append([InlineKeyboardButton("⬅️ Назад к матчам", callback_data="BACK:MATCHES")])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_buy_pro() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_buy_pro_screen() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -510,12 +487,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-    # quick entry to matches
-    if "матчи сегодня" in norm or text_raw.strip() == "🏟 Матчи сегодня":
+    if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # pass to agent
+    # “Оформить PRO” текстом тоже поддержим
+    if "оформить pro" in norm or "купить pro" in norm or norm.strip() in {"pro", "premium", "премиум"}:
+        await update.message.reply_text(_safe_markdown(_truncate_tg(_text_buy_pro(user_id))), parse_mode=ParseMode.MARKDOWN)
+        return
+
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
@@ -526,10 +506,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    BACK:MATCHES from match screen -> return user to the last matches screen:
-    countries/leagues/matches with last keys & page.
-    """
     st = _NAV_BY_USER.get(user_id)
     if not st:
         return "🏟 Выбери спорт:", kb_sports()
@@ -550,6 +526,29 @@ def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     return _text_countries(user_id, sport), _kb_countries(user_id, sport)
 
 
+def _text_buy_pro(user_id: int) -> str:
+    pro = _is_user_pro(user_id)
+    if pro:
+        return (
+            "⭐ PRO активен\n\n"
+            "Тебе доступен LIVE PRO:\n"
+            "• Факторы за/против фаворита и андердога\n"
+            "• Сигналы рынка и сценарии\n\n"
+            "Открой матч → нажми «🟢 LIVE PRO»."
+        )
+
+    return (
+        "⭐ Оформить PRO\n\n"
+        "PRO даёт максимум ценности в LIVE:\n"
+        "• Факторы: за/против фаворита и андердога\n"
+        "• Сигналы движения линии (почему рынок двигается)\n"
+        "• 2–3 сценария + что отменяет сценарий\n\n"
+        "Сейчас оплата в разработке (ЮKassa следующая).\n"
+        "Для теста: добавь свой user_id в ENV `PRO_USER_IDS`.\n\n"
+        "Пример: PRO_USER_IDS=5027679117"
+    )
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query:
         return
@@ -560,13 +559,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = update.effective_chat.id if update.effective_chat else None
 
     logger.info("tg.callback user_id=%s data=%r", user_id, data)
-
-    # ---- debounce: ignore same callback within short window ----
-    now = time.time()
-    last = _LAST_CB_BY_USER.get(user_id)
-    if last and last[0] == data and (now - last[1]) < _CB_DEBOUNCE_S:
-        return
-    _LAST_CB_BY_USER[user_id] = (data, now)
 
     try:
         await q.answer()
@@ -582,51 +574,89 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data in {"NOOP", ""}:
         return
 
-    # BACK:MENU
     if data == "BACK:MENU":
-        await _safe_edit_or_send(q, text=MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        try:
+            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        except Exception:
+            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
         return
 
-    # MENU:MATCHES / BACK:MATCHES_MENU => sport picker
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
-        await _safe_edit_or_send(q, text="🏟 Выбери спорт:", reply_markup=kb_sports())
+        text = "🏟 Выбери спорт:"
+        try:
+            await q.edit_message_text(text, reply_markup=kb_sports())
+        except Exception:
+            await q.message.reply_text(text, reply_markup=kb_sports())
         return
 
-    # BACK:MATCHES => back to last matches screen (NOT sport picker)
     if data == "BACK:MATCHES":
         text, kb = _nav_back_to_last(user_id)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # MENU shortcuts
+    # ====== BUY PRO ======
+    if data == "BUY:PRO":
+        txt = _truncate_tg(_text_buy_pro(user_id))
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+            ]
+        )
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ====== MENU shortcuts ======
     if data == "MENU:AI":
         reply = (
             "Как пользоваться:\n"
             "1) 🏟 Матчи сегодня\n"
             "2) спорт → страна → лига → матч\n"
-            "3) в матче нажми: PRE / LIVE / рынки\n\n"
+            "3) в матче нажми: PRE / LIVE / LIVE PRO\n\n"
             "Диагностика: llm ping, env, version, last_error"
         )
-        await _safe_edit_or_send(q, text=reply, reply_markup=kb_main_menu())
+        try:
+            await q.edit_message_text(reply, reply_markup=kb_main_menu())
+        except Exception:
+            await q.message.reply_text(reply, reply_markup=kb_main_menu())
         return
 
     if data == "MENU:STRATEGY":
         reply = await call_agent_local(user_id, "стратегия")
         txt = _truncate_tg(reply)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data == "MENU:PROFILE":
         reply = await call_agent_local(user_id, "профиль")
         txt = _truncate_tg(reply)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data == "MENU:PREMIUM":
-        from ..ui_text import text_premium
-
-        await _safe_edit_or_send(q, text=text_premium(), reply_markup=kb_main_menu())
+        txt = _truncate_tg(_text_buy_pro(user_id))
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+            ]
+        )
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # SPORT_LOCKED
@@ -637,7 +667,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"🔒 {title} недоступен по твоему тарифу.\n\n"
             "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in ALLOWED_SPORTS)
         )
-        await _safe_edit_or_send(q, text=txt, reply_markup=kb_sports())
+        try:
+            await q.edit_message_text(txt, reply_markup=kb_sports())
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=kb_sports())
         return
 
     # SPORT
@@ -645,12 +678,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sport_slug = data.split(":", 1)[1].strip().lower()
         if not _is_allowed_sport(sport_slug):
             title = SPORT_LABELS.get(sport_slug, sport_slug)
-            await _safe_edit_or_send(q, text=f"🔒 {title} недоступен по твоему тарифу.", reply_markup=kb_sports())
+            txt = f"🔒 {title} недоступен по твоему тарифу."
+            try:
+                await q.edit_message_text(txt, reply_markup=kb_sports())
+            except Exception:
+                await q.message.reply_text(txt, reply_markup=kb_sports())
             return
 
         text, kb = await _render_sport_nav_root(user_id, sport_slug)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:COUNTRY
@@ -671,7 +711,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_leagues(user_id, ckey)
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:LEAGUE
@@ -693,7 +736,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_matches(user_id, ckey, lkey, page=1)
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=1)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:PAGE
@@ -719,7 +765,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_matches(user_id, ckey, lkey, page=page)
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=page)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # BACK:COUNTRIES
@@ -737,7 +786,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_countries(user_id, sport_slug)
         kb = _kb_countries(user_id, sport_slug)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # BACK:LEAGUES
@@ -758,7 +810,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_leagues(user_id, ckey)
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
-        await _safe_edit_or_send(q, text=_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # MATCH open
@@ -771,7 +826,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sport_slug = "ice-hockey"
             match_id = data.split(":", 1)[1].strip()
 
-        # warm cache in parsing.py
         try:
             await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
         except Exception:
@@ -780,38 +834,71 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"матч {match_id}")
         txt = _truncate_tg(reply)
 
-        await _safe_edit_or_send(
-            q,
-            text=_safe_markdown(txt),
-            reply_markup=kb_match_hub(match_id),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await q.edit_message_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(user_id, match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await q.message.reply_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(user_id, match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     # UI actions
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) < 4:
-            await _safe_edit_or_send(q, text="⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            try:
+                await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            except Exception:
+                await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
             return
 
         match_id = parts[1].strip()
         mode = parts[2].strip().lower()
         action = parts[3].strip().lower()
 
+        # если юзер не PRO и жмёт live:pro — отправим на BUY:PRO
+        if mode == "live" and action == "pro" and not _is_user_pro(user_id):
+            txt = _truncate_tg(_text_buy_pro(user_id))
+            kb = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+                ]
+            )
+            try:
+                await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            return
+
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
 
-        await _safe_edit_or_send(
-            q,
-            text=_safe_markdown(txt),
-            reply_markup=kb_match_hub(match_id),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        try:
+            await q.edit_message_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(user_id, match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await q.message.reply_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(user_id, match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     # fallback
-    await _safe_edit_or_send(q, text="Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+    try:
+        await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+    except Exception:
+        await q.message.reply_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
 
 
 # ============================================================
@@ -829,9 +916,6 @@ def create_application() -> Application:
 
 
 async def telegram_startup() -> None:
-    """
-    Called from src/service.py on startup and/or via mount_telegram_routes startup event.
-    """
     global _telegram_app
     if _telegram_app is not None:
         return
@@ -866,14 +950,8 @@ async def telegram_shutdown() -> None:
         _telegram_app = None
 
 
-# ============================================================
-# FastAPI webhook router
-# ============================================================
 @router.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    """
-    FastAPI endpoint for Telegram webhook.
-    """
     if _telegram_app is None:
         await telegram_startup()
 
@@ -883,18 +961,7 @@ async def telegram_webhook(request: Request) -> Dict[str, Any]:
     return {"ok": True}
 
 
-# ============================================================
-# Mount helper (expected by src/service.py)
-# ============================================================
 def mount_telegram_routes(app: FastAPI) -> None:
-    """
-    src/service.py expects:
-      from .telegram_bot.app import mount_telegram_routes
-
-    Here we:
-    - include router
-    - attach lifecycle events (just in case)
-    """
     app.include_router(router)
 
     @app.on_event("startup")
