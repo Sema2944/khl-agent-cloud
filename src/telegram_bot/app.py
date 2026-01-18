@@ -481,21 +481,39 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+
     user_id = update.effective_user.id if update.effective_user else 0
     text_raw = (update.message.text or "").strip()
-    norm = text_raw.lower()
+    norm = text_raw.lower().strip()
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
+    # быстрый вход в матчи
     if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
         return
 
-    # “Оформить PRO” текстом тоже поддержим
-    if "оформить pro" in norm or "купить pro" in norm or norm.strip() in {"pro", "premium", "премиум"}:
-        await update.message.reply_text(_safe_markdown(_truncate_tg(_text_buy_pro(user_id))), parse_mode=ParseMode.MARKDOWN)
+    # premium / pro screen (когда "⭐ Premium" прилетает как текст, а не callback)
+    is_premium_text = (
+        ("premium" in norm)
+        or ("премиум" in norm)
+        or ("оформить pro" in norm)
+        or ("купить pro" in norm)
+        or (norm in {"pro", "premium", "премиум"})
+        or (text_raw in {"⭐ Premium", "⭐ Премиум"})
+    )
+    if is_premium_text:
+        txt = _truncate_tg(_text_buy_pro(user_id))
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+            ]
+        )
+        await update.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
 
+    # остальное — в агента
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
