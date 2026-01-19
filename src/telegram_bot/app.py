@@ -40,12 +40,7 @@ HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "").strip().lower() in 
 # лимит текста Telegram (страховка Message_too_long)
 TG_TEXT_LIMIT = int((os.getenv("TG_TEXT_LIMIT") or "3800").strip() or 3800)
 
-# PRO (пока без ЮKassa — ручной whitelist)
-PRO_USER_IDS = {
-    int(x.strip())
-    for x in (os.getenv("PRO_USER_IDS") or "").split(",")
-    if x.strip().isdigit()
-}
+# админ
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
 
 # ============================================================
@@ -92,11 +87,20 @@ router = APIRouter()
 # Helpers
 # ============================================================
 def is_pro(user_id: int) -> bool:
+    """
+    PRO через БД (users.is_premium/premium_until).
+    Админ всегда PRO.
+    """
     if not user_id:
         return False
     if ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
         return True
-    return user_id in PRO_USER_IDS
+    try:
+        from ..pro_db import is_pro as _db_is_pro
+        return bool(_db_is_pro(int(user_id)))
+    except Exception:
+        logger.exception("DB is_pro failed (fallback false)")
+        return False
 
 
 def _is_allowed_sport(sport_slug: str) -> bool:
@@ -163,7 +167,6 @@ async def call_agent_local(user_id: int, text: str) -> str:
 
 
 def _text_buy_pro(user_id: int) -> str:
-    # пока без платежей: объясняем ценность и что делать
     return (
         "⭐ *PRO-доступ*\n\n"
         "PRO открывает расширенный LIVE-разбор:\n"
@@ -598,7 +601,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Как пользоваться:\n"
             "1) 🏟 Матчи сегодня\n"
             "2) спорт → страна → лига → матч\n"
-            "3) в матче нажми: PRE / LIVE / рынки\n\n"
+            "3) в матче нажми: PRE / LIVE / LIVE PRO\n\n"
             "Диагностика: llm ping, env, version, last_error"
         )
         try:
@@ -837,13 +840,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         mode = parts[2].strip().lower()
         action = parts[3].strip().lower()
 
-        # ВАЖНО: гейтинг PRO (если parsing.py вдруг не отработает)
+        # гейтинг PRO (чтобы не дергать LLM лишний раз)
         if action == "pro" and not is_pro(user_id):
             txt = _truncate_tg(
                 "🟢 *LIVE PRO — превью*\n\n"
                 "• Факторы *за фаворита* / *против фаворита*\n"
                 "• Триггеры и условия отмены сценария\n"
-                "• Риски и план действий\n\n"
+                "• Риски и риск-план\n\n"
                 "Чтобы открыть полный PRO-разбор — оформи PRO."
             )
             try:
