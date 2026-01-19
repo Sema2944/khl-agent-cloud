@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -27,6 +27,9 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             return {"value": row}
 
 
+# ============================================================
+# CORE: PRO status
+# ============================================================
 def is_pro(user_id: int) -> bool:
     """
     True если:
@@ -57,22 +60,20 @@ def is_pro(user_id: int) -> bool:
         is_premium = bool(d.get("is_premium"))
         until = d.get("premium_until")
 
-        # premium_until может прийти строкой/naive dt — нормализуем
         if until is None:
             return is_premium
 
+        # premium_until может прийти строкой/naive dt — нормализуем
         if isinstance(until, str):
-            # пробуем ISO
             try:
                 until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
             except Exception:
-                return is_premium  # если не распарсили — пусть is_premium решает
+                return is_premium
         elif isinstance(until, datetime):
             until_dt = until
         else:
             return is_premium
 
-        # если naive — считаем UTC
         if until_dt.tzinfo is None:
             until_dt = until_dt.replace(tzinfo=timezone.utc)
 
@@ -87,7 +88,7 @@ def is_pro(user_id: int) -> bool:
 
 def get_pro_status(user_id: int) -> Dict[str, Any]:
     """
-    Возвращает словарь статуса, удобно для админки:
+    Возвращает словарь статуса:
     { "user_id":..., "is_premium":..., "premium_until":..., "active":... }
     """
     session = SessionLocal()
@@ -95,7 +96,7 @@ def get_pro_status(user_id: int) -> Dict[str, Any]:
         row = session.exec(
             text(
                 """
-                SELECT id, tg_user_id, is_premium, premium_until
+                SELECT id, tg_user_id, is_premium, premium_until, trial_live_used
                 FROM users
                 WHERE tg_user_id = :uid OR id = :uid
                 LIMIT 1
@@ -114,6 +115,7 @@ def get_pro_status(user_id: int) -> Dict[str, Any]:
             "exists": True,
             "is_premium": bool(d.get("is_premium")),
             "premium_until": d.get("premium_until"),
+            "trial_live_used": bool(d.get("trial_live_used") or False),
             "active": bool(active),
         }
     except Exception:
@@ -143,13 +145,11 @@ def grant_pro(user_id: int, days: Optional[int] = None, lifetime: bool = False) 
 
     session = SessionLocal()
     try:
-        # Важно: делаем upsert максимально совместимо (Postgres/SQLite).
-        # Держим id=tg_user_id (как у тебя задумано), но и tg_user_id тоже заполняем.
         session.exec(
             text(
                 """
-                INSERT INTO users (id, tg_user_id, is_premium, premium_until, created_at, updated_at)
-                VALUES (:uid, :uid, TRUE, :until, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                INSERT INTO users (id, tg_user_id, is_premium, premium_until, trial_live_used, created_at, updated_at)
+                VALUES (:uid, :uid, TRUE, :until, COALESCE(:trial_used, FALSE), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT (id) DO UPDATE SET
                     tg_user_id = EXCLUDED.tg_user_id,
                     is_premium = TRUE,
@@ -157,7 +157,7 @@ def grant_pro(user_id: int, days: Optional[int] = None, lifetime: bool = False) 
                     updated_at = CURRENT_TIMESTAMP
                 """
             ),
-            params={"uid": int(user_id), "until": until},
+            params={"uid": int(user_id), "until": until, "trial_used": False},
         )
         session.commit()
         return True
@@ -198,6 +198,129 @@ def revoke_pro(user_id: int) -> bool:
         session.close()
 
 
-# ---- aliases (на случай если ты где-то дергаешь другие имена) ----
+# ============================================================
+# TRIAL: LIVE PRO (1 раз бесплатно)
+# ============================================================
+def ensure_user_row(user_id: int) -> None:
+    """
+    Гарантирует, что в users есть запись для пользователя.
+    Это нужно, чтобы мы могли отметить trial_live_used даже у "нового" юзера.
+    """
+    if not user_id:
+        return
+
+    session = SessionLocal()
+    try:
+        # Вставляем минимально, если нет. Если есть — просто обновим updated_at.
+        session.exec(
+            text(
+                """
+                INSERT INTO users (id, tg_user_id, is_premium, premium_until, trial_live_used, created_at, updated_at)
+                VALUES (:uid, :uid, FALSE, NULL, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    tg_user_id = EXCLUDED.tg_user_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """
+            ),
+            params={"uid": int(user_id)},
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("ensure_user_row failed")
+    finally:
+        session.close()
+
+
+def get_user_flags(user_id: int) -> Dict[str, Any]:
+    """
+    Возвращает флаги (trial и т.п.). Если записи нет — вернёт дефолты.
+    """
+    if not user_id:
+        return {"trial_live_used": False}
+
+    session = SessionLocal()
+    try:
+        row = session.exec(
+            text(
+                """
+                SELECT trial_live_used
+                FROM users
+                WHERE tg_user_id = :uid OR id = :uid
+                LIMIT 1
+                """
+            ),
+            params={"uid": int(user_id)},
+        ).first()
+
+        if not row:
+            return {"trial_live_used": False}
+
+        d = _row_to_dict(row)
+        return {"trial_live_used": bool(d.get("trial_live_used") or False)}
+    except Exception:
+        logger.exception("get_user_flags failed")
+        return {"trial_live_used": False, "error": "db_error"}
+    finally:
+        session.close()
+
+
+def consume_live_trial(user_id: int) -> bool:
+    """
+    Помечает trial_live_used=True. Возвращает True если успешно.
+    """
+    if not user_id:
+        return False
+
+    ensure_user_row(user_id)
+
+    session = SessionLocal()
+    try:
+        session.exec(
+            text(
+                """
+                UPDATE users
+                SET trial_live_used = TRUE,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE tg_user_id = :uid OR id = :uid
+                """
+            ),
+            params={"uid": int(user_id)},
+        )
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        logger.exception("consume_live_trial failed")
+        return False
+    finally:
+        session.close()
+
+
+def can_access_live_pro(user_id: int) -> Tuple[bool, bool]:
+    """
+    Возвращает (allowed, use_trial_now)
+
+    - allowed=True если:
+        * пользователь PRO
+        * или trial ещё не использован (тогда use_trial_now=True)
+    - allowed=False если:
+        * не PRO и trial уже потрачен
+    """
+    if not user_id:
+        return False, False
+
+    if is_pro(user_id):
+        return True, False
+
+    flags = get_user_flags(user_id)
+    used = bool(flags.get("trial_live_used") or False)
+    if used:
+        return False, False
+
+    return True, True
+
+
+# ---- aliases (на случай если где-то дергаешь другие имена) ----
 pro_status = get_pro_status
 remove_pro = revoke_pro
