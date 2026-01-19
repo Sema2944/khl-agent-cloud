@@ -18,6 +18,7 @@ from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy
 from .llm_client import analyze_with_llm_cached
+from .pro_db import is_pro
 
 logger = logging.getLogger(__name__)
 
@@ -32,60 +33,32 @@ LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
         "Ты дружелюбный, структурированный и безопасный спортивный аналитик.\n"
-        "Твоя задача — объяснять движение линии и рыночную логику.\n"
-        "НЕ предсказывай исход и НЕ давай советов.\n"
-        "Пиши коротко, списками.\n"
-        "Используй язык трейдинга/рынка, но понятно русскоговорящей аудитории."
+        "Твоя задача — объяснять логику линии и движения.\n"
+        "НЕ предсказывай исход и НЕ давай советов/рекомендаций.\n"
+        "Пиши коротко, списками."
     )
 
 # -----------------------------
 # TTL policy for LLM caching
 # -----------------------------
-TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # 15 минут
-TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())     # 25 секунд
-TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "20").strip())  # PRO live чуть чаще
-
-# -----------------------------
-# PRO gating (MVP)
-# -----------------------------
-PRO_ENABLED = (os.getenv("PRO_ENABLED") or "1").strip().lower() not in {"0", "false", "no", "off"}
-PRO_USER_IDS_RAW = (os.getenv("PRO_USER_IDS") or "").strip()
-
-
-def _parse_int_list(csv: str) -> List[int]:
-    out: List[int] = []
-    for x in (csv or "").split(","):
-        x = x.strip()
-        if not x:
-            continue
-        try:
-            out.append(int(x))
-        except Exception:
-            continue
-    return out
-
-
-PRO_USER_IDS = set(_parse_int_list(PRO_USER_IDS_RAW))
-
-
-def is_pro(user_id: int) -> bool:
-    """
-    MVP: whitelist по ENV (позже заменим на БД/подписку).
-    """
-    if not PRO_ENABLED:
-        return False
-    return int(user_id or 0) in PRO_USER_IDS
-
+TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())              # 15 минут
+TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())         # 25 секунд
+TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "20").strip()) # 20 секунд
 
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
 _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
 
-# LIVE snapshot should be GLOBAL PER MATCH (not per user)
+# LIVE snapshot should be GLOBAL PER MATCH
 _LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
 
 # кеш матчей "сегодня" по пользователю: match_id -> meta
 _MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
+# навигация по списку матчей
+_ACTIVE_COUNTRY_BY_USER: Dict[int, str] = {}
+_ACTIVE_LEAGUE_BY_USER: Dict[int, str] = {}
+_ACTIVE_PAGE_BY_USER: Dict[int, int] = {}
 
 API_SPORTS_LABELS = {
     "football": "⚽ Футбол",
@@ -166,7 +139,7 @@ def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str
     lines.append(f"PnL: {stats.pnl:+.0f}")
     lines.append(f"Объём ставок: {stats.total_stake:.0f}")
     lines.append("")
-    lines.append("Это упрощённая статистика по всем твоим действиям.")
+    lines.append("Это упрощённая статистика по всем твоим ставкам.")
     return "\n".join(lines)
 
 
@@ -227,7 +200,7 @@ def _format_expert_strategy_for_today() -> str:
             "",
             text,
             "",
-            "Дисклеймер: аналитический материал, не является рекомендацией.",
+            "Дисклеймер: это аналитическая заметка, не призыв к действию.",
         ]
     )
 
@@ -272,6 +245,145 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
         session.commit()
 
     return True, "✅ Стратегия обновлена (по МСК)."
+
+
+# -----------------------------
+# Группировка матчей: страна -> лига -> матчи
+# -----------------------------
+def _norm_key(s: Any) -> str:
+    s = (str(s or "")).strip()
+    return s if s else "Other"
+
+
+def _build_index_for_user(user_id: int) -> Dict[str, Any]:
+    cache = _MATCH_CACHE_BY_USER.get(user_id) or {}
+    idx: Dict[str, Dict[str, List[str]]] = {}
+    for mid, meta in cache.items():
+        country = _norm_key(meta.get("country") or meta.get("league_country") or "Other")
+        league = _norm_key(meta.get("league") or "Other")
+        idx.setdefault(country, {}).setdefault(league, []).append(mid)
+
+    for c, leagues in idx.items():
+        for lg, ids in leagues.items():
+            ids.sort(key=lambda _id: str((cache.get(_id) or {}).get("start_time") or ""))
+    return idx
+
+
+def _render_countries(user_id: int, sport_title: str, today_iso: str) -> str:
+    idx = _build_index_for_user(user_id)
+    items: List[Tuple[str, int]] = []
+    for country, leagues in idx.items():
+        n = sum(len(v) for v in leagues.values())
+        items.append((country, n))
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    lines = [
+        f"🏟 Матчи сегодня (по МСК) — {sport_title}",
+        f"Дата: {today_iso}",
+        "",
+        "Выбери страну:",
+    ]
+    for c, n in items[:10]:
+        lines.append(f"• {c} ({n})")
+    if len(items) > 10:
+        rest = sum(n for _, n in items[10:])
+        lines.append(f"• Другие ({rest})")
+
+    lines.append("")
+    lines.append("Команды навигации:")
+    lines.append("• страна: <название>")
+    lines.append("• лига: <страна> | <лига> | <страница?>")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _render_leagues(user_id: int, country: str) -> str:
+    idx = _build_index_for_user(user_id)
+    leagues = idx.get(country) or {}
+    items = [(lg, len(ids)) for lg, ids in leagues.items()]
+    items.sort(key=lambda x: x[1], reverse=True)
+
+    lines = [f"🏳️ Страна: {country}", "", "Выбери лигу:"]
+    for lg, n in items[:15]:
+        lines.append(f"• {lg} ({n})")
+    if not items:
+        lines.append("• (пусто)")
+    lines.append("")
+    lines.append("Команда:")
+    lines.append("лига: {страна} | {лига} | 1")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _render_matches_page(user_id: int, country: str, league: str, page: int, per_page: int = 15) -> str:
+    idx = _build_index_for_user(user_id)
+    ids = (idx.get(country) or {}).get(league) or []
+    total = len(ids)
+    if total == 0:
+        return "Матчей не найдено."
+
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, pages))
+    start = (page - 1) * per_page
+    chunk = ids[start : start + per_page]
+
+    lines = [f"🏳️ {country}", f"🏆 {league}", f"Страница {page}/{pages}", ""]
+    for mid in chunk:
+        meta = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(mid) or {}
+        title = meta.get("title") or f"Матч {mid}"
+        status = meta.get("status") or ""
+        score = meta.get("score") or ""
+        start_time = meta.get("start_time") or ""
+        s: List[str] = []
+        s.append(f"• {title}")
+        if start_time:
+            s.append(f"  старт: {start_time}")
+        if score:
+            s.append(f"  счёт: {score}")
+        if status:
+            s.append(f"  статус: {status}")
+        s.append(f"  id: {mid}")
+        lines.append("\n".join(s))
+
+    lines.append("")
+    if pages > 1:
+        prev_p = max(1, page - 1)
+        next_p = min(pages, page + 1)
+        lines.append(f"Листать: лига: {country} | {league} | {prev_p}   /   {next_p}")
+    lines.append("Открыть матч: матч <id>")
+    return _truncate_telegram("\n".join(lines))
+
+
+def _parse_nav_country(text_raw: str) -> Optional[str]:
+    m = re.match(r"^(страна)\s*:\s*(.+)$", (text_raw or "").strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(2).strip()
+
+
+def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
+    m = re.match(r"^(лига)\s*:\s*(.+)$", (text_raw or "").strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    tail = m.group(2).strip()
+    if "|" in tail:
+        parts = [p.strip() for p in tail.split("|")]
+    elif "/" in tail:
+        parts = [p.strip() for p in tail.split("/")]
+    else:
+        return None
+
+    if len(parts) < 2:
+        return None
+
+    country = parts[0]
+    league = parts[1]
+    page = 1
+    if len(parts) >= 3 and parts[2]:
+        try:
+            page = int(re.findall(r"\d+", parts[2])[0])
+        except Exception:
+            page = 1
+    return country, league, page
 
 
 # -----------------------------
@@ -331,12 +443,11 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "country": getattr(m, "country", "") if hasattr(m, "country") else "",
         }
 
-    return (
-        f"🏟 Матчи сегодня (по МСК) — {title}\n"
-        f"Дата: {today.isoformat()}\n\n"
-        "Открой матч командой: матч <id>\n"
-        "Или используй кнопки навигации в интерфейсе."
-    )
+    _ACTIVE_COUNTRY_BY_USER[user_id] = ""
+    _ACTIVE_LEAGUE_BY_USER[user_id] = ""
+    _ACTIVE_PAGE_BY_USER[user_id] = 1
+
+    return _render_countries(user_id, title, today.isoformat())
 
 
 def _fmt_status_ru(status: str) -> str:
@@ -451,7 +562,11 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
             ch = m.get("choices")
             if isinstance(ch, list):
                 mm["choices"] = [
-                    {"name": c.get("name"), "odd": c.get("odd"), "change": c.get("change")}
+                    {
+                        "name": c.get("name"),
+                        "odd": c.get("odd"),
+                        "change": c.get("change"),
+                    }
                     for c in ch[:max_choices]
                     if isinstance(c, dict)
                 ]
@@ -466,7 +581,10 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
         ch = m.get("choices")
         if isinstance(ch, list):
             mm["choices"] = [
-                {"name": c.get("name"), "change": c.get("change")}
+                {
+                    "name": c.get("name"),
+                    "change": c.get("change"),
+                }
                 for c in ch[:max_choices]
                 if isinstance(c, dict)
             ]
@@ -498,10 +616,10 @@ def _build_ui_prompt(
         LLM_PROMPT_PREFIX,
         "",
         "Правила:",
-        "- НЕ давай прогнозов и рекомендаций (никаких 'ставь/бери/лучше/выгодно')",
-        "- Формат: сжато, списками, без воды",
-        "- В LIVE не показывай конкретные коэффициенты и числа (только направление/логика)",
-        "- Стиль: язык рынка/трейдинга, но понятно русскоговорящей аудитории",
+        "- НЕ давай прогнозов и рекомендаций",
+        "- НЕ используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%",
+        "- В LIVE (обычный) не показывай коэффициенты и числа — только направление и логику",
+        "- Ответ короткий. Списками.",
         "",
         f"Матч: {title}" + (f" ({league})" if league else ""),
         f"sport: {sport}",
@@ -520,60 +638,47 @@ def _build_ui_prompt(
     if mode == "live" and action == "pro":
         base += [
             "",
-            "Верни СТРОГО JSON (без markdown) по схеме ui_live_pro:",
+            "Это режим LIVE PRO: можно давать более детальную структуру, но всё равно БЕЗ рекомендаций.",
+            "Верни СТРОГО JSON (без markdown) по схеме:",
             (
-                '{"title":"...",'
-                '"bias":{"for_favorite":["..."],"against_favorite":["..."],"for_underdog":["..."],"against_underdog":["..."]},'
-                '"signals":[{"name":"...","direction":"up|down|flat|unknown","meaning":"...","confidence":"low|mid|high"}],'
-                '"trade_plan":{"scenarios":[{"if":"...","then":"...","invalidates":"..."}], "timeboxing":"..."},'
-                '"risks":["..."],'
-                '"disclaimer":"..."}'
-            ),
-            "Важно: НИГДЕ не пиши 'ставь/бери'. Это не совет, а разбор факторов и сценариев.",
-        ]
-        return "\n".join(base)
-
-    if mode == "live":
-        base += [
-            "",
-            "Верни СТРОГО JSON (без markdown) по схеме ui_live:",
-            (
-                '{"title":"...",'
+                '{'
+                '"title":"...",'
                 '"context":["..."],'
                 '"markets":[{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}],'
+                '"pro":{'
+                '"bias":"нейтрально/в пользу фаворита/против фаворита",'
+                '"levels":{"support":["..."],"resistance":["..."]},'
+                '"triggers":["..."],'
+                '"scenarios":[{"name":"...","if":"...","then":"..."}],'
+                '"risk_plan":["..."],'
+                '"notes":["..."]'
+                '},'
                 '"risks":["..."],'
-                '"disclaimer":"..."}'
+                '"disclaimer":"..."'
+                '}'
             ),
+            "",
+            "Важно: формулируй как анализ и сценарии, не как совет/инструкция.",
+        ]
+    elif mode == "live":
+        base += [
+            "",
+            "Верни СТРОГО JSON (без markdown) с полями:",
+            '{"title": "...", "context": ["..."], "markets": [{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
         ]
     else:
         base += [
             "",
-            "Верни СТРОГО JSON (без markdown) по схеме ui_pre:",
-            (
-                '{"title":"...",'
-                '"summary":"...",'
-                '"key_factors":["..."],'
-                '"line_logic":["..."],'
-                '"risks":["..."],'
-                '"disclaimer":"..."}'
-            ),
+            "Верни СТРОГО JSON (без markdown) с полями:",
+            '{"title": "...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}',
         ]
 
     return "\n".join(base)
 
 
 def _render_ui_json(analysis: Any, mode: str, action: str) -> str:
-    """
-    Универсальный рендер:
-    - ui_pre
-    - ui_live
-    - ui_live_pro
-    """
-    mode = (mode or "").lower()
-    action = (action or "").lower()
-
     if not isinstance(analysis, dict):
-        title = "🟢 LIVE" if mode == "live" else "📊 Обзор"
+        title = "🟢 LIVE" if (mode or "").lower() == "live" else "📊 Обзор"
         return (
             f"{title}\n\n"
             "Сейчас нет достаточных данных для аккуратного разбора.\n"
@@ -581,142 +686,122 @@ def _render_ui_json(analysis: Any, mode: str, action: str) -> str:
             "ℹ️ Аналитический материал. Не является рекомендацией."
         )
 
-    # ---------- LIVE PRO ----------
-    if mode == "live" and action == "pro":
-        title = str(analysis.get("title") or "🟢 LIVE-анализ — PRO").strip()
-        lines: List[str] = [title]
+    mode_l = (mode or "").lower()
+    action_l = (action or "").lower()
 
-        bias = analysis.get("bias") or {}
-        if isinstance(bias, dict):
-            ff = bias.get("for_favorite") or []
-            af = bias.get("against_favorite") or []
-            fu = bias.get("for_underdog") or []
-            au = bias.get("against_underdog") or []
-
-            def _blk(name: str, arr: Any, maxn: int = 5) -> None:
-                if not arr:
-                    return
-                lines.append("")
-                lines.append(name)
-                if isinstance(arr, list):
-                    for x in arr[:maxn]:
-                        lines.append(f"• {x}")
-                else:
-                    lines.append(f"• {str(arr)}")
-
-            _blk("Факторы в пользу фаворита", ff)
-            _blk("Факторы против фаворита", af)
-            _blk("Факторы в пользу андердога", fu)
-            _blk("Факторы против андердога", au)
-
-        sig = analysis.get("signals") or []
-        if sig:
-            lines.append("")
-            lines.append("Сигналы рынка")
-            if isinstance(sig, list):
-                for s in sig[:4]:
-                    if not isinstance(s, dict):
-                        continue
-                    nm = str(s.get("name") or "Сигнал")
-                    direction = str(s.get("direction") or "unknown")
-                    meaning = str(s.get("meaning") or "").strip()
-                    conf = str(s.get("confidence") or "").strip()
-                    tail = f" ({conf})" if conf else ""
-                    lines.append(f"— {nm}: {direction}{tail}")
-                    if meaning:
-                        lines.append(f"  {meaning}")
-
-        tp = analysis.get("trade_plan") or {}
-        if isinstance(tp, dict):
-            scen = tp.get("scenarios") or []
-            timebox = str(tp.get("timeboxing") or "").strip()
-
-            if scen:
-                lines.append("")
-                lines.append("План (сценарии)")
-                if isinstance(scen, list):
-                    for sc in scen[:3]:
-                        if not isinstance(sc, dict):
-                            continue
-                        _if = str(sc.get("if") or "").strip()
-                        _then = str(sc.get("then") or "").strip()
-                        inv = str(sc.get("invalidates") or "").strip()
-                        if _if:
-                            lines.append(f"• Если: {_if}")
-                        if _then:
-                            lines.append(f"  Тогда: {_then}")
-                        if inv:
-                            lines.append(f"  Отмена: {inv}")
-
-            if timebox:
-                lines.append("")
-                lines.append(f"Таймбокс: {timebox}")
-
-        risks = analysis.get("risks") or []
-        if risks:
-            lines.append("")
-            lines.append("Риски")
-            if isinstance(risks, list):
-                for r in risks[:6]:
-                    lines.append(f"• {r}")
-
-        disclaimer = str(analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией.").strip()
-        lines.append("")
-        lines.append(disclaimer)
-        return "\n".join(lines)
-
-    # ---------- PRE / LIVE базовые ----------
-    title = str(analysis.get("title") or ("🟢 LIVE" if mode == "live" else "📊 Обзор")).strip()
-    lines2: list[str] = [title]
+    title = str(
+        analysis.get("title")
+        or ("🟢 LIVE PRO" if (mode_l == "live" and action_l == "pro") else ("🟢 LIVE" if mode_l == "live" else "📊 Обзор"))
+    ).strip()
+    lines: list[str] = [title]
 
     if analysis.get("summary"):
-        lines2 += ["", str(analysis["summary"]).strip()]
+        lines += ["", str(analysis["summary"]).strip()]
 
     ctx = analysis.get("context") or []
     if ctx:
-        lines2.append("")
+        lines.append("")
         for x in ctx[:6]:
-            lines2.append(f"• {x}")
+            lines.append(f"• {x}")
 
     kf = analysis.get("key_factors") or []
     if kf:
-        lines2.append("")
-        lines2.append("Факторы")
+        lines.append("")
+        lines.append("Факторы")
         for x in kf[:6]:
-            lines2.append(f"• {x}")
+            lines.append(f"• {x}")
 
     ll = analysis.get("line_logic") or []
     if ll:
-        lines2.append("")
-        lines2.append("Логика линии")
+        lines.append("")
+        lines.append("Логика линии")
         for x in ll[:6]:
-            lines2.append(f"• {x}")
+            lines.append(f"• {x}")
 
     mk = analysis.get("markets") or []
     if mk:
-        lines2.append("")
-        lines2.append("Ключевые рынки")
+        lines.append("")
+        lines.append("Ключевые рынки")
         for item in mk[:4]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "Market"))
             direction = str(item.get("direction", "unknown"))
             logic = str(item.get("logic", "")).strip()
-            lines2.append(f"— {name}: {direction}")
+            lines.append(f"— {name}: {direction}")
             if logic:
-                lines2.append(f"  {logic}")
+                lines.append(f"  {logic}")
+
+    # PRO extra
+    if mode_l == "live" and action_l == "pro":
+        pro = analysis.get("pro") or {}
+        if isinstance(pro, dict):
+            bias = str(pro.get("bias") or "").strip()
+            if bias:
+                lines.append("")
+                lines.append("Смещение")
+                lines.append(f"• {bias}")
+
+            levels = pro.get("levels") or {}
+            if isinstance(levels, dict):
+                sup = levels.get("support") or []
+                res = levels.get("resistance") or []
+                if sup or res:
+                    lines.append("")
+                    lines.append("Уровни (интерпретация линии)")
+                    for x in (sup[:3] if isinstance(sup, list) else []):
+                        lines.append(f"• Поддержка: {x}")
+                    for x in (res[:3] if isinstance(res, list) else []):
+                        lines.append(f"• Сопротивление: {x}")
+
+            trig = pro.get("triggers") or []
+            if isinstance(trig, list) and trig:
+                lines.append("")
+                lines.append("Триггеры")
+                for x in trig[:4]:
+                    lines.append(f"• {x}")
+
+            scen = pro.get("scenarios") or []
+            if isinstance(scen, list) and scen:
+                lines.append("")
+                lines.append("Сценарии")
+                for s in scen[:3]:
+                    if not isinstance(s, dict):
+                        continue
+                    nm = str(s.get("name") or "").strip() or "Сценарий"
+                    iff = str(s.get("if") or "").strip()
+                    thn = str(s.get("then") or "").strip()
+                    lines.append(f"— {nm}")
+                    if iff:
+                        lines.append(f"  если: {iff}")
+                    if thn:
+                        lines.append(f"  то: {thn}")
+
+            rp = pro.get("risk_plan") or []
+            if isinstance(rp, list) and rp:
+                lines.append("")
+                lines.append("Риск-план")
+                for x in rp[:4]:
+                    lines.append(f"• {x}")
+
+            notes = pro.get("notes") or []
+            if isinstance(notes, list) and notes:
+                lines.append("")
+                lines.append("Заметки")
+                for x in notes[:4]:
+                    lines.append(f"• {x}")
 
     risks = analysis.get("risks") or []
     if risks:
-        lines2.append("")
-        lines2.append("Риски")
+        lines.append("")
+        lines.append("Риски")
         for r in risks[:6]:
-            lines2.append(f"• {r}")
+            lines.append(f"• {r}")
 
     disclaimer = str(analysis.get("disclaimer") or "ℹ️ Аналитический материал. Не является рекомендацией.").strip()
-    lines2.append("")
-    lines2.append(disclaimer)
-    return "\n".join(lines2)
+    lines.append("")
+    lines.append(disclaimer)
+    return "\n".join(lines)
 
 
 def _hash_cache_key(match_id: str, sport_slug: str, mode: str, action: str, cur_snap: Dict[str, Any]) -> str:
@@ -731,24 +816,15 @@ def _hash_cache_key(match_id: str, sport_slug: str, mode: str, action: str, cur_
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _pro_preview_text(match_title: str = "") -> str:
-    t = (match_title or "").strip()
-    head = "🟢 LIVE-анализ — PRO (превью)"
-    if t:
-        head = f"{head}\n{t}"
-    return "\n".join(
-        [
-            head,
-            "",
-            "В PRO ты получаешь:",
-            "• Факторы за/против фаворита и андердога (чтобы решать самому)",
-            "• Сигналы рынка: что двигает линию и почему",
-            "• 2–3 сценария + что является “отменой” сценария",
-            "",
-            "⭐ Нажми «Оформить PRO» (скоро подключим оплату).",
-            "",
-            "ℹ️ Аналитический материал. Не является рекомендацией.",
-        ]
+def _pro_teaser_footer() -> str:
+    return (
+        "\n\n"
+        "🔒 Полный LIVE PRO доступен в подписке.\n"
+        "Что даст PRO:\n"
+        "• уровни/триггеры/сценарии\n"
+        "• риск-план и условия отмены сценария\n"
+        "• меньше воды — больше структуры\n\n"
+        "Нажми: ⭐ Оформить PRO"
     )
 
 
@@ -759,10 +835,6 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     match_id = str(match_meta.get("id") or match_id).strip()
     mode = (mode or "pre").strip().lower()
     action = (action or "overview").strip().lower()
-
-    # PRO gating: только LIVE PRO
-    if mode == "live" and action == "pro" and not is_pro(user_id):
-        return _pro_preview_text(str(match_meta.get("title") or ""))
 
     cur_snap = {
         "status": match_meta.get("status"),
@@ -778,13 +850,36 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             action = "overview"
 
+    # ---------- LIVE PRO gating ----------
+    if mode == "live" and action == "pro" and not is_pro(user_id):
+        # делаем teaser на базе обычного LIVE overview (с шансом попасть в cache)
+        teaser_action = "overview"
+        prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
+
+        h = _hash_cache_key(match_id, sport_slug, mode, teaser_action, cur_snap)
+        cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
+
+        analysis, meta = await analyze_with_llm_cached(
+            prompt,
+            cache_key=cache_key,
+            schema="ui_live",
+            ttl_s=int(TTL_LIVE_S),
+            user_id=user_id,
+        )
+        _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
+        base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
+        # чуть укоротим и добавим CTA
+        return _truncate_telegram(base_txt) + _pro_teaser_footer()
+
+    # ---------- Normal / PRO ----------
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
 
     h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
     cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
     if mode == "live" and action == "pro":
-        schema = "ui_live_pro"
+        schema = "ui_live_pro"  # если в валидаторе схем нет — llm_client должен пропустить/soft-validate
         ttl_s = TTL_LIVE_PRO_S
     else:
         schema = "ui_live" if mode == "live" else "ui_pre"
@@ -824,11 +919,13 @@ def _map_button_to_ui(label: str) -> Optional[Tuple[str, str]]:
         return ("pre", "total")
     if "фора" in s or "handicap" in s:
         return ("pre", "handicap")
+    if "связк" in s:
+        return ("pre", "links")
 
     # live
     if ("обнов" in s or "refresh" in s) and ("live" in s or "лайв" in s):
         return ("live", "refresh")
-    if "pro" in s and ("live" in s or "лайв" in s):
+    if "live pro" in s or (("pro" in s) and ("live" in s or "лайв" in s)):
         return ("live", "pro")
     if "live" in s or "лайв" in s:
         return ("live", "overview")
@@ -854,8 +951,6 @@ def _format_env_status() -> str:
         "LLM_CACHE_TTL_S",
         "LLM_CACHE_TTL_LIVE_S",
         "LLM_CACHE_TTL_LIVE_PRO_S",
-        "PRO_ENABLED",
-        "PRO_USER_IDS",
     ]
     lines = ["🔧 ENV status"]
     for k in keys:
@@ -902,7 +997,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-18 v12 (LIVE PRO action + PRO gating MVP + TTL live_pro)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-18 v12 (LIVE PRO action + gating + pro_db.is_pro)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -945,6 +1040,44 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # strategy
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _md_safe_text(_format_expert_strategy_for_today())
+
+    # --------- NAV: страна / лига ----------
+    ctry = _parse_nav_country(text_raw)
+    if ctry:
+        idx = _build_index_for_user(user_id)
+        hit = None
+        for k in idx.keys():
+            if k.lower() == ctry.lower():
+                hit = k
+                break
+        country = hit or ctry
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        return _md_safe_text(_render_leagues(user_id, country))
+
+    lg = _parse_nav_league(text_raw)
+    if lg:
+        country, league, page = lg
+        idx = _build_index_for_user(user_id)
+
+        c_hit = None
+        for k in idx.keys():
+            if k.lower() == country.lower():
+                c_hit = k
+                break
+        country = c_hit or country
+
+        leagues = idx.get(country) or {}
+        l_hit = None
+        for k in leagues.keys():
+            if k.lower() == league.lower():
+                l_hit = k
+                break
+        league = l_hit or league
+
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        _ACTIVE_LEAGUE_BY_USER[user_id] = league
+        _ACTIVE_PAGE_BY_USER[user_id] = page
+        return _md_safe_text(_render_matches_page(user_id, country, league, page))
 
     # matches today (API)
     if norm.startswith("матчи сегодня"):
@@ -1015,27 +1148,11 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
                 return _md_safe_text("У тебя пока не задан банк. Установи: мой банк 100000")
             return _md_safe_text(f"Текущий банк: {bank:,.0f}".replace(",", " "))
 
-    # premium text fallback (если нажали текстом)
-    if "premium" in norm or "премиум" in norm:
-        pro_line = "✅ PRO активен" if is_pro(user_id) else "🔒 PRO не активен"
-        return _md_safe_text(
-            "\n".join(
-                [
-                    "⭐ Premium / PRO",
-                    pro_line,
-                    "",
-                    "PRO даёт:",
-                    "• LIVE PRO: факторы за/против фаворита и андердога",
-                    "• Сигналы движения линии + сценарии и отмены",
-                    "",
-                    "Пока оплата не подключена.",
-                ]
-            )
-        )
-
     help_text = (
         "Команды:\n\n"
         "• матчи сегодня football|ice-hockey|basketball|tennis|table-tennis|esports\n"
+        "• страна: <название>\n"
+        "• лига: <страна> | <лига> | <страница>\n"
         "• матч <id> (дальше кнопки PRE/LIVE/LIVE PRO)\n"
         "• стратегия\n"
         "• профиль\n"
