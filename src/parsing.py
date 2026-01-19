@@ -14,6 +14,8 @@ from typing import Optional, Tuple, Dict, Any, List
 from sqlmodel import Session, select
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import text
+
 from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy
@@ -118,6 +120,71 @@ def db_session() -> Session:
 
 
 # -----------------------------
+# TRIAL LIVE PRO (1 раз на пользователя)
+# -----------------------------
+def _trial_live_used(session: Session, user_id: int) -> bool:
+    """
+    True если trial уже использован.
+    Если записи пользователя нет — считаем что trial НЕ использован.
+    """
+    try:
+        row = session.exec(
+            text(
+                """
+                SELECT trial_live_used
+                FROM users
+                WHERE tg_user_id = :uid OR id = :uid
+                LIMIT 1
+                """
+            ),
+            params={"uid": int(user_id)},
+        ).first()
+        if not row:
+            return False
+        # row может быть Row/tuple
+        try:
+            m = row._mapping  # type: ignore[attr-defined]
+            return bool(m.get("trial_live_used"))
+        except Exception:
+            try:
+                # sqlite/tuple-like
+                return bool(row[0])
+            except Exception:
+                return False
+    except Exception:
+        logger.exception("_trial_live_used failed")
+        # безопаснее: если непонятно — не блокируем, даём trial
+        return False
+
+
+def _consume_trial_live(session: Session, user_id: int) -> bool:
+    """
+    Помечаем trial как использованный.
+    Делает UPSERT так, чтобы работало и в Postgres, и в SQLite.
+    """
+    try:
+        session.exec(
+            text(
+                """
+                INSERT INTO users (id, tg_user_id, trial_live_used, created_at, updated_at)
+                VALUES (:uid, :uid, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    tg_user_id = EXCLUDED.tg_user_id,
+                    trial_live_used = TRUE,
+                    updated_at = CURRENT_TIMESTAMP
+                """
+            ),
+            params={"uid": int(user_id)},
+        )
+        session.commit()
+        return True
+    except Exception:
+        session.rollback()
+        logger.exception("_consume_trial_live failed")
+        return False
+
+
+# -----------------------------
 # Профиль / банк
 # -----------------------------
 def _format_profile_text(bank: Optional[float], stats: bets_db.UserStats) -> str:
@@ -169,23 +236,23 @@ def _get_strategy_row(session: Session, day) -> Optional[ExpertStrategy]:
 def _format_expert_strategy_for_today() -> str:
     today = _msk_today_date()
 
-    text = ""
+    text_ = ""
     date_label = today.isoformat()
 
     try:
         with db_session() as session:
             row = _get_strategy_row(session, today)
             if row and row.text:
-                text = row.text
+                text_ = row.text
                 date_label = row.date.isoformat()
     except Exception:
         logger.exception("expert_strategy table missing or db error (fallback to env)")
 
-    if not text and EXPERT_STRATEGY_TEXT:
-        text = EXPERT_STRATEGY_TEXT
+    if not text_ and EXPERT_STRATEGY_TEXT:
+        text_ = EXPERT_STRATEGY_TEXT
         date_label = EXPERT_STRATEGY_DATE or date_label
 
-    if not text:
+    if not text_:
         return (
             "👤 Стратегия эксперта на сегодня (по МСК)\n"
             "Пока не опубликована.\n\n"
@@ -198,7 +265,7 @@ def _format_expert_strategy_for_today() -> str:
             "👤 Стратегия эксперта на сегодня (по МСК)",
             f"Дата: {date_label}",
             "",
-            text,
+            text_,
             "",
             "Дисклеймер: это аналитическая заметка, не призыв к действию.",
         ]
@@ -850,27 +917,50 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             action = "overview"
 
-    # ---------- LIVE PRO gating ----------
+    # ---------- LIVE PRO gating + TRIAL ----------
     if mode == "live" and action == "pro" and not is_pro(user_id):
-        # делаем teaser на базе обычного LIVE overview (с шансом попасть в cache)
-        teaser_action = "overview"
-        prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
+        # 1) Проверяем trial (1 раз)
+        trial_used = False
+        with db_session() as session:
+            trial_used = _trial_live_used(session, user_id)
 
-        h = _hash_cache_key(match_id, sport_slug, mode, teaser_action, cur_snap)
-        cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
+            # если trial не использован — активируем его и ПУСКАЕМ В ПОЛНЫЙ PRO
+            if not trial_used:
+                ok = _consume_trial_live(session, user_id)
+                if ok:
+                    # пометка для пользователя (не ломаем JSON-рендер)
+                    # просто добавим строку в готовый текст после рендера
+                    pass
+                else:
+                    # если не смогли пометить trial — безопасно показываем teaser
+                    trial_used = True
 
-        analysis, meta = await analyze_with_llm_cached(
-            prompt,
-            cache_key=cache_key,
-            schema="ui_live",
-            ttl_s=int(TTL_LIVE_S),
-            user_id=user_id,
-        )
-        _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+        if trial_used:
+            # trial уже использован => teaser
+            teaser_action = "overview"
+            prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
 
-        base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
-        # чуть укоротим и добавим CTA
-        return _truncate_telegram(base_txt) + _pro_teaser_footer()
+            h = _hash_cache_key(match_id, sport_slug, mode, teaser_action, cur_snap)
+            cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
+
+            analysis, meta = await analyze_with_llm_cached(
+                prompt,
+                cache_key=cache_key,
+                schema="ui_live",
+                ttl_s=int(TTL_LIVE_S),
+                user_id=user_id,
+            )
+            _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
+            base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
+            return _truncate_telegram(base_txt) + _pro_teaser_footer()
+
+        # trial был НЕ использован => мы его активировали и идём дальше как в PRO
+        # (то есть выполняем нормальный блок ниже для mode=live/action=pro)
+        # Добавим короткую пометку сверху после рендера.
+        trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
+    else:
+        trial_banner = ""
 
     # ---------- Normal / PRO ----------
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
@@ -879,7 +969,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
     if mode == "live" and action == "pro":
-        schema = "ui_live_pro"  # если в валидаторе схем нет — llm_client должен пропустить/soft-validate
+        schema = "ui_live_pro"
         ttl_s = TTL_LIVE_PRO_S
     else:
         schema = "ui_live" if mode == "live" else "ui_pre"
@@ -894,7 +984,13 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     )
 
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
-    return _render_ui_json(analysis, mode=mode, action=action)
+    out = _render_ui_json(analysis, mode=mode, action=action)
+
+    # если это был trial-запуск — добавим баннер
+    if trial_banner and mode == "live" and action == "pro":
+        out = trial_banner + out
+
+    return out
 
 
 # -----------------------------
@@ -997,7 +1093,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-18 v12 (LIVE PRO action + gating + pro_db.is_pro)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-19 v13 (LIVE PRO trial 1/1 + DB flag users.trial_live_used)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -1130,7 +1226,12 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
             stats = bets_db.get_user_stats(session, user_id)
-        return _md_safe_text(_format_profile_text(bank, stats))
+
+            # покажем trial статус (приятно для дебага)
+            trial_used = _trial_live_used(session, user_id)
+
+        extra = f"\n\nTrial LIVE PRO: {'использован' if trial_used else 'доступен (1/1)'}"
+        return _md_safe_text(_format_profile_text(bank, stats) + extra)
 
     # bank
     if "банк" in norm:
