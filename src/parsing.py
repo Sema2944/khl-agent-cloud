@@ -917,14 +917,13 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             action = "overview"
 
-    # ---------- LIVE PRO gating + TRIAL ----------
+       # ---------- LIVE PRO gating + TRIAL ----------
     trial_banner = ""
 
-if mode == "live" and action == "pro" and not is_pro(user_id):
-    ...
-
+    if mode == "live" and action == "pro" and not is_pro(user_id):
         # 1) Проверяем trial (1 раз)
         trial_used = False
+
         with db_session() as session:
             trial_used = _trial_live_used(session, user_id)
 
@@ -932,9 +931,7 @@ if mode == "live" and action == "pro" and not is_pro(user_id):
             if not trial_used:
                 ok = _consume_trial_live(session, user_id)
                 if ok:
-                    # пометка для пользователя (не ломаем JSON-рендер)
-                    # просто добавим строку в готовый текст после рендера
-                    pass
+                    trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
                 else:
                     # если не смогли пометить trial — безопасно показываем teaser
                     trial_used = True
@@ -954,10 +951,11 @@ if mode == "live" and action == "pro" and not is_pro(user_id):
                 ttl_s=int(TTL_LIVE_S),
                 user_id=user_id,
             )
-            _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
 
+            _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
             return _truncate_telegram(base_txt) + _pro_teaser_footer()
+
 
         # trial был НЕ использован => мы его активировали и идём дальше как в PRO
         # (то есть выполняем нормальный блок ниже для mode=live/action=pro)
