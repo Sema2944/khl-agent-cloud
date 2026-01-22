@@ -918,7 +918,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             action = "overview"
 
     # ---------- LIVE PRO gating + TRIAL ----------
-    if mode == "live" and action == "pro" and not is_pro(user_id):
+    trial_banner = ""
+
+if mode == "live" and action == "pro" and not is_pro(user_id):
+    ...
+
         # 1) Проверяем trial (1 раз)
         trial_used = False
         with db_session() as session:
