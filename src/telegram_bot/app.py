@@ -295,8 +295,10 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         }
 
     for key, ids in match_ids_by_league.items():
+
         def _sk(mid_: str) -> str:
             return (match_meta.get(mid_) or {}).get("start_time") or ""
+
         ids.sort(key=_sk)
 
     return _NavState(
@@ -803,7 +805,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             sport_slug = "ice-hockey"
             match_id = data.split(":", 1)[1].strip()
 
-        # прогреваем контекст для parsing.py
+        # прогреваем контекст для parsing.py (чтобы match_details работал даже без кеша)
         try:
             await call_agent_local(user_id, f"матчи сегодня {sport_slug}")
         except Exception:
@@ -840,21 +842,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         mode = parts[2].strip().lower()
         action = parts[3].strip().lower()
 
-        # гейтинг PRO (чтобы не дергать LLM лишний раз)
-        if action == "pro" and not is_pro(user_id):
-            txt = _truncate_tg(
-                "🟢 *LIVE PRO — превью*\n\n"
-                "• Факторы *за фаворита* / *против фаворита*\n"
-                "• Триггеры и условия отмены сценария\n"
-                "• Риски и риск-план\n\n"
-                "Чтобы открыть полный PRO-разбор — оформи PRO."
-            )
-            try:
-                await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
-            except Exception:
-                await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
-            return
-
+        # ВАЖНО:
+        # НЕ блокируем LIVE PRO здесь — иначе Trial (1/1) из parsing.py никогда не сработает.
+        # Вся логика trial/pro/teaser — в src/parsing.py (_run_ui_llm).
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
 
