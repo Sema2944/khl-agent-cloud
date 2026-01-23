@@ -8,7 +8,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Dict, Union
+from typing import Any, Optional, Tuple, Dict, Union, Iterable
 
 import httpx
 
@@ -78,12 +78,25 @@ class LLMAnalysis:
 # -----------------------------
 # Helpers
 # -----------------------------
-def _contains_banned_phrases(obj: Any) -> bool:
+def _find_banned_phrase_in_text(text: str, banned: Iterable[str]) -> Optional[str]:
+    t = (text or "").lower()
+    for p in banned:
+        pp = (p or "").lower().strip()
+        if pp and pp in t:
+            return p
+    return None
+
+
+def _find_banned_phrase(obj: Any) -> Optional[str]:
     try:
         s = json.dumps(obj, ensure_ascii=False).lower()
     except Exception:
         s = str(obj).lower()
-    return any(p in s for p in _BANNED_PHRASES)
+    return _find_banned_phrase_in_text(s, _BANNED_PHRASES)
+
+
+def _contains_banned_phrases(obj: Any) -> bool:
+    return _find_banned_phrase(obj) is not None
 
 
 def _clamp01(x: Any) -> float:
@@ -175,6 +188,35 @@ def _max_tokens_for_schema(schema: str) -> int:
     if schema in ("ui_pre", "ui_live"):
         return 520
     return 300
+
+
+def _make_repair_domain_prompt(schema: str, original_domain_prompt: str, bad_obj: Any) -> str:
+    """
+    Просим модель переписать свой JSON, убрав запрещённые фразы.
+    Важно: _openai_chat_json сам оборачивает это в user prompt.
+    """
+    bad_json = ""
+    try:
+        bad_json = json.dumps(bad_obj, ensure_ascii=False)
+    except Exception:
+        bad_json = str(bad_obj)
+
+    return (
+        "ВНИМАНИЕ: твой предыдущий ответ будет отклонён из-за запрещённых слов/фраз.\n"
+        "Нужно переписать ответ, сохранив смысл и СТРУКТУРУ строго по схеме, но без запрещённых слов.\n\n"
+        f"Schema: {schema}\n"
+        "Запрещённые слова/фразы (нельзя использовать ни в каком виде):\n"
+        + ", ".join(_BANNED_PHRASES)
+        + "\n\n"
+        "Правила:\n"
+        "- Верни СТРОГО JSON-объект (без markdown, без текста вне JSON)\n"
+        "- НЕ давай прогнозов, советов или призывов\n"
+        "- В LIVE не показывай коэффициенты и числа\n\n"
+        "Исходный вход (контекст), который нужно учитывать:\n"
+        f"{(original_domain_prompt or '').strip()}\n\n"
+        "Твой предыдущий JSON (перепиши его корректно):\n"
+        f"{bad_json}\n"
+    )
 
 
 # -----------------------------
@@ -553,8 +595,20 @@ async def analyze_with_llm_cached(
                     max_tokens=max_tokens_hint,
                 )
 
-                if _contains_banned_phrases(obj):
-                    raise ValueError("banned_phrases_in_output")
+                # ---------- banned-phrases auto-repair (1 retry inside attempt) ----------
+                hit = _find_banned_phrase(obj)
+                if hit:
+                    repair_prompt = _make_repair_domain_prompt(schema, domain_prompt, obj)
+                    obj2 = await _openai_chat_json(
+                        repair_prompt,
+                        timeout_s=attempt_timeout,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens_hint,
+                    )
+                    hit2 = _find_banned_phrase(obj2)
+                    if hit2:
+                        raise ValueError(f"banned_phrases_in_output:{hit2}")
+                    obj = obj2
 
                 if schema == "legacy":
                     ok, analysis, msg = validate_analysis_json(obj)
