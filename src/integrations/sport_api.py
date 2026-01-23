@@ -447,110 +447,38 @@ class SportAPIClient:
 
         return out
 
-    async def match_details(self, sport_slug: str, match_id: str) -> MatchItem:
-        sport_slug = (sport_slug or "").strip().lower()
-        match_id = str(match_id).strip()
+    async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
+    """
+    FIX: api.api-sport.ru НЕ поддерживает /v2/<sport>/<id>
+    Нормальный details: /v2/<sport>/matches/<id>
+    """
+    sport_slug = sport_slug.strip()
+    match_id = str(match_id).strip()
 
-        # у провайдера может быть другой эндпоинт, но оставим рабочий вариант
-        path = f"v2/{sport_slug}/{match_id}"
-        data = await self._get(path)
+    candidates = [
+        f"/v2/{sport_slug}/matches/{match_id}",
+        f"/v2/{sport_slug}/events/{match_id}",
+        # если у провайдера есть query-style:
+        (f"/v2/{sport_slug}/matches", {"id": match_id}),
+    ]
 
-        if isinstance(data, dict):
-            m = data.get("data") if isinstance(data.get("data"), dict) else data
-            if not isinstance(m, dict):
-                m = data
-        else:
-            raise SportAPIError(f"unexpected response shape for match_details: {type(data).__name__}")
+    last_err = None
 
-        return MatchItem(
-            id=match_id,
-            sport_slug=sport_slug,
-            title=self._infer_title(m),
-            league=self._infer_league(m),
-            country=self._infer_country(m),
-            status=self._infer_status(m),
-            start_time=self._infer_start_time(m),
-            score=self._infer_score(m),
-            odds_base=self._infer_odds_base(m),
-        )
+    for item in candidates:
+        try:
+            if isinstance(item, tuple):
+                path, params = item
+                data = await self._get(path, params=params)  # <- у тебя в файле судя по логам _get()
+            else:
+                path = item
+                data = await self._get(path)
 
-    async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
-        sport_slug = (sport_slug or "").strip().lower()
-        match_id = str(match_id).strip()
+            obj = self._unwrap_obj(data)
+            if obj:
+                return self._match_to_dto(obj, sport_slug)
 
-        candidates = [
-            f"v2/{sport_slug}/{match_id}/odds",
-            f"v2/{sport_slug}/{match_id}/markets",
-            f"v2/{sport_slug}/{match_id}/line",
-        ]
+        except Exception as e:
+            last_err = e
 
-        last_err: Optional[Exception] = None
-        data: Any = None
-        used_path = ""
+    raise SportAPIError(f"match_details failed: {sport_slug}/{match_id}: {last_err}")
 
-        for p in candidates:
-            try:
-                data = await self._get(p)
-                used_path = p
-                break
-            except Exception as e:
-                last_err = e
-
-        if data is None:
-            raise SportAPIError(f"all odds endpoints failed: {last_err}")
-
-        raw: Dict[str, Any]
-        if isinstance(data, dict):
-            raw = data
-        else:
-            raw = {"data": data}
-
-        moneyline = None
-        total_main = None
-        handicap_main = None
-
-        root = data
-        if isinstance(data, dict):
-            for k in ("data", "odds", "markets", "result"):
-                if k in data:
-                    root = data[k]
-                    break
-
-        markets = None
-        if isinstance(root, list):
-            markets = root
-        elif isinstance(root, dict):
-            for k in ("markets", "items", "data", "lines"):
-                if isinstance(root.get(k), list):
-                    markets = root[k]
-                    break
-
-        if isinstance(markets, list):
-
-            def mname(x: Dict[str, Any]) -> str:
-                n = x.get("name") or x.get("key") or x.get("type") or ""
-                return str(n).lower()
-
-            for mm in markets:
-                if not isinstance(mm, dict):
-                    continue
-                n = mname(mm)
-                if (moneyline is None) and ("1x2" in n or "moneyline" in n or "winner" in n):
-                    moneyline = mm
-                if (total_main is None) and ("total" in n or ("over" in n and "under" in n)):
-                    total_main = mm
-                if (handicap_main is None) and ("handicap" in n or "spread" in n):
-                    handicap_main = mm
-
-        merged_raw: Dict[str, Any]
-        if isinstance(raw, dict):
-            merged_raw = {"_used_path": used_path, **raw}
-        else:
-            merged_raw = {"_used_path": used_path, "raw": raw}
-
-        return OddsSnapshot(
-            raw=merged_raw,
-            moneyline=moneyline,
-            total_main=total_main,
-            handicap_main=handicap_main,
-        )
