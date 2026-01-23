@@ -8,7 +8,7 @@ import os
 import re
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Tuple, Dict, Any, List
 
 from sqlmodel import Session, select
@@ -35,17 +35,17 @@ LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
 if not LLM_PROMPT_PREFIX:
     LLM_PROMPT_PREFIX = (
         "Ты дружелюбный, структурированный и безопасный спортивный аналитик.\n"
-        "Твоя задача — объяснять логику линии и движения.\n"
-        "НЕ предсказывай исход и НЕ давай советов/рекомендаций.\n"
+        "Объясняй логику движения линии.\n"
+        "НЕ предсказывай исход и НЕ давай советов.\n"
         "Пиши коротко, списками."
     )
 
 # -----------------------------
 # TTL policy for LLM caching
 # -----------------------------
-TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())               # 15 минут
-TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())         # 25 секунд
-TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "20").strip()) # 20 секунд
+TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())                 # prematch
+TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "75").strip())            # LIVE (default 75s)
+TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "75").strip())    # LIVE PRO (default 75s)
 
 _ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
 _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
@@ -78,7 +78,7 @@ def _now_ts() -> int:
     return int(time.time())
 
 
-def _msk_today_date():
+def _msk_today_date() -> date:
     return datetime.now(MSK).date()
 
 
@@ -123,10 +123,6 @@ def db_session() -> Session:
 # TRIAL LIVE PRO (1 раз на пользователя)
 # -----------------------------
 def _trial_live_used(session: Session, user_id: int) -> bool:
-    """
-    True если trial уже использован.
-    Если записи пользователя нет — считаем что trial НЕ использован.
-    """
     try:
         row = session.exec(
             text(
@@ -155,10 +151,6 @@ def _trial_live_used(session: Session, user_id: int) -> bool:
 
 
 def _consume_trial_live(session: Session, user_id: int) -> bool:
-    """
-    Помечаем trial как использованный.
-    Делает UPSERT так, чтобы работало и в Postgres, и в SQLite.
-    """
     try:
         session.exec(
             text(
@@ -565,29 +557,85 @@ def _format_match_hub_text(
     return "\n".join(lines)
 
 
+def _extract_date_from_start_time(start_time: str) -> Optional[date]:
+    if not start_time:
+        return None
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", str(start_time))
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(m.group(1)).date()
+    except Exception:
+        return None
+
+
+async def _refresh_match_from_day_list(
+    sport_slug: str,
+    match_id: str,
+    day: date,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fallback refresher: re-fetch day list and find match_id there.
+    This avoids relying solely on match_details which can be flaky/404 on some providers.
+    """
+    try:
+        from .integrations.sport_api import SportAPIClient
+        api = SportAPIClient()
+        matches = await api.matches_by_date(sport_slug, day)
+        for m in matches:
+            if str(getattr(m, "id", "")) == str(match_id):
+                return {
+                    "sport": getattr(m, "sport_slug", sport_slug),
+                    "title": getattr(m, "title", f"Матч {match_id}"),
+                    "league": getattr(m, "league", ""),
+                    "status": getattr(m, "status", ""),
+                    "start_time": getattr(m, "start_time", ""),
+                    "score": getattr(m, "score", ""),
+                    "odds_base": getattr(m, "odds_base", None),
+                    "country": getattr(m, "country", "") if hasattr(m, "country") else "",
+                }
+    except Exception:
+        logger.exception("_refresh_match_from_day_list failed")
+    return None
+
+
 async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
     """
-    Контекст матча: берём из кеша (матчи сегодня).
-    Но если матч LIVE/FINISHED и score пустой — дотягиваем match_details из API.
+    Контекст матча:
+    1) берём из кеша (матчи сегодня)
+    2) если LIVE/FINISHED и нет score/статус странный — пытаемся освежить:
+       a) match_details()
+       b) если оно не работает / 404 — refresh from day list (matches_by_date + поиск id)
     """
     match_id = str(match_id).strip()
     cached = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(match_id)
-
     sport = (_ACTIVE_SPORT_BY_USER.get(user_id) or "").strip().lower()
 
-    if cached:
-        try:
-            c_status = str(cached.get("status") or "").strip().lower()
-            c_score = str(cached.get("score") or "").strip()
-            is_live = c_status in {"live", "inprogress", "in_progress"}
-            is_done = c_status in {"finished", "ended"}
+    def _is_live_done(st: str) -> Tuple[bool, bool]:
+        s = (st or "").strip().lower()
+        is_live = s in {"live", "inprogress", "in_progress"}
+        is_done = s in {"finished", "ended"}
+        return is_live, is_done
 
-            if (is_live or is_done) and not c_score and sport:
+    if cached:
+        c_status = str(cached.get("status") or "").strip()
+        c_score = str(cached.get("score") or "").strip()
+        is_live, is_done = _is_live_done(c_status)
+
+        need_refresh = (is_live or is_done) and (not c_score)
+        # также если статус пустой — полезно освежить
+        if not c_status:
+            need_refresh = True
+
+        if need_refresh and sport:
+            merged = dict(cached)
+
+            # 1) try match_details
+            try:
                 from .integrations.sport_api import SportAPIClient
                 api = SportAPIClient()
                 d = await api.match_details(sport, match_id)
 
-                merged = dict(cached)
                 merged.update(
                     {
                         "sport": getattr(d, "sport_slug", merged.get("sport") or sport),
@@ -600,17 +648,23 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                         "country": getattr(d, "country", merged.get("country") or "") if hasattr(d, "country") else merged.get("country") or "",
                     }
                 )
+            except Exception:
+                logger.exception("match_details refresh failed; will try day-list refresh")
 
-                # обновим кеш, чтобы следующий раз уже было с score
-                (_MATCH_CACHE_BY_USER.setdefault(user_id, {}))[match_id] = merged
-                return dict(merged, id=match_id)
+            # 2) day-list refresh if still no score/status
+            if (not str(merged.get("score") or "").strip()) or (not str(merged.get("status") or "").strip()):
+                day = _extract_date_from_start_time(str(merged.get("start_time") or "")) or _msk_today_date()
+                refreshed = await _refresh_match_from_day_list(sport, match_id, day)
+                if refreshed:
+                    merged.update(refreshed)
 
-        except Exception:
-            logger.exception("match_details refresh failed; fallback to cached")
+            # update cache
+            (_MATCH_CACHE_BY_USER.setdefault(user_id, {}))[match_id] = merged
+            return dict(merged, id=match_id)
 
         return dict(cached, id=match_id)
 
-    # если в кеше нет — пробуем match_details (если известен sport)
+    # cache miss: try match_details then day-list refresh (today)
     if sport:
         try:
             from .integrations.sport_api import SportAPIClient
@@ -628,7 +682,11 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                 "country": getattr(d, "country", "") if hasattr(d, "country") else "",
             }
         except Exception:
-            pass
+            logger.exception("match_details on cache miss failed; will try day-list refresh")
+
+        refreshed = await _refresh_match_from_day_list(sport, match_id, _msk_today_date())
+        if refreshed:
+            return dict(refreshed, id=match_id)
 
     return {
         "id": match_id,
@@ -652,8 +710,8 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
     if not isinstance(markets, list):
         return {"odds": {"present": True, "markets": []}}
 
-    max_markets = 4 if (mode or "").lower() == "live" else 5
-    max_choices = 4 if (mode or "").lower() == "live" else 5
+    max_markets = 3 if (mode or "").lower() == "live" else 5
+    max_choices = 3 if (mode or "").lower() == "live" else 5
 
     if (mode or "").lower() != "live":
         slim: List[Dict[str, Any]] = []
@@ -671,6 +729,7 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
             slim.append(mm)
         return {"odds": {"present": True, "markets": slim}}
 
+    # LIVE: максимально лёгкий снапшот без odds
     slim_live: List[Dict[str, Any]] = []
     for m in markets[:max_markets]:
         if not isinstance(m, dict):
@@ -697,6 +756,12 @@ def _build_ui_prompt(
     prev_snap: Optional[Dict[str, Any]],
     cur_snap: Dict[str, Any],
 ) -> str:
+    """
+    URGENT: trimmed LIVE prompt to reduce tokens.
+    - less boilerplate
+    - short schema
+    - keep only essentials + slim snapshot
+    """
     mode = (mode or "pre").lower()
     action = (action or "overview").lower()
 
@@ -707,14 +772,12 @@ def _build_ui_prompt(
     status = str(match_meta.get("status") or "").strip()
     score = str(match_meta.get("score") or "").strip()
 
-    base = [
+    head = [
         LLM_PROMPT_PREFIX,
         "",
-        "Правила:",
-        "- НЕ давай прогнозов и рекомендаций",
-        "- НЕ используй слова: ставь, бери, выгодно, лучше, проход, гарантия, 100%",
-        "- В LIVE (обычный) не показывай коэффициенты и числа — только направление и логику",
-        "- Ответ короткий. Списками.",
+        "Ограничения: без прогнозов/советов; не использовать слова: ставь/бери/выгодно/лучше/проход/гарантия/100%.",
+        "LIVE: без коэффициентов и чисел, только направление и логика.",
+        "Верни только JSON (без markdown/текста).",
         "",
         f"Матч: {title}" + (f" ({league})" if league else ""),
         f"sport: {sport}",
@@ -724,51 +787,29 @@ def _build_ui_prompt(
         f"mode: {mode}",
         f"action: {action}",
         "",
-        f"Текущий снапшот (JSON): {json.dumps(cur_snap, ensure_ascii=False)}",
+        f"snapshot: {json.dumps(cur_snap, ensure_ascii=False, separators=(',', ':'))}",
     ]
 
     if prev_snap:
-        base.append(f"Предыдущий снапшот (JSON): {json.dumps(prev_snap, ensure_ascii=False)}")
+        head.append(f"prev_snapshot: {json.dumps(prev_snap, ensure_ascii=False, separators=(',', ':'))}")
 
     if mode == "live" and action == "pro":
-        base += [
+        head += [
             "",
-            "Это режим LIVE PRO: можно давать более детальную структуру, но всё равно БЕЗ рекомендаций.",
-            "Верни СТРОГО JSON (без markdown) по схеме:",
-            (
-                "{"
-                '"title":"...",'
-                '"context":["..."],'
-                '"markets":[{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}],'
-                '"pro":{'
-                '"bias":"нейтрально/в пользу фаворита/против фаворита",'
-                '"levels":{"support":["..."],"resistance":["..."]},'
-                '"triggers":["..."],'
-                '"scenarios":[{"name":"...","if":"...","then":"..."}],'
-                '"risk_plan":["..."],'
-                '"notes":["..."]'
-                "},"
-                '"risks":["..."],'
-                '"disclaimer":"..."'
-                "}"
-            ),
-            "",
-            "Важно: формулируй как анализ и сценарии, не как совет/инструкция.",
+            'schema(ui_live_pro): {"title":str,"context":[str],"markets":[{"name":str,"direction":"up|down|flat|unknown","logic":str}],"pro":{"bias":str,"levels":{"support":[str],"resistance":[str]},"triggers":[str],"scenarios":[{"name":str,"if":str,"then":str}],"risk_plan":[str],"notes":[str]},"risks":[str],"disclaimer":str}',
         ]
     elif mode == "live":
-        base += [
+        head += [
             "",
-            "Верни СТРОГО JSON (без markdown) с полями:",
-            '{"title": "...", "context": ["..."], "markets": [{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}], "risks": ["..."], "disclaimer":"..."}',
+            'schema(ui_live): {"title":str,"context":[str],"markets":[{"name":str,"direction":"up|down|flat|unknown","logic":str}],"risks":[str],"disclaimer":str}',
         ]
     else:
-        base += [
+        head += [
             "",
-            "Верни СТРОГО JSON (без markdown) с полями:",
-            '{"title": "...", "summary":"...", "key_factors":["..."], "line_logic":["..."], "risks":["..."], "disclaimer":"..."}',
+            'schema(ui_pre): {"title":str,"summary":str,"key_factors":[str],"line_logic":[str],"risks":[str],"disclaimer":str}',
         ]
 
-    return "\n".join(base)
+    return "\n".join(head)
 
 
 def _render_ui_json(analysis: Any, mode: str, action: str) -> str:
@@ -969,7 +1010,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
 
             h = _hash_cache_key(match_id, sport_slug, mode, teaser_action, cur_snap)
-            cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
+            cache_key = f"v15:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
 
             analysis, meta = await analyze_with_llm_cached(
                 prompt,
@@ -989,7 +1030,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
 
     h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
-    cache_key = f"v12:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+    cache_key = f"v15:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
     if mode == "live" and action == "pro":
         schema = "ui_live_pro"
@@ -1115,7 +1156,9 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-23 v14 (hub score refresh for LIVE/FINISHED + LIVE PRO trial 1/1)")
+        return _md_safe_text(
+            "✅ parsing.py version: 2026-01-23 v15 (LIVE prompt trimmed + TTL live=75s default + match refresh via day list + fixed match_details flow)"
+        )
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -1158,6 +1201,44 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # strategy
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _md_safe_text(_format_expert_strategy_for_today())
+
+    # --------- NAV: страна / лига ----------
+    ctry = _parse_nav_country(text_raw)
+    if ctry:
+        idx = _build_index_for_user(user_id)
+        hit = None
+        for k in idx.keys():
+            if k.lower() == ctry.lower():
+                hit = k
+                break
+        country = hit or ctry
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        return _md_safe_text(_render_leagues(user_id, country))
+
+    lg = _parse_nav_league(text_raw)
+    if lg:
+        country, league, page = lg
+        idx = _build_index_for_user(user_id)
+
+        c_hit = None
+        for k in idx.keys():
+            if k.lower() == country.lower():
+                c_hit = k
+                break
+        country = c_hit or country
+
+        leagues = idx.get(country) or {}
+        l_hit = None
+        for k in leagues.keys():
+            if k.lower() == league.lower():
+                l_hit = k
+                break
+        league = l_hit or league
+
+        _ACTIVE_COUNTRY_BY_USER[user_id] = country
+        _ACTIVE_LEAGUE_BY_USER[user_id] = league
+        _ACTIVE_PAGE_BY_USER[user_id] = page
+        return _md_safe_text(_render_matches_page(user_id, country, league, page))
 
     # matches today (API)
     if norm.startswith("матчи сегодня"):
@@ -1234,6 +1315,8 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     help_text = (
         "Команды:\n\n"
         "• матчи сегодня football|ice-hockey|basketball|tennis|table-tennis|esports\n"
+        "• страна: <название>\n"
+        "• лига: <страна> | <лига> | <страница>\n"
         "• матч <id> (дальше кнопки PRE/LIVE/LIVE PRO)\n"
         "• стратегия\n"
         "• профиль\n"
