@@ -43,7 +43,7 @@ if not LLM_PROMPT_PREFIX:
 # -----------------------------
 # TTL policy for LLM caching
 # -----------------------------
-TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())              # 15 минут
+TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())               # 15 минут
 TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip())         # 25 секунд
 TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "20").strip()) # 20 секунд
 
@@ -141,19 +141,16 @@ def _trial_live_used(session: Session, user_id: int) -> bool:
         ).first()
         if not row:
             return False
-        # row может быть Row/tuple
         try:
             m = row._mapping  # type: ignore[attr-defined]
             return bool(m.get("trial_live_used"))
         except Exception:
             try:
-                # sqlite/tuple-like
                 return bool(row[0])
             except Exception:
                 return False
     except Exception:
         logger.exception("_trial_live_used failed")
-        # безопаснее: если непонятно — не блокируем, даём trial
         return False
 
 
@@ -569,16 +566,54 @@ def _format_match_hub_text(
 
 
 async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
+    """
+    Контекст матча: берём из кеша (матчи сегодня).
+    Но если матч LIVE/FINISHED и score пустой — дотягиваем match_details из API.
+    """
     match_id = str(match_id).strip()
     cached = (_MATCH_CACHE_BY_USER.get(user_id) or {}).get(match_id)
-    if cached:
-        return dict(cached, id=match_id)
 
     sport = (_ACTIVE_SPORT_BY_USER.get(user_id) or "").strip().lower()
+
+    if cached:
+        try:
+            c_status = str(cached.get("status") or "").strip().lower()
+            c_score = str(cached.get("score") or "").strip()
+            is_live = c_status in {"live", "inprogress", "in_progress"}
+            is_done = c_status in {"finished", "ended"}
+
+            if (is_live or is_done) and not c_score and sport:
+                from .integrations.sport_api import SportAPIClient
+                api = SportAPIClient()
+                d = await api.match_details(sport, match_id)
+
+                merged = dict(cached)
+                merged.update(
+                    {
+                        "sport": getattr(d, "sport_slug", merged.get("sport") or sport),
+                        "title": getattr(d, "title", merged.get("title") or f"Матч {match_id}"),
+                        "league": getattr(d, "league", merged.get("league") or ""),
+                        "status": getattr(d, "status", merged.get("status") or ""),
+                        "start_time": getattr(d, "start_time", merged.get("start_time") or ""),
+                        "score": getattr(d, "score", merged.get("score") or ""),
+                        "odds_base": getattr(d, "odds_base", merged.get("odds_base")),
+                        "country": getattr(d, "country", merged.get("country") or "") if hasattr(d, "country") else merged.get("country") or "",
+                    }
+                )
+
+                # обновим кеш, чтобы следующий раз уже было с score
+                (_MATCH_CACHE_BY_USER.setdefault(user_id, {}))[match_id] = merged
+                return dict(merged, id=match_id)
+
+        except Exception:
+            logger.exception("match_details refresh failed; fallback to cached")
+
+        return dict(cached, id=match_id)
+
+    # если в кеше нет — пробуем match_details (если известен sport)
     if sport:
         try:
             from .integrations.sport_api import SportAPIClient
-
             api = SportAPIClient()
             d = await api.match_details(sport, match_id)
             return {
@@ -629,11 +664,7 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
             ch = m.get("choices")
             if isinstance(ch, list):
                 mm["choices"] = [
-                    {
-                        "name": c.get("name"),
-                        "odd": c.get("odd"),
-                        "change": c.get("change"),
-                    }
+                    {"name": c.get("name"), "odd": c.get("odd"), "change": c.get("change")}
                     for c in ch[:max_choices]
                     if isinstance(c, dict)
                 ]
@@ -648,10 +679,7 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
         ch = m.get("choices")
         if isinstance(ch, list):
             mm["choices"] = [
-                {
-                    "name": c.get("name"),
-                    "change": c.get("change"),
-                }
+                {"name": c.get("name"), "change": c.get("change")}
                 for c in ch[:max_choices]
                 if isinstance(c, dict)
             ]
@@ -708,7 +736,7 @@ def _build_ui_prompt(
             "Это режим LIVE PRO: можно давать более детальную структуру, но всё равно БЕЗ рекомендаций.",
             "Верни СТРОГО JSON (без markdown) по схеме:",
             (
-                '{'
+                "{"
                 '"title":"...",'
                 '"context":["..."],'
                 '"markets":[{"name":"1X2|Total|Handicap|Odds","direction":"up|down|flat|unknown","logic":"..."}],'
@@ -719,10 +747,10 @@ def _build_ui_prompt(
                 '"scenarios":[{"name":"...","if":"...","then":"..."}],'
                 '"risk_plan":["..."],'
                 '"notes":["..."]'
-                '},'
+                "},"
                 '"risks":["..."],'
                 '"disclaimer":"..."'
-                '}'
+                "}"
             ),
             "",
             "Важно: формулируй как анализ и сценарии, не как совет/инструкция.",
@@ -758,7 +786,11 @@ def _render_ui_json(analysis: Any, mode: str, action: str) -> str:
 
     title = str(
         analysis.get("title")
-        or ("🟢 LIVE PRO" if (mode_l == "live" and action_l == "pro") else ("🟢 LIVE" if mode_l == "live" else "📊 Обзор"))
+        or (
+            "🟢 LIVE PRO"
+            if (mode_l == "live" and action_l == "pro")
+            else ("🟢 LIVE" if mode_l == "live" else "📊 Обзор")
+        )
     ).strip()
     lines: list[str] = [title]
 
@@ -917,27 +949,22 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             action = "overview"
 
-       # ---------- LIVE PRO gating + TRIAL ----------
+    # ---------- LIVE PRO gating + TRIAL ----------
     trial_banner = ""
 
     if mode == "live" and action == "pro" and not is_pro(user_id):
-        # 1) Проверяем trial (1 раз)
         trial_used = False
-
         with db_session() as session:
             trial_used = _trial_live_used(session, user_id)
 
-            # если trial не использован — активируем его и ПУСКАЕМ В ПОЛНЫЙ PRO
             if not trial_used:
                 ok = _consume_trial_live(session, user_id)
                 if ok:
                     trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
                 else:
-                    # если не смогли пометить trial — безопасно показываем teaser
                     trial_used = True
 
         if trial_used:
-            # trial уже использован => teaser
             teaser_action = "overview"
             prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
 
@@ -951,18 +978,12 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 ttl_s=int(TTL_LIVE_S),
                 user_id=user_id,
             )
-
             _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
             return _truncate_telegram(base_txt) + _pro_teaser_footer()
 
-
-        # trial был НЕ использован => мы его активировали и идём дальше как в PRO
-        # (то есть выполняем нормальный блок ниже для mode=live/action=pro)
-        # Добавим короткую пометку сверху после рендера.
-        trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
-    else:
-        trial_banner = ""
+        # trial активирован — продолжаем как PRO (ниже)
 
     # ---------- Normal / PRO ----------
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
@@ -988,7 +1009,6 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
     out = _render_ui_json(analysis, mode=mode, action=action)
 
-    # если это был trial-запуск — добавим баннер
     if trial_banner and mode == "live" and action == "pro":
         out = trial_banner + out
 
@@ -1095,7 +1115,7 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
 
     # diag
     if norm == "version":
-        return _md_safe_text("✅ parsing.py version: 2026-01-19 v13 (LIVE PRO trial 1/1 + DB flag users.trial_live_used)")
+        return _md_safe_text("✅ parsing.py version: 2026-01-23 v14 (hub score refresh for LIVE/FINISHED + LIVE PRO trial 1/1)")
     if norm == "env":
         return _md_safe_text(_format_env_status())
     if norm == "llm ping":
@@ -1138,44 +1158,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     # strategy
     if norm in {"стратегия", "эксперт", "эксперт сегодня", "стратегия сегодня"} or norm.startswith("стратегия"):
         return _md_safe_text(_format_expert_strategy_for_today())
-
-    # --------- NAV: страна / лига ----------
-    ctry = _parse_nav_country(text_raw)
-    if ctry:
-        idx = _build_index_for_user(user_id)
-        hit = None
-        for k in idx.keys():
-            if k.lower() == ctry.lower():
-                hit = k
-                break
-        country = hit or ctry
-        _ACTIVE_COUNTRY_BY_USER[user_id] = country
-        return _md_safe_text(_render_leagues(user_id, country))
-
-    lg = _parse_nav_league(text_raw)
-    if lg:
-        country, league, page = lg
-        idx = _build_index_for_user(user_id)
-
-        c_hit = None
-        for k in idx.keys():
-            if k.lower() == country.lower():
-                c_hit = k
-                break
-        country = c_hit or country
-
-        leagues = idx.get(country) or {}
-        l_hit = None
-        for k in leagues.keys():
-            if k.lower() == league.lower():
-                l_hit = k
-                break
-        league = l_hit or league
-
-        _ACTIVE_COUNTRY_BY_USER[user_id] = country
-        _ACTIVE_LEAGUE_BY_USER[user_id] = league
-        _ACTIVE_PAGE_BY_USER[user_id] = page
-        return _md_safe_text(_render_matches_page(user_id, country, league, page))
 
     # matches today (API)
     if norm.startswith("матчи сегодня"):
@@ -1228,8 +1210,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
         with db_session() as session:
             bank = bets_db.get_user_bank(session, user_id)
             stats = bets_db.get_user_stats(session, user_id)
-
-            # покажем trial статус (приятно для дебага)
             trial_used = _trial_live_used(session, user_id)
 
         extra = f"\n\nTrial LIVE PRO: {'использован' if trial_used else 'доступен (1/1)'}"
@@ -1254,8 +1234,6 @@ async def run_dialog_agent(user_id: int, message: str) -> str:
     help_text = (
         "Команды:\n\n"
         "• матчи сегодня football|ice-hockey|basketball|tennis|table-tennis|esports\n"
-        "• страна: <название>\n"
-        "• лига: <страна> | <лига> | <страница>\n"
         "• матч <id> (дальше кнопки PRE/LIVE/LIVE PRO)\n"
         "• стратегия\n"
         "• профиль\n"
