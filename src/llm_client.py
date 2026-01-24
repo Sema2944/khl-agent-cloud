@@ -34,9 +34,19 @@ LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "2").strip())
 
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 
-# TTLs (используются как подсказка gateway)
-LLM_CACHE_TTL_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())          # prematch 15 минут
-LLM_CACHE_TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "25").strip()) # live 25 сек
+# -----------------------------
+# Max tokens caps (anti-TPM)
+# -----------------------------
+# Снижаем токены в LIVE, чтобы не упираться в TPM.
+# Можно тюнить через ENV без деплоя кода.
+LLM_MAX_TOKENS_LEGACY = int((os.getenv("LLM_MAX_TOKENS_LEGACY") or "260").strip())
+LLM_MAX_TOKENS_UI_PRE = int((os.getenv("LLM_MAX_TOKENS_UI_PRE") or "380").strip())
+LLM_MAX_TOKENS_UI_LIVE = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE") or "220").strip())
+LLM_MAX_TOKENS_UI_LIVE_PRO = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE_PRO") or "320").strip())
+
+# Hard safety cap (на случай неверных ENV)
+LLM_MAX_TOKENS_HARD_CAP = int((os.getenv("LLM_MAX_TOKENS_HARD_CAP") or "520").strip())
+
 
 # Safety throttles (Telegram-friendly) — лёгкая локальная защита
 LLM_PER_USER_MIN_INTERVAL_S = float((os.getenv("LLM_PER_USER_MIN_INTERVAL_S") or "2.5").strip())
@@ -184,10 +194,32 @@ async def _per_user_throttle(user_id: int) -> Optional[float]:
 
 
 def _max_tokens_for_schema(schema: str) -> int:
-    # ui_* иногда требует больше, чтобы модель успела вернуть валидный JSON.
-    if schema in ("ui_pre", "ui_live"):
-        return 520
-    return 300
+    """
+    Жёстко режем токены в LIVE, чтобы снизить TPM.
+    Значения настраиваются через ENV.
+    """
+    schema = (schema or "").strip()
+
+    if schema == "legacy":
+        v = LLM_MAX_TOKENS_LEGACY
+    elif schema == "ui_pre":
+        v = LLM_MAX_TOKENS_UI_PRE
+    elif schema == "ui_live_pro":
+        v = LLM_MAX_TOKENS_UI_LIVE_PRO
+    else:  # ui_live и любые неизвестные UI-схемы
+        v = LLM_MAX_TOKENS_UI_LIVE
+
+    # safety cap
+    try:
+        v = int(v)
+    except Exception:
+        v = 220
+    if v < 120:
+        v = 120
+    if v > int(LLM_MAX_TOKENS_HARD_CAP):
+        v = int(LLM_MAX_TOKENS_HARD_CAP)
+    return v
+
 
 
 def _make_repair_domain_prompt(schema: str, original_domain_prompt: str, bad_obj: Any) -> str:
