@@ -1,9 +1,4 @@
 # src/integrations/sport_api.py
-from __future__ import annotations
-
-import json# src/integrations/sport_api.py
-from __future__ import annotations
-
 import logging
 import os
 from dataclasses import dataclass
@@ -17,18 +12,6 @@ logger = logging.getLogger(__name__)
 
 class SportAPIError(Exception):
     pass
-
-
-LEAGUE_COUNTRY_HINTS = {
-    "KHL": "Russia",
-    "NHL": "USA",
-    "AHL": "USA",
-    "SHL": "Sweden",
-    "Liiga": "Finland",
-    "DEL": "Germany",
-    "Extraliga": "Czech",
-    "NCAA": "USA",
-}
 
 
 @dataclass
@@ -98,59 +81,12 @@ def _get_team_name(team_obj: Any, fallback: str) -> str:
     return fallback
 
 
-def _unwrap_country(raw: Any) -> str:
-    if isinstance(raw, dict):
-        return _first_str(raw.get("name"), raw.get("country"), raw.get("title"))
-    return _first_str(raw)
-
-
-def _league_country_hint(league: str) -> str:
-    league = (league or "").strip()
-    if not league:
-        return ""
-    lower = league.lower()
-    for key, country in LEAGUE_COUNTRY_HINTS.items():
-        if key.lower() in lower:
-            return country
-    return ""
-
-
-def _extract_country(raw: Dict[str, Any], tournament: Any, league: str) -> str:
-    country = _unwrap_country(raw.get("country"))
-    if not country:
-        country = _first_str(raw.get("countryName"))
-
-    if not country and isinstance(tournament, dict):
-        country = _unwrap_country(tournament.get("country"))
-        if not country:
-            category = tournament.get("category")
-            if isinstance(category, dict):
-                country = _first_str(category.get("name"), category.get("country"))
-
-    if not country:
-        country = _league_country_hint(league)
-
-    return country or "Other"
-
-
 def _extract_score(raw: Dict[str, Any]) -> str:
     s = raw.get("score")
     if isinstance(s, str) and s.strip():
         return s.strip()
 
-    hs = raw.get("homeScore")
-    aw = raw.get("awayScore")
-    if hs is not None and aw is not None:
-        return f"{hs}:{aw}"
-
-    scores = raw.get("scores")
-    if isinstance(scores, dict):
-        h = scores.get("home")
-        a = scores.get("away")
-        if h is not None and a is not None:
-            return f"{h}:{a}"
-
-    for key in ("goals", "result"):
+    for key in ("scores", "goals", "result"):
         obj = raw.get(key)
         if isinstance(obj, dict):
             h = obj.get("home") or obj.get("homeScore") or obj.get("h")
@@ -158,8 +94,8 @@ def _extract_score(raw: Dict[str, Any]) -> str:
             if h is not None and a is not None:
                 return f"{h}:{a}"
 
-    hs = raw.get("scoreHome") or raw.get("home_score")
-    aw = raw.get("scoreAway") or raw.get("away_score")
+    hs = raw.get("homeScore") or raw.get("scoreHome") or raw.get("home_score")
+    aw = raw.get("awayScore") or raw.get("scoreAway") or raw.get("away_score")
     if hs is not None and aw is not None:
         return f"{hs}:{aw}"
 
@@ -192,6 +128,7 @@ class SportAPIClient:
         self.headers = _auth_headers()
         self.timeout_s = _timeout()
 
+        # лог как в проде (не критично)
         try:
             from urllib.parse import urlparse
 
@@ -266,7 +203,13 @@ class SportAPIClient:
         else:
             league = _first_str(raw.get("leagueName"), raw.get("tournamentName"), raw.get("competitionName"))
 
-        country = _extract_country(raw, tournament, league)
+        country = ""
+        if isinstance(tournament, dict):
+            country = _first_str(
+                tournament.get("country"),
+                (tournament.get("country") or {}).get("name") if isinstance(tournament.get("country"), dict) else "",
+            )
+        country = country or _first_str(raw.get("country"), raw.get("league_country"), raw.get("countryName"))
 
         status = _first_str(raw.get("status"), raw.get("state"), raw.get("matchStatus"), raw.get("stage"))
         start_time = _first_str(
@@ -324,31 +267,13 @@ class SportAPIClient:
             path.lstrip("/"),
             len(out),
         )
-
-        if out:
-            country_counts: Dict[str, int] = {}
-            for m in out:
-                c = (getattr(m, "country", "") or "Other").strip() or "Other"
-                country_counts[c] = country_counts.get(c, 0) + 1
-
-            countries_total = len(country_counts)
-            other_count = country_counts.get("Other", 0)
-            top = sorted(country_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-            top_str = ", ".join([f"{name}({cnt})" for name, cnt in top])
-            logger.info(
-                "SportAPI matches_by_date summary: matches=%s countries=%s other=%s top=%s",
-                len(out),
-                countries_total,
-                other_count,
-                top_str,
-            )
-
         return out
 
     async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
         sport_slug = (sport_slug or "").strip()
         match_id = str(match_id or "").strip()
 
+        # КРИТИЧНО: НЕ /v2/<sport>/<id>
         candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
             (f"/v2/{sport_slug}/matches/{match_id}", None),
             (f"/v2/{sport_slug}/events/{match_id}", None),
@@ -390,106 +315,3 @@ class SportAPIClient:
                 last_err = e
 
         raise SportAPIError(f"match_odds failed: {sport_slug}/{match_id}: {last_err}")
-
-import logging
-import os
-from dataclasses import dataclass
-from datetime import date
-from typing import Any, Dict, List, Optional, Tuple
-
-import httpx
-
-logger = logging.getLogger(__name__)
-
-
-class SportAPIError(Exception):
-    pass
-
-
-@dataclass
-class MatchDTO:
-    id: str
-    sport_slug: str
-    title: str
-    league: str
-    country: str
-    status: str
-    start_time: str
-    score: str = ""
-
-
-@dataclass
-class OddsSnapshot:
-    raw: Dict[str, Any]
-    moneyline: Optional[Dict[str, Any]] = None
-    total_main: Optional[Dict[str, Any]] = None
-    handicap_main: Optional[Dict[str, Any]] = None
-
-
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
-
-
-def _auth_headers() -> Dict[str, str]:
-    key = _env("SPORT_API_KEY")
-    if not key:
-        return {}
-    hdr = _env("SPORT_API_KEY_HEADER", "Authorization")
-    pref = _env("SPORT_API_KEY_PREFIX", "")
-    return {hdr: f"{pref}{key}".strip()}
-
-
-def _parse_sport_aliases() -> Dict[str, List[str]]:
-    """
-    Optional ENV:
-      SPORT_API_SPORT_ALIASES='{"ice-hockey":["ice-hockey","hockey"]}'
-    """
-    raw = _env("SPORT_API_SPORT_ALIASES", "")
-    if not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            out: Dict[str, List[str]] = {}
-            for k, v in obj.items():
-                if not isinstance(k, str):
-                    continue
-                kk = k.strip().lower()
-                if isinstance(v, list):
-                    out[kk] = [str(x).strip().lower() for x in v if str(x).strip()]
-                elif isinstance(v, str) and v.strip():
-                    out[kk] = [v.strip().lower()]
-            return out
-    except Exception:
-        logger.exception("SPORT_API_SPORT_ALIASES invalid JSON")
-    return {}
-
-
-_SPORT_ALIASES = _parse_sport_aliases()
-
-
-def _sport_candidates(sport_slug: str) -> List[str]:
-    s = (sport_slug or "").strip().lower()
-    if not s:
-        return []
-
-    # aliases from ENV
-    if s in _SPORT_ALIASES and _SPORT_ALIASES[s]:
-        xs = [s] + _SPORT_ALIASES[s]
-        seen = set()
-        out: List[str] = []
-        for x in xs:
-            x = (x or "").strip().lower()
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
-
-    # common heuristics
-    if s == "ice-hockey":
-        return ["ice-hockey", "hockey"]
-
-    if s == "table-tennis":
-        return ["table-tennis", "ping-pong"]
-
-    return [s]
