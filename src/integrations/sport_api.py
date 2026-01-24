@@ -84,6 +84,7 @@ def _sport_candidates(sport_slug: str) -> List[str]:
     if not s:
         return []
 
+    # aliases from ENV
     if s in _SPORT_ALIASES and _SPORT_ALIASES[s]:
         xs = [s] + _SPORT_ALIASES[s]
         seen = set()
@@ -97,4 +98,9 @@ def _sport_candidates(sport_slug: str) -> List[str]:
 
     # common heuristics
     if s == "ice-hockey":
-        return ["ice-hockey
+        return ["ice-hockey", "hockey"]
+
+    if s == "table-tennis":
+        return ["table-tennis", "ping-pong"]
+
+    return [s]
