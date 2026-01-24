@@ -14,6 +14,22 @@ class SportAPIError(Exception):
     pass
 
 
+LEAGUE_COUNTRY_HINTS = {
+    "KHL": "Russia",
+    "NHL": "USA",
+    "AHL": "USA",
+    "SHL": "Sweden",
+    "Liiga": "Finland",
+    "DEL": "Germany",
+    "Extraliga": "Czech",
+    "NCAA": "USA",
+}
+
+SPORT_ALIASES = {
+    "ice-hockey": ["hockey"],
+}
+
+
 @dataclass
 class MatchDTO:
     id: str
@@ -81,12 +97,59 @@ def _get_team_name(team_obj: Any, fallback: str) -> str:
     return fallback
 
 
+def _unwrap_country(raw: Any) -> str:
+    if isinstance(raw, dict):
+        return _first_str(raw.get("name"), raw.get("country"), raw.get("title"))
+    return _first_str(raw)
+
+
+def _league_country_hint(league: str) -> str:
+    league = (league or "").strip()
+    if not league:
+        return ""
+    lower = league.lower()
+    for key, country in LEAGUE_COUNTRY_HINTS.items():
+        if key.lower() in lower:
+            return country
+    return ""
+
+
+def _extract_country(raw: Dict[str, Any], tournament: Any, league: str) -> str:
+    country = _unwrap_country(raw.get("country"))
+    if not country:
+        country = _first_str(raw.get("countryName"))
+
+    if not country and isinstance(tournament, dict):
+        country = _unwrap_country(tournament.get("country"))
+        if not country:
+            category = tournament.get("category")
+            if isinstance(category, dict):
+                country = _first_str(category.get("name"), category.get("country"))
+
+    if not country:
+        country = _league_country_hint(league)
+
+    return country or "Other"
+
+
 def _extract_score(raw: Dict[str, Any]) -> str:
     s = raw.get("score")
     if isinstance(s, str) and s.strip():
         return s.strip()
 
-    for key in ("scores", "goals", "result"):
+    hs = raw.get("homeScore")
+    aw = raw.get("awayScore")
+    if hs is not None and aw is not None:
+        return f"{hs}:{aw}"
+
+    scores = raw.get("scores")
+    if isinstance(scores, dict):
+        h = scores.get("home")
+        a = scores.get("away")
+        if h is not None and a is not None:
+            return f"{h}:{a}"
+
+    for key in ("goals", "result"):
         obj = raw.get(key)
         if isinstance(obj, dict):
             h = obj.get("home") or obj.get("homeScore") or obj.get("h")
@@ -94,8 +157,8 @@ def _extract_score(raw: Dict[str, Any]) -> str:
             if h is not None and a is not None:
                 return f"{h}:{a}"
 
-    hs = raw.get("homeScore") or raw.get("scoreHome") or raw.get("home_score")
-    aw = raw.get("awayScore") or raw.get("scoreAway") or raw.get("away_score")
+    hs = raw.get("scoreHome") or raw.get("home_score")
+    aw = raw.get("scoreAway") or raw.get("away_score")
     if hs is not None and aw is not None:
         return f"{hs}:{aw}"
 
@@ -128,7 +191,6 @@ class SportAPIClient:
         self.headers = _auth_headers()
         self.timeout_s = _timeout()
 
-        # лог как в проде (не критично)
         try:
             from urllib.parse import urlparse
 
@@ -203,13 +265,7 @@ class SportAPIClient:
         else:
             league = _first_str(raw.get("leagueName"), raw.get("tournamentName"), raw.get("competitionName"))
 
-        country = ""
-        if isinstance(tournament, dict):
-            country = _first_str(
-                tournament.get("country"),
-                (tournament.get("country") or {}).get("name") if isinstance(tournament.get("country"), dict) else "",
-            )
-        country = country or _first_str(raw.get("country"), raw.get("league_country"), raw.get("countryName"))
+        country = _extract_country(raw, tournament, league)
 
         status = _first_str(raw.get("status"), raw.get("state"), raw.get("matchStatus"), raw.get("stage"))
         start_time = _first_str(
@@ -240,7 +296,6 @@ class SportAPIClient:
         sport_slug = (sport_slug or "").strip()
         day_s = day.isoformat()
 
-        path = f"/v2/{sport_slug}/matches"
         params = {
             "date": day_s,
             "day": day_s,
@@ -252,10 +307,28 @@ class SportAPIClient:
             "endDate": day_s,
         }
 
-        logger.info("SportAPI try matches_by_date sport=%s: GET %s params=%s", sport_slug, path.lstrip("/"), params)
+        candidates = [sport_slug]
+        candidates += [x for x in SPORT_ALIASES.get(sport_slug, []) if x not in candidates]
 
-        data = await self._get_json(path, params=params)
-        items = self._unwrap_list(data)
+        items: List[Dict[str, Any]] = []
+        used_slug = sport_slug
+        used_path = ""
+        for cand in candidates:
+            path = f"/v2/{cand}/matches"
+            used_path = path.lstrip("/")
+            used_slug = cand
+            logger.info(
+                "SportAPI try matches_by_date sport=%s: GET %s params=%s",
+                cand,
+                used_path,
+                params,
+            )
+
+            data = await self._get_json(path, params=params)
+            items = self._unwrap_list(data)
+            if items:
+                break
+
         if not items:
             raise SportAPIError(f"matches_by_date empty for {sport_slug} {day_s}")
 
@@ -263,17 +336,35 @@ class SportAPIClient:
         logger.info(
             "SportAPI matches_by_date OK: requested=%s used_sport=%s used_path=%s n=%s",
             sport_slug,
-            sport_slug,
-            path.lstrip("/"),
+            used_slug,
+            used_path,
             len(out),
         )
+
+        if out:
+            country_counts: Dict[str, int] = {}
+            for m in out:
+                c = (getattr(m, "country", "") or "Other").strip() or "Other"
+                country_counts[c] = country_counts.get(c, 0) + 1
+
+            countries_total = len(country_counts)
+            other_count = country_counts.get("Other", 0)
+            top = sorted(country_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            top_str = ", ".join([f"{name}({cnt})" for name, cnt in top])
+            logger.info(
+                "SportAPI matches_by_date summary: matches=%s countries=%s other=%s top=%s",
+                len(out),
+                countries_total,
+                other_count,
+                top_str,
+            )
+
         return out
 
     async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
         sport_slug = (sport_slug or "").strip()
         match_id = str(match_id or "").strip()
 
-        # КРИТИЧНО: НЕ /v2/<sport>/<id>
         candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
             (f"/v2/{sport_slug}/matches/{match_id}", None),
             (f"/v2/{sport_slug}/events/{match_id}", None),
