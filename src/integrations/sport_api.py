@@ -23,11 +23,11 @@ class MatchDTO:
     sport_slug: str
     title: str
     league: str
+    country: str
     status: str
     start_time: str
     score: str = ""
-    country: str = ""
-    odds_base: Optional[Dict[str, Any]] = None
+
 
 
 @dataclass
@@ -252,63 +252,109 @@ class SportAPIClient:
         return ""
 
     def _match_to_dto(self, raw: Dict[str, Any], sport_slug: str) -> MatchDTO:
-        mid = str(raw.get("id") or raw.get("eventId") or raw.get("matchId") or raw.get("gameId") or "")
+    # --- id ---
+    mid = str(raw.get("id") or raw.get("eventId") or raw.get("matchId") or raw.get("fixture_id") or "")
 
-        home = (
-            (raw.get("homeTeam") or {}).get("translations", {}).get("ru")
-            or (raw.get("homeTeam") or {}).get("translation", {}).get("ru")
-            or (raw.get("homeTeam") or {}).get("name")
-            or raw.get("home")
-            or raw.get("homeName")
-            or "Home"
-        )
-        away = (
-            (raw.get("awayTeam") or {}).get("translations", {}).get("ru")
-            or (raw.get("awayTeam") or {}).get("translation", {}).get("ru")
-            or (raw.get("awayTeam") or {}).get("name")
-            or raw.get("away")
-            or raw.get("awayName")
-            or "Away"
-        )
+    # --- teams ---
+    home = (
+        (raw.get("homeTeam") or {}).get("translations", {}).get("ru")
+        or (raw.get("homeTeam") or {}).get("translation", {}).get("ru")
+        or (raw.get("homeTeam") or {}).get("name")
+        or (raw.get("home") or {}).get("name")
+        or raw.get("home")
+        or "Home"
+    )
+    away = (
+        (raw.get("awayTeam") or {}).get("translations", {}).get("ru")
+        or (raw.get("awayTeam") or {}).get("translation", {}).get("ru")
+        or (raw.get("awayTeam") or {}).get("name")
+        or (raw.get("away") or {}).get("name")
+        or raw.get("away")
+        or "Away"
+    )
 
-        league = (
-            (raw.get("tournament") or {}).get("translations", {}).get("ru")
-            or (raw.get("tournament") or {}).get("name")
-            or (raw.get("league") or {}).get("name")
-            or raw.get("leagueName")
-            or raw.get("tournamentName")
-            or ""
-        )
+    # --- league/tournament ---
+    tournament = raw.get("tournament") or raw.get("league") or {}
+    league = (
+        (tournament.get("translations", {}) if isinstance(tournament, dict) else {}).get("ru")
+        or (tournament.get("name") if isinstance(tournament, dict) else "")
+        or raw.get("leagueName")
+        or ""
+    )
+    league = str(league or "").strip()
 
-        country = (
-            (raw.get("league") or {}).get("country")
-            or (raw.get("tournament") or {}).get("country")
-            or raw.get("country")
-            or raw.get("leagueCountry")
-            or ""
-        )
+    # --- country (главное для навигации) ---
+    country = ""
+    try:
+        # часто: raw["country"], raw["league"]["country"], raw["tournament"]["country"]
+        if isinstance(raw.get("country"), str):
+            country = raw.get("country") or ""
+        if not country and isinstance(tournament, dict):
+            c1 = tournament.get("country")
+            if isinstance(c1, str) and c1.strip():
+                country = c1.strip()
 
-        status = str(raw.get("status") or raw.get("state") or raw.get("matchStatus") or raw.get("statusName") or "")
-        start_time = str(raw.get("dateEvent") or raw.get("startTime") or raw.get("start_date") or raw.get("date") or "")
+            # иногда: tournament.category.name или tournament.category.country
+            cat = tournament.get("category")
+            if not country and isinstance(cat, dict):
+                cn = cat.get("name") or cat.get("country")
+                if isinstance(cn, str) and cn.strip():
+                    country = cn.strip()
 
-        odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")
-        if not isinstance(odds_base, dict):
-            odds_base = None
+        # иногда: raw["league_country"] / raw["leagueCountry"]
+        if not country:
+            for k in ("league_country", "leagueCountry", "countryName"):
+                v = raw.get(k)
+                if isinstance(v, str) and v.strip():
+                    country = v.strip()
+                    break
+    except Exception:
+        country = ""
 
-        score = self._extract_score(raw)
+    country = (country or "").strip() or "Other"
 
-        title = f"{home} — {away}"
-        return MatchDTO(
-            id=mid or "unknown",
-            sport_slug=sport_slug,
-            title=title,
-            league=league,
-            status=status,
-            start_time=start_time,
-            score=score,
-            country=str(country or ""),
-            odds_base=odds_base,
-        )
+    # --- status ---
+    status = str(raw.get("status") or raw.get("state") or raw.get("matchStatus") or "").strip()
+
+    # --- start time ---
+    start_time = str(
+        raw.get("dateEvent")
+        or raw.get("startTime")
+        or raw.get("start_date")
+        or raw.get("startDate")
+        or raw.get("date")
+        or ""
+    ).strip()
+
+    # --- score (опционально) ---
+    score = ""
+    try:
+        sc = raw.get("score")
+        if isinstance(sc, str):
+            score = sc.strip()
+        elif isinstance(sc, dict):
+            # варианты: {"home":1,"away":2} или {"fullTime":{"home":1,"away":2}}
+            if "home" in sc and "away" in sc:
+                score = f"{sc.get('home')}:{sc.get('away')}"
+            elif isinstance(sc.get("fullTime"), dict):
+                ft = sc["fullTime"]
+                score = f"{ft.get('home')}:{ft.get('away')}"
+    except Exception:
+        score = ""
+
+    title = f"{home} — {away}"
+
+    return MatchDTO(
+        id=mid or "unknown",
+        sport_slug=sport_slug,
+        title=title,
+        league=league,
+        country=country,
+        status=status,
+        start_time=start_time,
+        score=score,
+    )
+
 
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
         """
