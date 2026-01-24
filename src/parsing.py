@@ -461,6 +461,8 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     try:
         api = SportAPIClient()
         matches = await api.matches_by_date(sport_slug, today)
+        if not matches:
+            raise SportAPIError(f"matches_by_date empty for {sport_slug} {today.isoformat()}")
     except SportAPIError as e:
         return _truncate_telegram(
             "\n".join(
@@ -494,9 +496,9 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "league": getattr(m, "league", ""),
             "status": getattr(m, "status", ""),
             "start_time": getattr(m, "start_time", ""),
-            "score": getattr(m, "score", ""),
+            "score": getattr(m, "score", "") or "",
             "odds_base": getattr(m, "odds_base", None),
-            "country": getattr(m, "country", "") if hasattr(m, "country") else "",
+            "country": getattr(m, "country", "") or "",
         }
 
     _ACTIVE_COUNTRY_BY_USER[user_id] = ""
@@ -504,26 +506,6 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     _ACTIVE_PAGE_BY_USER[user_id] = 1
 
     return _render_countries(user_id, title, today.isoformat())
-
-
-def _fmt_status_ru(status: str) -> str:
-    s = (status or "").strip().lower()
-    if not s:
-        return "—"
-    map_ru = {
-        "not_started": "не начался",
-        "notstarted": "не начался",
-        "scheduled": "по расписанию",
-        "live": "LIVE",
-        "inprogress": "LIVE",
-        "in_progress": "LIVE",
-        "finished": "завершён",
-        "ended": "завершён",
-        "canceled": "отменён",
-        "cancelled": "отменён",
-        "postponed": "перенесён",
-    }
-    return map_ru.get(s, status)
 
 
 def _format_match_hub_text(
