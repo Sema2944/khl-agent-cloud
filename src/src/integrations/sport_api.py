@@ -70,7 +70,6 @@ def _first_str(*vals: Any) -> str:
 
 def _get_team_name(team_obj: Any, fallback: str) -> str:
     if isinstance(team_obj, dict):
-        # ru translation variants
         tr = team_obj.get("translations") or team_obj.get("translation") or {}
         if isinstance(tr, dict):
             ru = tr.get("ru") or tr.get("ru_RU")
@@ -85,14 +84,6 @@ def _get_team_name(team_obj: Any, fallback: str) -> str:
 
 
 def _extract_score(raw: Dict[str, Any]) -> str:
-    """
-    Пробуем разные схемы:
-    - score: "2:1"
-    - scores: {home:2, away:1}
-    - homeScore/awayScore
-    - goals: {home:2, away:1}
-    - result: {home:2, away:1}
-    """
     s = raw.get("score")
     if isinstance(s, str) and s.strip():
         return s.strip()
@@ -110,7 +101,6 @@ def _extract_score(raw: Dict[str, Any]) -> str:
     if hs is not None and aw is not None:
         return f"{hs}:{aw}"
 
-    # иногда бывает nested: {"homeTeam":{"score":...}, "awayTeam":{"score":...}}
     ht = raw.get("homeTeam")
     at = raw.get("awayTeam")
     if isinstance(ht, dict) and isinstance(at, dict):
@@ -140,7 +130,7 @@ class SportAPIClient:
         self.headers = _auth_headers()
         self.timeout_s = _timeout()
 
-        # удобный лог как у тебя в проде
+        # лог как в проде (не критично)
         try:
             from urllib.parse import urlparse
 
@@ -163,22 +153,17 @@ class SportAPIClient:
         timeout = httpx.Timeout(self.timeout_s)
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(url, params=params or {}, headers=self.headers)
+
         if r.status_code >= 400:
             txt = (r.text or "")[:500]
             raise SportAPIError(f"HTTP {r.status_code}: {txt}")
+
         try:
             return r.json()
         except Exception:
             raise SportAPIError(f"Bad JSON from API: {(r.text or '')[:200]}")
 
     def _unwrap_list(self, data: Any) -> List[Dict[str, Any]]:
-        """
-        Провайдеры часто возвращают:
-        - {"data":[...]}
-        - {"response":[...]}
-        - {"results":[...]}
-        - [...]
-        """
         if isinstance(data, list):
             return [x for x in data if isinstance(x, dict)]
         if isinstance(data, dict):
@@ -205,7 +190,6 @@ class SportAPIClient:
         home = _get_team_name(raw.get("homeTeam") or raw.get("home_team") or raw.get("teamHome"), "Home")
         away = _get_team_name(raw.get("awayTeam") or raw.get("away_team") or raw.get("teamAway"), "Away")
 
-        # иногда просто строки
         if raw.get("home") and isinstance(raw.get("home"), str):
             home = str(raw.get("home")).strip()
         if raw.get("away") and isinstance(raw.get("away"), str):
@@ -222,7 +206,6 @@ class SportAPIClient:
             league = _first_str(raw.get("leagueName"), raw.get("tournamentName"), raw.get("competitionName"))
 
         country = ""
-        # разные варианты страны
         if isinstance(tournament, dict):
             country = _first_str(
                 tournament.get("country"),
@@ -231,11 +214,16 @@ class SportAPIClient:
         country = country or _first_str(raw.get("country"), raw.get("league_country"), raw.get("countryName"))
 
         status = _first_str(raw.get("status"), raw.get("state"), raw.get("matchStatus"), raw.get("stage"))
-        start_time = _first_str(raw.get("dateEvent"), raw.get("startTime"), raw.get("start_date"), raw.get("date"), raw.get("time"))
-
+        start_time = _first_str(
+            raw.get("dateEvent"),
+            raw.get("startTime"),
+            raw.get("start_date"),
+            raw.get("date"),
+            raw.get("time"),
+        )
         score = _extract_score(raw)
 
-        odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")  # на всякий случай
+        odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")
 
         title = f"{home} — {away}"
         return MatchDTO(
@@ -251,17 +239,10 @@ class SportAPIClient:
         )
 
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
-        """
-        Максимально совместимо с api-sport.ru:
-        В логах у тебя уже работает /v2/<sport>/matches + пачка параметров.
-        """
         sport_slug = (sport_slug or "").strip()
         day_s = day.isoformat()
 
-        # ключевой путь — matches
         path = f"/v2/{sport_slug}/matches"
-
-        # как в твоих логах: отправляем сразу несколько вариантов ключей даты
         params = {
             "date": day_s,
             "day": day_s,
@@ -291,16 +272,10 @@ class SportAPIClient:
         return out
 
     async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
-        """
-        ВАЖНО: НЕ ходим в /v2/<sport>/<id> (у тебя это даёт 404 "No such sport endpoint").
-        Пробуем нормальные варианты:
-          /v2/<sport>/matches/<id>
-          /v2/<sport>/events/<id>
-          /v2/<sport>/match/<id>
-        """
         sport_slug = (sport_slug or "").strip()
         match_id = str(match_id or "").strip()
 
+        # КРИТИЧНО: НЕ /v2/<sport>/<id>
         candidates: List[Tuple[str, Optional[Dict[str, Any]]]] = [
             (f"/v2/{sport_slug}/matches/{match_id}", None),
             (f"/v2/{sport_slug}/events/{match_id}", None),
@@ -321,11 +296,6 @@ class SportAPIClient:
         raise SportAPIError(f"match_details failed: {sport_slug}/{match_id}: {last_err}")
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
-        """
-        Типовые пути odds:
-          /v2/<sport>/matches/<id>/odds
-          /v2/<sport>/events/<id>/odds
-        """
         sport_slug = (sport_slug or "").strip()
         match_id = str(match_id or "").strip()
 
