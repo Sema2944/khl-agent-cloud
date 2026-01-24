@@ -1,17 +1,20 @@
 # src/telegram_bot/app.py
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from zoneinfo import ZoneInfo
-
-from fastapi import APIRouter, FastAPI, Request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -22,103 +25,38 @@ from telegram.ext import (
     filters,
 )
 
-logger = logging.getLogger(__name__)
-MSK = ZoneInfo("Europe/Moscow")
+from ..db import get_session
+from ..pro_db import is_pro
+from ..user_access import allowed_sports_for_user
+from ..ui_text import MAIN_MENU_TEXT
 
-# ============================================================
-# ENV
-# ============================================================
+logger = logging.getLogger(__name__)
+
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()  # https://xxxx.onrender.com
-WEBHOOK_PATH = (os.getenv("TELEGRAM_WEBHOOK_PATH") or "/telegram/webhook").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()
+WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()
 
-# доступ по тарифу
-ALLOWED_SPORTS = [s.strip() for s in (os.getenv("ALLOWED_SPORTS") or "ice-hockey").split(",") if s.strip()]
-HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "").strip().lower() in {"1", "true", "yes", "on"}
+# feature flags
+HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
 
-# лимит текста Telegram (страховка Message_too_long)
-TG_TEXT_LIMIT = int((os.getenv("TG_TEXT_LIMIT") or "3800").strip() or 3800)
+MSK = datetime.now().astimezone().tzinfo
 
-# админ
-ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
+# Telegram Application
+_telegram_app: Optional[Application] = None
 
-# ============================================================
-# UI labels
-# ============================================================
+TG_TEXT_LIMIT = 3800
+
 SPORT_LABELS = {
     "ice-hockey": "🏒 Хоккей",
-    "football": "⚽️ Футбол",
+    "football": "⚽ Футбол",
     "basketball": "🏀 Баскетбол",
     "tennis": "🎾 Теннис",
     "table-tennis": "🏓 Настольный теннис",
     "esports": "🎮 Киберспорт",
 }
-MAIN_MENU_TEXT = "Главное меню"
 
-# простая “русификация” самых частых лиг
-LEAGUE_RU = {
-    "NHL": "НХЛ",
-    "KHL": "КХЛ",
-    "AHL": "АХЛ",
-    "VHL": "ВХЛ",
-    "MHL": "МХЛ",
-    "NCAA Women": "NCAA (жен.)",
-    "National League A": "Нац. лига A (Швейцария)",
-    "Swiss League": "Швейцарская лига",
-    "Continental Cup": "Континентальный кубок",
-}
-
-
-def _league_ru(name: str) -> str:
-    s = (name or "").strip()
-    if not s:
-        return "Другое"
-    return LEAGUE_RU.get(s, s)
-
-
-# ============================================================
-# Telegram Application
-# ============================================================
-_telegram_app: Optional[Application] = None
-router = APIRouter()
-
-# ============================================================
-# Helpers
-# ============================================================
-def is_pro(user_id: int) -> bool:
-    """
-    PRO через БД (users.is_premium/premium_until).
-    Админ всегда PRO.
-    """
-    if not user_id:
-        return False
-    if ADMIN_TELEGRAM_ID and user_id == ADMIN_TELEGRAM_ID:
-        return True
-    try:
-        from ..pro_db import is_pro as _db_is_pro
-        return bool(_db_is_pro(int(user_id)))
-    except Exception:
-        logger.exception("DB is_pro failed (fallback false)")
-        return False
-
-
-def _is_allowed_sport(sport_slug: str) -> bool:
-    s = (sport_slug or "").strip().lower()
-    return s in {x.lower() for x in ALLOWED_SPORTS}
-
-
-def _msk_today_iso() -> str:
-    return datetime.now(MSK).date().isoformat()
-
-
-def _safe_markdown(text: str) -> str:
-    """Минимальная экранизация под ParseMode.MARKDOWN."""
-    s = text or ""
-    s = s.replace("\\", "\\\\")
-    s = s.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
-    s = s.replace("`", "\\`")
-    return s
+DEFAULT_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]
 
 
 def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
@@ -126,6 +64,17 @@ def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
     if len(t) <= limit:
         return t
     return t[: max(0, limit - 60)] + "\n\n…(сообщение обрезано)"
+
+
+def _safe_markdown(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\\", "\\\\")
+    s = s.replace("_", "\\_")
+    s = s.replace("*", "\\*")
+    s = s.replace("[", "\\[")
+    s = s.replace("`", "\\`")
+    return s
 
 
 def _short_key(s: str, n: int = 10) -> str:
@@ -168,30 +117,14 @@ async def call_agent_local(user_id: int, text: str) -> str:
 
 def _text_buy_pro(user_id: int) -> str:
     return (
-        "⭐ *PRO-доступ*\n\n"
-        "PRO открывает расширенный LIVE-разбор:\n"
-        "• факторы *за фаворита* / *против фаворита*\n"
-        "• логика сценариев и триггеры (что должно случиться, чтобы идея сломалась)\n"
-        "• риски, уровни и моменты для ожидания/входа\n\n"
-        "Сейчас оплата ещё не подключена.\n"
-        "Чтобы получить PRO вручную — напиши в поддержку свой ID:\n"
-        f"`{user_id}`\n\n"
-        "Команда активирует доступ и ты сразу увидишь LIVE PRO."
+        "⭐ Premium\n\n"
+        "Что входит:\n"
+        "• LIVE PRO в матчах\n"
+        "• Больше аналитики\n\n"
+        "Нажми кнопку ниже, чтобы оформить."
     )
 
 
-def kb_buy_pro() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="BUY:PRO")],
-            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
-        ]
-    )
-
-
-# ============================================================
-# Keyboards
-# ============================================================
 def kb_main_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🏟 Матчи сегодня", callback_data="MENU:MATCHES")],
@@ -203,9 +136,14 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _is_allowed_sport(slug: str) -> bool:
+    allowed = allowed_sports_for_user()
+    return (slug or "").strip().lower() in allowed
+
+
 def kb_sports() -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for slug in ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]:
+    rows = []
+    for slug in DEFAULT_SPORTS:
         title = SPORT_LABELS.get(slug, slug)
         if _is_allowed_sport(slug):
             rows.append([InlineKeyboardButton(title, callback_data=f"SPORT:{slug}")])
@@ -440,6 +378,22 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
     )
 
 
+def _msk_today_iso() -> str:
+    return datetime.now(MSK).date().isoformat()
+
+
+def _league_ru(league: str) -> str:
+    if not league:
+        return "Other"
+    return league
+
+
+def kb_buy_pro() -> InlineKeyboardMarkup:
+    from .payments import kb_buy_pro as kb
+
+    return kb()
+
+
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
     from ..integrations.sport_api import SportAPIClient, SportAPIError
 
@@ -644,7 +598,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         title = SPORT_LABELS.get(slug, slug)
         txt = (
             f"🔒 {title} недоступен по твоему тарифу.\n\n"
-            "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in ALLOWED_SPORTS)
+            "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in DEFAULT_SPORTS)
         )
         try:
             await q.edit_message_text(txt, reply_markup=kb_sports())
@@ -730,7 +684,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ckey = parts[3].strip()
         lkey = parts[4].strip()
         try:
-            page = int(parts[5].strip())
+            page = int(parts[5])
         except Exception:
             page = 1
 
@@ -753,7 +707,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # BACK:COUNTRIES
     if data.startswith("BACK:COUNTRIES:"):
         parts = data.split(":")
-        sport_slug = parts[2].strip().lower() if len(parts) >= 3 else "ice-hockey"
+        if len(parts) < 3:
+            return
+        sport_slug = parts[2].strip().lower()
 
         st = _NAV_BY_USER.get(user_id)
         if st:
@@ -869,6 +825,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.message.reply_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Telegram handler error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Временно недоступно, попробуй позже.",
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
+
+
 # ============================================================
 # Telegram init / webhook
 # ============================================================
@@ -880,6 +848,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(handle_error)
     return app
 
 
@@ -916,38 +885,3 @@ async def telegram_shutdown() -> None:
         await _telegram_app.shutdown()
     finally:
         _telegram_app = None
-
-
-# ============================================================
-# FastAPI webhook router
-# ============================================================
-@router.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request) -> Dict[str, Any]:
-    if _telegram_app is None:
-        await telegram_startup()
-
-    data = await request.json()
-    update = Update.de_json(data, _telegram_app.bot)  # type: ignore[arg-type]
-    await _telegram_app.process_update(update)  # type: ignore[union-attr]
-    return {"ok": True}
-
-
-# ============================================================
-# Mount helper
-# ============================================================
-def mount_telegram_routes(app: FastAPI) -> None:
-    app.include_router(router)
-
-    @app.on_event("startup")
-    async def _tg_startup_event() -> None:  # noqa: B902
-        try:
-            await telegram_startup()
-        except Exception:
-            logger.exception("Telegram startup failed")
-
-    @app.on_event("shutdown")
-    async def _tg_shutdown_event() -> None:  # noqa: B902
-        try:
-            await telegram_shutdown()
-        except Exception:
-            logger.exception("Telegram shutdown failed")
