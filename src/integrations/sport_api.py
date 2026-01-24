@@ -164,14 +164,57 @@ class SportAPIClient:
             raise SportAPIError(f"Bad JSON from API: {(r.text or '')[:200]}")
 
     def _unwrap_list(self, data: Any) -> List[Dict[str, Any]]:
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict):
-            for k in ("data", "response", "results", "items"):
-                v = data.get(k)
-                if isinstance(v, list):
-                    return [x for x in v if isinstance(x, dict)]
+    """
+    Провайдеры часто возвращают:
+    - {"data":[...]}
+    - {"response":[...]}
+    - {"data":{"matches":[...]}}
+    - {"response":{"items":[...]}}
+    - {"matches":[...]}
+    - [...]
+    """
+    def _as_list(x: Any) -> List[Dict[str, Any]]:
+        if isinstance(x, list):
+            return [i for i in x if isinstance(i, dict)]
         return []
+
+    # 1) если уже список
+    out = _as_list(data)
+    if out:
+        return out
+
+    # 2) если dict — пробуем разные ключи
+    if isinstance(data, dict):
+        # прямые ключи со списком
+        for k in ("data", "response", "results", "items", "matches", "events"):
+            v = data.get(k)
+            out = _as_list(v)
+            if out:
+                return out
+
+        # 3) если dict внутри dict: {"data": {"matches": [...]}}
+        for k in ("data", "response", "result", "item"):
+            v = data.get(k)
+            if isinstance(v, dict):
+                for kk in ("data", "response", "results", "items", "matches", "events"):
+                    vv = v.get(kk)
+                    out = _as_list(vv)
+                    if out:
+                        return out
+
+        # 4) крайний случай: первый попавшийся list среди значений
+        for v in data.values():
+            out = _as_list(v)
+            if out:
+                return out
+            if isinstance(v, dict):
+                for vv in v.values():
+                    out = _as_list(vv)
+                    if out:
+                        return out
+
+    return []
+
 
     def _unwrap_obj(self, data: Any) -> Dict[str, Any]:
         if isinstance(data, dict):
