@@ -1,6 +1,4 @@
 # src/integrations/sport_api.py
-from __future__ import annotations
-
 import logging
 import os
 from dataclasses import dataclass
