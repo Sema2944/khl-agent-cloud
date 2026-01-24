@@ -1009,8 +1009,8 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             teaser_action = "overview"
             prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
 
-            h = _hash_cache_key(match_id, sport_slug, mode, teaser_action, cur_snap)
-            cache_key = f"v15:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}:{h}"
+            # LIVE: стабильный cache_key без снапшот-хеша => меньше LLM вызовов / меньше TPM
+            cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
 
             analysis, meta = await analyze_with_llm_cached(
                 prompt,
@@ -1025,6 +1025,40 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             return _truncate_telegram(base_txt) + _pro_teaser_footer()
 
         # trial активирован — продолжаем как PRO (ниже)
+
+    # ---------- Normal / PRO ----------
+    prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
+
+    # LIVE: стабильный cache_key (без хеша); PRE: оставляем hash по снапшоту
+    if mode == "live":
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}"
+    else:
+        h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+
+    if mode == "live" and action == "pro":
+        schema = "ui_live_pro"
+        ttl_s = TTL_LIVE_PRO_S
+    else:
+        schema = "ui_live" if mode == "live" else "ui_pre"
+        ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
+
+    analysis, meta = await analyze_with_llm_cached(
+        prompt,
+        cache_key=cache_key,
+        schema=schema,
+        ttl_s=int(ttl_s),
+        user_id=user_id,
+    )
+
+    _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+    out = _render_ui_json(analysis, mode=mode, action=action)
+
+    if trial_banner and mode == "live" and action == "pro":
+        out = trial_banner + out
+
+    return out
+
 
     # ---------- Normal / PRO ----------
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
