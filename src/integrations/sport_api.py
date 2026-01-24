@@ -29,7 +29,6 @@ class MatchDTO:
     score: str = ""
 
 
-
 @dataclass
 class OddsSnapshot:
     raw: Dict[str, Any]
@@ -51,13 +50,6 @@ def _auth_headers() -> Dict[str, str]:
     return {hdr: f"{pref}{key}".strip()}
 
 
-def _safe_json_dumps(obj: Any) -> str:
-    try:
-        return json.dumps(obj, ensure_ascii=False)[:1200]
-    except Exception:
-        return str(obj)[:1200]
-
-
 def _parse_sport_aliases() -> Dict[str, List[str]]:
     """
     Optional ENV:
@@ -71,11 +63,13 @@ def _parse_sport_aliases() -> Dict[str, List[str]]:
         if isinstance(obj, dict):
             out: Dict[str, List[str]] = {}
             for k, v in obj.items():
-                if isinstance(k, str):
-                    if isinstance(v, list):
-                        out[k.strip().lower()] = [str(x).strip().lower() for x in v if str(x).strip()]
-                    elif isinstance(v, str) and v.strip():
-                        out[k.strip().lower()] = [v.strip().lower()]
+                if not isinstance(k, str):
+                    continue
+                kk = k.strip().lower()
+                if isinstance(v, list):
+                    out[kk] = [str(x).strip().lower() for x in v if str(x).strip()]
+                elif isinstance(v, str) and v.strip():
+                    out[kk] = [v.strip().lower()]
             return out
     except Exception:
         logger.exception("SPORT_API_SPORT_ALIASES invalid JSON")
@@ -89,11 +83,10 @@ def _sport_candidates(sport_slug: str) -> List[str]:
     s = (sport_slug or "").strip().lower()
     if not s:
         return []
-    # env mapping first
     if s in _SPORT_ALIASES and _SPORT_ALIASES[s]:
         xs = [s] + _SPORT_ALIASES[s]
         seen = set()
-        out = []
+        out: List[str] = []
         for x in xs:
             x = (x or "").strip().lower()
             if x and x not in seen:
@@ -112,9 +105,14 @@ def _sport_candidates(sport_slug: str) -> List[str]:
 class SportAPIClient:
     """
     Generic Sport Events API client.
+
     Required ENV:
       - SPORT_API_BASE (e.g. https://api.api-sport.ru)
       - SPORT_API_KEY (+ optional header/prefix)
+
+    Optional ENV:
+      - SPORT_API_TIMEOUT_S (default 12.0)
+      - SPORT_API_SPORT_ALIASES JSON mapping
     """
 
     def __init__(self) -> None:
@@ -123,10 +121,9 @@ class SportAPIClient:
             raise SportAPIError("SPORT_API_BASE is missing")
 
         self.headers = _auth_headers()
-
         self.timeout_s = float((_env("SPORT_API_TIMEOUT_S", "12.0") or "12.0").strip() or 12.0)
 
-        # log init once
+        # init log (once per process start)
         try:
             from urllib.parse import urlparse
 
@@ -142,12 +139,16 @@ class SportAPIClient:
                 bool(_env("SPORT_API_KEY")),
             )
         except Exception:
-            logger.info("SportAPI init: base=%r timeout=%.1f key_present=%s", self.base, self.timeout_s, bool(_env("SPORT_API_KEY")))
+            logger.info(
+                "SportAPI init: base=%r timeout=%.1f key_present=%s",
+                self.base,
+                self.timeout_s,
+                bool(_env("SPORT_API_KEY")),
+            )
 
     async def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base}{path}"
         timeout = httpx.Timeout(self.timeout_s)
-
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(url, params=params or {}, headers=self.headers)
 
@@ -162,7 +163,7 @@ class SportAPIClient:
 
     def _unwrap_list(self, data: Any) -> List[Dict[str, Any]]:
         """
-        Провайдеры часто возвращают:
+        Providers often return:
         - {"data":[...]}
         - {"response":[...]}
         - {"data":{"matches":[...]}}
@@ -170,35 +171,30 @@ class SportAPIClient:
         - {"matches":[...]}
         - [...]
         """
+
         def _as_list(x: Any) -> List[Dict[str, Any]]:
             if isinstance(x, list):
                 return [i for i in x if isinstance(i, dict)]
             return []
 
-        # 1) уже список
         out = _as_list(data)
         if out:
             return out
 
-        # 2) dict: прямые ключи
         if isinstance(data, dict):
             for k in ("data", "response", "results", "items", "matches", "events", "list"):
-                v = data.get(k)
-                out = _as_list(v)
+                out = _as_list(data.get(k))
                 if out:
                     return out
 
-            # 3) dict внутри dict
             for k in ("data", "response", "result", "item"):
                 v = data.get(k)
                 if isinstance(v, dict):
                     for kk in ("data", "response", "results", "items", "matches", "events", "list"):
-                        vv = v.get(kk)
-                        out = _as_list(vv)
+                        out = _as_list(v.get(kk))
                         if out:
                             return out
 
-            # 4) крайний случай: первый list среди значений (и вложенных значений)
             for v in data.values():
                 out = _as_list(v)
                 if out:
@@ -223,8 +219,7 @@ class SportAPIClient:
         return {}
 
     def _extract_score(self, raw: Dict[str, Any]) -> str:
-        # common patterns
-        # 1) {"score":"2-1"}
+        # 1) {"score":"2-1"} / "2:1"
         s = raw.get("score")
         if isinstance(s, str) and s.strip():
             return s.strip()
@@ -238,7 +233,7 @@ class SportAPIClient:
         except Exception:
             pass
 
-        # 3) {"scores":{"home":2,"away":1}}
+        # 3) {"scores":{"home":2,"away":1}} / {"goals":{"home":..,"away":..}}
         scores = raw.get("scores") or raw.get("goals")
         if isinstance(scores, dict):
             home = scores.get("home") or scores.get("homeScore") or scores.get("h")
@@ -249,121 +244,114 @@ class SportAPIClient:
             except Exception:
                 pass
 
+        # 4) nested formats
+        if isinstance(s, dict):
+            try:
+                if "home" in s and "away" in s:
+                    return f"{s.get('home')}:{s.get('away')}"
+                ft = s.get("fullTime")
+                if isinstance(ft, dict) and "home" in ft and "away" in ft:
+                    return f"{ft.get('home')}:{ft.get('away')}"
+            except Exception:
+                pass
+
         return ""
 
     def _match_to_dto(self, raw: Dict[str, Any], sport_slug: str) -> MatchDTO:
-    # --- id ---
-    mid = str(raw.get("id") or raw.get("eventId") or raw.get("matchId") or raw.get("fixture_id") or "")
+        # --- id ---
+        mid = str(raw.get("id") or raw.get("eventId") or raw.get("matchId") or raw.get("fixture_id") or "")
 
-    # --- teams ---
-    home = (
-        (raw.get("homeTeam") or {}).get("translations", {}).get("ru")
-        or (raw.get("homeTeam") or {}).get("translation", {}).get("ru")
-        or (raw.get("homeTeam") or {}).get("name")
-        or (raw.get("home") or {}).get("name")
-        or raw.get("home")
-        or "Home"
-    )
-    away = (
-        (raw.get("awayTeam") or {}).get("translations", {}).get("ru")
-        or (raw.get("awayTeam") or {}).get("translation", {}).get("ru")
-        or (raw.get("awayTeam") or {}).get("name")
-        or (raw.get("away") or {}).get("name")
-        or raw.get("away")
-        or "Away"
-    )
+        # --- teams ---
+        home = (
+            (raw.get("homeTeam") or {}).get("translations", {}).get("ru")
+            or (raw.get("homeTeam") or {}).get("translation", {}).get("ru")
+            or (raw.get("homeTeam") or {}).get("name")
+            or (raw.get("home") or {}).get("name")
+            or raw.get("home")
+            or "Home"
+        )
+        away = (
+            (raw.get("awayTeam") or {}).get("translations", {}).get("ru")
+            or (raw.get("awayTeam") or {}).get("translation", {}).get("ru")
+            or (raw.get("awayTeam") or {}).get("name")
+            or (raw.get("away") or {}).get("name")
+            or raw.get("away")
+            or "Away"
+        )
 
-    # --- league/tournament ---
-    tournament = raw.get("tournament") or raw.get("league") or {}
-    league = (
-        (tournament.get("translations", {}) if isinstance(tournament, dict) else {}).get("ru")
-        or (tournament.get("name") if isinstance(tournament, dict) else "")
-        or raw.get("leagueName")
-        or ""
-    )
-    league = str(league or "").strip()
+        # --- league/tournament ---
+        tournament = raw.get("tournament") or raw.get("league") or {}
+        league = (
+            (tournament.get("translations", {}) if isinstance(tournament, dict) else {}).get("ru")
+            or (tournament.get("name") if isinstance(tournament, dict) else "")
+            or raw.get("leagueName")
+            or ""
+        )
+        league = str(league or "").strip()
 
-    # --- country (главное для навигации) ---
-    country = ""
-    try:
-        # часто: raw["country"], raw["league"]["country"], raw["tournament"]["country"]
-        if isinstance(raw.get("country"), str):
-            country = raw.get("country") or ""
-        if not country and isinstance(tournament, dict):
-            c1 = tournament.get("country")
-            if isinstance(c1, str) and c1.strip():
-                country = c1.strip()
-
-            # иногда: tournament.category.name или tournament.category.country
-            cat = tournament.get("category")
-            if not country and isinstance(cat, dict):
-                cn = cat.get("name") or cat.get("country")
-                if isinstance(cn, str) and cn.strip():
-                    country = cn.strip()
-
-        # иногда: raw["league_country"] / raw["leagueCountry"]
-        if not country:
-            for k in ("league_country", "leagueCountry", "countryName"):
-                v = raw.get(k)
-                if isinstance(v, str) and v.strip():
-                    country = v.strip()
-                    break
-    except Exception:
+        # --- country (важно для навигации) ---
         country = ""
+        try:
+            if isinstance(raw.get("country"), str):
+                country = raw.get("country") or ""
 
-    country = (country or "").strip() or "Other"
+            if not country and isinstance(tournament, dict):
+                c1 = tournament.get("country")
+                if isinstance(c1, str) and c1.strip():
+                    country = c1.strip()
 
-    # --- status ---
-    status = str(raw.get("status") or raw.get("state") or raw.get("matchStatus") or "").strip()
+                cat = tournament.get("category")
+                if not country and isinstance(cat, dict):
+                    cn = cat.get("name") or cat.get("country")
+                    if isinstance(cn, str) and cn.strip():
+                        country = cn.strip()
 
-    # --- start time ---
-    start_time = str(
-        raw.get("dateEvent")
-        or raw.get("startTime")
-        or raw.get("start_date")
-        or raw.get("startDate")
-        or raw.get("date")
-        or ""
-    ).strip()
+            if not country:
+                for k in ("league_country", "leagueCountry", "countryName"):
+                    v = raw.get(k)
+                    if isinstance(v, str) and v.strip():
+                        country = v.strip()
+                        break
+        except Exception:
+            country = ""
 
-    # --- score (опционально) ---
-    score = ""
-    try:
-        sc = raw.get("score")
-        if isinstance(sc, str):
-            score = sc.strip()
-        elif isinstance(sc, dict):
-            # варианты: {"home":1,"away":2} или {"fullTime":{"home":1,"away":2}}
-            if "home" in sc and "away" in sc:
-                score = f"{sc.get('home')}:{sc.get('away')}"
-            elif isinstance(sc.get("fullTime"), dict):
-                ft = sc["fullTime"]
-                score = f"{ft.get('home')}:{ft.get('away')}"
-    except Exception:
-        score = ""
+        country = (country or "").strip() or "Other"
 
-    title = f"{home} — {away}"
+        # --- status ---
+        status = str(raw.get("status") or raw.get("state") or raw.get("matchStatus") or "").strip()
 
-    return MatchDTO(
-        id=mid or "unknown",
-        sport_slug=sport_slug,
-        title=title,
-        league=league,
-        country=country,
-        status=status,
-        start_time=start_time,
-        score=score,
-    )
+        # --- start time ---
+        start_time = str(
+            raw.get("dateEvent")
+            or raw.get("startTime")
+            or raw.get("start_date")
+            or raw.get("startDate")
+            or raw.get("date")
+            or ""
+        ).strip()
 
+        score = self._extract_score(raw)
+
+        title = f"{home} — {away}"
+
+        return MatchDTO(
+            id=mid or "unknown",
+            sport_slug=sport_slug,
+            title=title,
+            league=league,
+            country=country,
+            status=status,
+            start_time=start_time,
+            score=score,
+        )
 
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
         """
-        Пробуем типовые пути и расширенные date-параметры (как в твоих логах).
+        Fetch matches by date with robust params/paths.
         """
         day_s = day.isoformat()
         sports = _sport_candidates(sport_slug)
 
-        # расширенный набор ключей дат — многие провайдеры принимают разные
         date_params = {
             "date": day_s,
             "day": day_s,
@@ -375,22 +363,19 @@ class SportAPIClient:
             "endDate": day_s,
         }
 
-        # пути (без ведущего / чтобы красиво в логе)
         paths: List[Tuple[str, Optional[Dict[str, Any]]]] = [
-            ("v2/{sport}/matches", date_params),
-            ("v2/{sport}/events", {"date": day_s}),
-            ("v2/{sport}/events/date/{day}", None),
-            ("v2/{sport}/games", {"date": day_s}),
+            ("/v2/{sport}/matches", date_params),
+            ("/v2/{sport}/events", {"date": day_s}),
+            ("/v2/{sport}/events/date/{day}", None),
+            ("/v2/{sport}/games", {"date": day_s}),
         ]
 
         last_err: Optional[Exception] = None
 
         for sp in sports:
             for tpl, params in paths:
-                path = "/" + tpl.format(sport=sp, day=day_s)
-
+                path = tpl.format(sport=sp, day=day_s)
                 try:
-                    # лог как у тебя
                     logger.info(
                         "SportAPI try matches_by_date sport=%s: GET %s params=%s",
                         sp,
@@ -419,12 +404,8 @@ class SportAPIClient:
 
     async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
         """
-        IMPORTANT: у тебя в логах 404 на /v2/ice-hockey/<id>
-        поэтому пробуем:
-          /v2/<sport>/matches/<id>
-          /v2/<sport>/events/<id>
-          /v2/<sport>/match/<id>
-          /v2/<sport>/<id> (на всякий)
+        Many providers do NOT support /v2/<sport>/<id>.
+        Try multiple known patterns.
         """
         sp = (sport_slug or "").strip().lower()
         mid = str(match_id or "").strip()
@@ -439,7 +420,7 @@ class SportAPIClient:
             "/v2/{sport}/events/{id}",
             "/v2/{sport}/match/{id}",
             "/v2/{sport}/game/{id}",
-            "/v2/{sport}/{id}",  # last resort (у тебя сейчас именно он и падает)
+            "/v2/{sport}/{id}",  # last resort
         ]
 
         last_err: Optional[Exception] = None
@@ -459,10 +440,7 @@ class SportAPIClient:
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
         """
-        Типовые пути:
-          /v2/<sport>/events/<id>/odds
-          /v2/<sport>/matches/<id>/odds
-          /v2/<sport>/odds/<id>
+        Odds endpoints vary widely.
         """
         sp = (sport_slug or "").strip().lower()
         mid = str(match_id or "").strip()
