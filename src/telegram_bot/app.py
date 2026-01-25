@@ -464,10 +464,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-    # быстрый вход в матчи
+        # быстрый вход в матчи
     if "матчи сегодня" in norm:
-    await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports(user_id))
-    return
+        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports(user_id))
+        return
+
 
 
     # premium / pro screen (когда кнопка прилетает как текст)
