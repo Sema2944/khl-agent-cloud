@@ -885,52 +885,32 @@ async def telegram_shutdown() -> None:
         await _telegram_app.shutdown()
     finally:
         _telegram_app = None
-# --- COMPAT: FastAPI routes mount for Telegram webhook ---
-# Вставь этот блок в src/telegram_bot/app.py (лучше в самый низ файла).
-
-import logging
-from typing import Any, Optional
+# ============================================================
+# FastAPI routes mount for Telegram webhook (Render / FastAPI)
+# ============================================================
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
-
-logger = logging.getLogger(__name__)
+from telegram import Update as TgUpdate
 
 telegram_router = APIRouter()
-
-
-def _get_ptb_application() -> Any:
-    """
-    Ищем объект python-telegram-bot Application в глобалах этого модуля.
-    Под разные версии/рефакторинги.
-    """
-    g = globals()
-    for name in ("application", "app", "tg_app", "_app", "_application", "BOT_APP"):
-        obj = g.get(name)
-        if obj is not None:
-            # грубая проверка по API
-            if hasattr(obj, "process_update") and hasattr(obj, "bot"):
-                return obj
-    return None
 
 
 @telegram_router.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     """
-    Telegram webhook endpoint: принимает Update JSON и прокидывает в PTB Application.
+    Telegram webhook endpoint: принимает Update JSON и прокидывает в python-telegram-bot Application.
     """
     payload = await request.json()
 
-    ptb_app = _get_ptb_application()
-    if ptb_app is None:
-        # Роут есть, но PTB app не найден — чтобы не было 404 и было видно в логах.
-        logger.error("Telegram webhook received, but PTB Application not found in module globals()")
-        return JSONResponse({"ok": False, "error": "ptb_application_not_found"}, status_code=500)
+    # используем твой глобальный PTB app
+    if _telegram_app is None:
+        logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
+        return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
 
     try:
-        from telegram import Update  # python-telegram-bot
-        upd = Update.de_json(payload, ptb_app.bot)
-        await ptb_app.process_update(upd)
+        upd = TgUpdate.de_json(payload, _telegram_app.bot)
+        await _telegram_app.process_update(upd)
         return JSONResponse({"ok": True})
     except Exception:
         logger.exception("Failed to process telegram update")
@@ -944,14 +924,3 @@ def mount_telegram_routes(app: FastAPI) -> None:
     app.include_router(telegram_router)
     logger.info("Telegram routes mounted.")
 
-
-# На всякий случай — мягкая совместимость с тем, как сервис дергает стартап/шатдаун
-async def telegram_startup() -> None:
-    # Если у тебя уже есть telegram_startup выше — этот не будет нужен.
-    return None
-
-
-async def telegram_shutdown() -> None:
-    # Если у тебя уже есть telegram_shutdown выше — этот не будет нужен.
-    return None
-# --- /COMPAT ---
