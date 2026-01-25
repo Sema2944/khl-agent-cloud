@@ -887,7 +887,6 @@ async def telegram_shutdown() -> None:
         _telegram_app = None
 # --- COMPAT: FastAPI routes mount for Telegram webhook ---
 # Вставь этот блок в src/telegram_bot/app.py (лучше в самый низ файла).
-from __future__ import annotations
 
 import logging
 from typing import Any, Optional
