@@ -5,6 +5,16 @@ import time
 
 Plan = Literal["free", "premium"]
 
+DEFAULT_SPORTS = [
+    "ice-hockey",
+    "football",
+    "basketball",
+    "tennis",
+    "table-tennis",
+    "esports",
+]
+
+
 @dataclass
 class UserAccess:
     user_id: int
@@ -23,3 +33,11 @@ class UserAccess:
     @property
     def can_live(self) -> bool:
         return self.is_premium or not self.trial_live_used
+
+
+def allowed_sports_for_user() -> list[str]:
+    """
+    Пока без персональной логики — возвращаем набор доступных видов спорта.
+    В будущем можно подключить user_id и тарифы.
+    """
+    return list(DEFAULT_SPORTS)
