@@ -885,3 +885,74 @@ async def telegram_shutdown() -> None:
         await _telegram_app.shutdown()
     finally:
         _telegram_app = None
+# --- COMPAT: FastAPI routes mount for Telegram webhook ---
+# Вставь этот блок в src/telegram_bot/app.py (лучше в самый низ файла).
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
+
+telegram_router = APIRouter()
+
+
+def _get_ptb_application() -> Any:
+    """
+    Ищем объект python-telegram-bot Application в глобалах этого модуля.
+    Под разные версии/рефакторинги.
+    """
+    g = globals()
+    for name in ("application", "app", "tg_app", "_app", "_application", "BOT_APP"):
+        obj = g.get(name)
+        if obj is not None:
+            # грубая проверка по API
+            if hasattr(obj, "process_update") and hasattr(obj, "bot"):
+                return obj
+    return None
+
+
+@telegram_router.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """
+    Telegram webhook endpoint: принимает Update JSON и прокидывает в PTB Application.
+    """
+    payload = await request.json()
+
+    ptb_app = _get_ptb_application()
+    if ptb_app is None:
+        # Роут есть, но PTB app не найден — чтобы не было 404 и было видно в логах.
+        logger.error("Telegram webhook received, but PTB Application not found in module globals()")
+        return JSONResponse({"ok": False, "error": "ptb_application_not_found"}, status_code=500)
+
+    try:
+        from telegram import Update  # python-telegram-bot
+        upd = Update.de_json(payload, ptb_app.bot)
+        await ptb_app.process_update(upd)
+        return JSONResponse({"ok": True})
+    except Exception:
+        logger.exception("Failed to process telegram update")
+        return JSONResponse({"ok": False}, status_code=500)
+
+
+def mount_telegram_routes(app: FastAPI) -> None:
+    """
+    Эту функцию требует src/service.py для монтирования маршрутов.
+    """
+    app.include_router(telegram_router)
+    logger.info("Telegram routes mounted.")
+
+
+# На всякий случай — мягкая совместимость с тем, как сервис дергает стартап/шатдаун
+async def telegram_startup() -> None:
+    # Если у тебя уже есть telegram_startup выше — этот не будет нужен.
+    return None
+
+
+async def telegram_shutdown() -> None:
+    # Если у тебя уже есть telegram_shutdown выше — этот не будет нужен.
+    return None
+# --- /COMPAT ---
