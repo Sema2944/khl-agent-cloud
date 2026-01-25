@@ -136,16 +136,21 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _is_allowed_sport(slug: str) -> bool:
-    allowed = allowed_sports_for_user()
-    return (slug or "").strip().lower() in allowed
+def _is_allowed_sport(user_id: int, slug: str) -> bool:
+    try:
+        allowed = allowed_sports_for_user(int(user_id))
+    except TypeError:
+        # если вдруг старая сигнатура без user_id
+        allowed = allowed_sports_for_user()
+    return (slug or "").strip().lower() in set((allowed or []))
 
 
-def kb_sports() -> InlineKeyboardMarkup:
+
+def kb_sports(user_id: int) -> InlineKeyboardMarkup:
     rows = []
     for slug in DEFAULT_SPORTS:
         title = SPORT_LABELS.get(slug, slug)
-        if _is_allowed_sport(slug):
+        if _is_allowed_sport(user_id, slug):
             rows.append([InlineKeyboardButton(title, callback_data=f"SPORT:{slug}")])
         else:
             if HIDE_LOCKED_SPORTS:
@@ -154,6 +159,7 @@ def kb_sports() -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
+
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
@@ -460,8 +466,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # быстрый вход в матчи
     if "матчи сегодня" in norm:
-        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports())
-        return
+    await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports(user_id))
+    return
+
 
     # premium / pro screen (когда кнопка прилетает как текст)
     if (
@@ -534,12 +541,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
-        text = "🏟 Выбери спорт:"
-        try:
-            await q.edit_message_text(text, reply_markup=kb_sports())
-        except Exception:
-            await q.message.reply_text(text, reply_markup=kb_sports())
-        return
+    text = "🏟 Выбери спорт:"
+    await q.edit_message_text(text, reply_markup=kb_sports(user_id))
+    return
+
 
     # BACK:MATCHES => вернуться на последний экран матчей
     if data == "BACK:MATCHES":
@@ -609,7 +614,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # SPORT
     if data.startswith("SPORT:"):
         sport_slug = data.split(":", 1)[1].strip().lower()
-        if not _is_allowed_sport(sport_slug):
+        if not _is_allowed_sport(user_id, sport_slug):
             title = SPORT_LABELS.get(sport_slug, sport_slug)
             txt = f"🔒 {title} недоступен по твоему тарифу."
             try:
