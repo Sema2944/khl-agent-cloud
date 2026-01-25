@@ -542,9 +542,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
-    text = "🏟 Выбери спорт:"
-    await q.edit_message_text(text, reply_markup=kb_sports(user_id))
-    return
+        text = "🏟 Выбери спорт:"
+        try:
+            await q.edit_message_text(text, reply_markup=kb_sports(user_id))
+        except Exception:
+            await q.message.reply_text(text, reply_markup=kb_sports(user_id))
+        return
+
 
 
     # BACK:MATCHES => вернуться на последний экран матчей
