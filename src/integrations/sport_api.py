@@ -25,7 +25,6 @@ LEAGUE_COUNTRY_HINTS = {
     "NCAA": "USA",
 }
 
-# Алиасы спорта (когда провайдер не знает исходный slug)
 SPORT_ALIASES: Dict[str, List[str]] = {
     "ice-hockey": ["hockey"],
     "table-tennis": ["ping-pong", "table_tennis", "tabletennis"],
@@ -101,7 +100,7 @@ def _get_team_name(team_obj: Any, fallback: str) -> str:
 
 def _unwrap_country(raw: Any) -> str:
     if isinstance(raw, dict):
-        return _first_str(raw.get("name"), raw.get("country"), raw.get("title"))
+        return _first_str(raw.get("name"), raw.get("country"), raw.get("title"), raw.get("code"))
     return _first_str(raw)
 
 
@@ -116,66 +115,140 @@ def _league_country_hint(league: str) -> str:
     return ""
 
 
+def _dig(d: Any, *path: str) -> Any:
+    """Безопасно достаём вложенное значение из dict по пути."""
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
 def _extract_country(raw: Dict[str, Any], tournament: Any, league: str) -> str:
+    # 1) top-level
     country = _unwrap_country(raw.get("country"))
     if not country:
-        country = _first_str(raw.get("countryName"), raw.get("leagueCountry"), raw.get("country_name"))
+        country = _first_str(
+            raw.get("countryName"),
+            raw.get("leagueCountry"),
+            raw.get("country_name"),
+            raw.get("countryCode"),
+        )
 
+    # 2) tournament/league/competition shapes
     if not country and isinstance(tournament, dict):
+        # tournament.country
         country = _unwrap_country(tournament.get("country"))
         if not country:
+            # tournament.category
             category = tournament.get("category")
             if isinstance(category, dict):
-                country = _first_str(category.get("name"), category.get("country"))
+                country = _first_str(category.get("name"), category.get("country"), category.get("title"))
+                if not country:
+                    country = _unwrap_country(category.get("country"))
 
+        # частые варианты
+        if not country:
+            country = _first_str(
+                _dig(tournament, "country", "name"),
+                _dig(tournament, "country", "title"),
+                _dig(tournament, "category", "name"),
+                _dig(tournament, "category", "country"),
+                _dig(tournament, "category", "country", "name"),
+            )
+
+    # 3) ещё пару популярных мест
+    if not country:
+        country = _first_str(
+            _dig(raw, "tournament", "country", "name"),
+            _dig(raw, "tournament", "category", "name"),
+            _dig(raw, "league", "country", "name"),
+            _dig(raw, "competition", "country", "name"),
+        )
+
+    # 4) fallback по лиге
     if not country:
         country = _league_country_hint(league)
 
     return country or "Other"
 
 
+def _score_num(x: Any) -> Optional[int]:
+    """Пытаемся привести счёт к числу из разных форматов."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        return int(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if s.isdigit():
+            return int(s)
+        return None
+    if isinstance(x, dict):
+        # часто бывает {"current": 0} или {"display": 0} или {"value": 0}
+        for k in ("current", "display", "value", "total", "score"):
+            v = x.get(k)
+            n = _score_num(v)
+            if n is not None:
+                return n
+        return None
+    return None
+
+
 def _extract_score(raw: Dict[str, Any]) -> str:
+    # string score
     s = raw.get("score")
     if isinstance(s, str) and s.strip():
         return s.strip()
 
-    # homeScore/awayScore
+    # simple numeric fields
     hs = raw.get("homeScore") or raw.get("home_score") or raw.get("scoreHome") or raw.get("goalsHome")
     aw = raw.get("awayScore") or raw.get("away_score") or raw.get("scoreAway") or raw.get("goalsAway")
-    if hs is not None and aw is not None:
-        return f"{hs}:{aw}"
+    hn = _score_num(hs)
+    an = _score_num(aw)
+    if hn is not None and an is not None:
+        return f"{hn}:{an}"
 
-    # scores/goals/result objects
+    # nested objects
     for key in ("scores", "goals", "result"):
         obj = raw.get(key)
         if isinstance(obj, dict):
             h = obj.get("home") or obj.get("homeScore") or obj.get("h")
             a = obj.get("away") or obj.get("awayScore") or obj.get("a")
-            if h is not None and a is not None:
-                return f"{h}:{a}"
+            hn = _score_num(h)
+            an = _score_num(a)
+            if hn is not None and an is not None:
+                return f"{hn}:{an}"
 
-    # sometimes score is dict
+    # score dict variants
     if isinstance(s, dict):
-        if "home" in s and "away" in s:
-            return f"{s.get('home')}:{s.get('away')}"
+        # fullTime / current / etc.
         ft = s.get("fullTime")
-        if isinstance(ft, dict) and "home" in ft and "away" in ft:
-            return f"{ft.get('home')}:{ft.get('away')}"
+        if isinstance(ft, dict):
+            hn = _score_num(ft.get("home"))
+            an = _score_num(ft.get("away"))
+            if hn is not None and an is not None:
+                return f"{hn}:{an}"
+
+        hn = _score_num(s.get("home"))
+        an = _score_num(s.get("away"))
+        if hn is not None and an is not None:
+            return f"{hn}:{an}"
+
+    # sometimes: homeTeam/awayTeam include score
+    ht = raw.get("homeTeam")
+    at = raw.get("awayTeam")
+    if isinstance(ht, dict) and isinstance(at, dict):
+        hn = _score_num(ht.get("score"))
+        an = _score_num(at.get("score"))
+        if hn is not None and an is not None:
+            return f"{hn}:{an}"
 
     return ""
 
 
 class SportAPIClient:
-    """
-    Sport Events API client.
-
-    Required ENV:
-      - SPORT_API_BASE (e.g. https://api.api-sport.ru)
-      - SPORT_API_KEY (+ optional header/prefix)
-    Optional:
-      - SPORT_API_TIMEOUT_S (default 12.0)
-    """
-
     def __init__(self) -> None:
         self.base = _env("SPORT_API_BASE", "").rstrip("/")
         if not self.base:
@@ -216,15 +289,6 @@ class SportAPIClient:
             raise SportAPIError(f"Bad JSON from API: {(r.text or '')[:400]}")
 
     def _unwrap_list(self, data: Any) -> List[Dict[str, Any]]:
-        """
-        Providers often return:
-        - {"data":[...]}
-        - {"response":[...]}
-        - {"data":{"matches":[...]}}
-        - {"response":{"items":[...]}}
-        - {"matches":[...]}
-        - [...]
-        """
         def _as_list(x: Any) -> List[Dict[str, Any]]:
             if isinstance(x, list):
                 return [i for i in x if isinstance(i, dict)]
@@ -283,7 +347,6 @@ class SportAPIClient:
             "Away",
         )
 
-        # если home/away пришли строкой
         if isinstance(raw.get("home"), str) and raw.get("home").strip():
             home = str(raw.get("home")).strip()
         if isinstance(raw.get("away"), str) and raw.get("away").strip():
@@ -310,6 +373,7 @@ class SportAPIClient:
             raw.get("date"),
             raw.get("time"),
         )
+
         score = _extract_score(raw)
 
         odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")
@@ -328,10 +392,6 @@ class SportAPIClient:
         )
 
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
-        """
-        Пробуем разные пути и алиасы спорта.
-        Главное: не падаем на 404 одного эндпоинта — пробуем дальше.
-        """
         sport_slug = (sport_slug or "").strip().lower()
         if not sport_slug:
             raise SportAPIError("matches_by_date: sport_slug is empty")
@@ -385,26 +445,9 @@ class SportAPIClient:
                             path.lstrip("/"),
                             len(out),
                         )
-
-                        # небольшой лог-саммари (помогает дебажить "Other")
-                        country_counts: Dict[str, int] = {}
-                        for m in out:
-                            c = (m.country or "Other").strip() or "Other"
-                            country_counts[c] = country_counts.get(c, 0) + 1
-                        top = sorted(country_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                        top_str = ", ".join([f"{name}({cnt})" for name, cnt in top])
-                        logger.info(
-                            "SportAPI matches_by_date summary: matches=%s countries=%s other=%s top=%s",
-                            len(out),
-                            len(country_counts),
-                            country_counts.get("Other", 0),
-                            top_str,
-                        )
-
                         return out
                 except Exception as e:
                     last_err = e
-                    # продолжаем перебирать
 
         if last_err:
             raise SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
