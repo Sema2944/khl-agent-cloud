@@ -1200,3 +1200,12 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
 
     return out
+import asyncio
+
+async def run_dialog_agent(user_id: int, text: str) -> str:
+    # fallback adapter if main entrypoint has different name
+    if "run_agent" in globals():
+        return await globals()["run_agent"](user_id, text)
+    if "run_dialog" in globals():
+        return await globals()["run_dialog"](user_id, text)
+    return "⚠️ Агент не подключен: не найден entrypoint run_dialog_agent"
