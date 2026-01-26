@@ -10,11 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -27,8 +25,8 @@ from telegram.ext import (
 
 from ..db import get_session
 from ..pro_db import is_pro
-from ..user_access import allowed_sports_for_user
 from ..ui_text import MAIN_MENU_TEXT
+from ..user_access import allowed_sports_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +110,7 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
 async def call_agent_local(user_id: int, text: str) -> str:
     """Вызываем локального агента (src/parsing.py)."""
     from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
+
     return await run_dialog_agent(user_id, text)
 
 
@@ -141,13 +140,12 @@ def _is_allowed_sport(user_id: int, slug: str) -> bool:
         allowed = allowed_sports_for_user(int(user_id))
     except TypeError:
         # если вдруг старая сигнатура без user_id
-        allowed = allowed_sports_for_user()
+        allowed = allowed_sports_for_user()  # type: ignore
     return (slug or "").strip().lower() in set((allowed or []))
 
 
-
 def kb_sports(user_id: int) -> InlineKeyboardMarkup:
-    rows = []
+    rows: List[List[InlineKeyboardButton]] = []
     for slug in DEFAULT_SPORTS:
         title = SPORT_LABELS.get(slug, slug)
         if _is_allowed_sport(user_id, slug):
@@ -159,7 +157,6 @@ def kb_sports(user_id: int) -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
-
 
 
 def kb_match_hub(match_id: str) -> InlineKeyboardMarkup:
@@ -205,7 +202,16 @@ _NAV_BY_USER: Dict[int, _NavState] = {}
 _PER_PAGE = 12
 
 
+def _msk_today_iso() -> str:
+    return datetime.now(MSK).date().isoformat()
+
+
+def _league_ru(league: str) -> str:
+    return (league or "").strip() or "Other"
+
+
 def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
+    _ = user_id
     today_iso = _msk_today_iso()
 
     country_by_key: Dict[str, str] = {}
@@ -298,7 +304,7 @@ def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarku
         return InlineKeyboardMarkup(rows)
 
     items: List[Tuple[str, int]] = []
-    for (ck, lk), lname in st.league_by_key.items():
+    for (ck, lk), _lname in st.league_by_key.items():
         if ck != ckey:
             continue
         n = len(st.match_ids_by_league.get((ck, lk), []))
@@ -384,20 +390,19 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
     )
 
 
-def _msk_today_iso() -> str:
-    return datetime.now(MSK).date().isoformat()
-
-
-def _league_ru(league: str) -> str:
-    if not league:
-        return "Other"
-    return league
-
-
 def kb_buy_pro() -> InlineKeyboardMarkup:
-    from .payments import kb_buy_pro as kb
+    # чтобы бот не падал, если payments/user_store ещё не готовы
+    try:
+        from .payments import kb_buy_pro as kb  # type: ignore
 
-    return kb()
+        return kb()
+    except Exception:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Написать админу", url="https://t.me/")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+            ]
+        )
 
 
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -427,7 +432,7 @@ async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, In
 def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     st = _NAV_BY_USER.get(user_id)
     if not st:
-        return "🏟 Выбери спорт:", kb_sports()
+        return "🏟 Выбери спорт:", kb_sports(user_id)
 
     sport = st.sport
     if st.last_screen == "COUNTRIES":
@@ -464,12 +469,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-        # быстрый вход в матчи
+    # быстрый вход в матчи
     if "матчи сегодня" in norm:
         await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports(user_id))
         return
-
-
 
     # premium / pro screen (когда кнопка прилетает как текст)
     if (
@@ -549,8 +552,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(text, reply_markup=kb_sports(user_id))
         return
 
-
-
     # BACK:MATCHES => вернуться на последний экран матчей
     if data == "BACK:MATCHES":
         text, kb = _nav_back_to_last(user_id)
@@ -611,9 +612,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in DEFAULT_SPORTS)
         )
         try:
-            await q.edit_message_text(txt, reply_markup=kb_sports())
+            await q.edit_message_text(txt, reply_markup=kb_sports(user_id))
         except Exception:
-            await q.message.reply_text(txt, reply_markup=kb_sports())
+            await q.message.reply_text(txt, reply_markup=kb_sports(user_id))
         return
 
     # SPORT
@@ -623,9 +624,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             title = SPORT_LABELS.get(sport_slug, sport_slug)
             txt = f"🔒 {title} недоступен по твоему тарифу."
             try:
-                await q.edit_message_text(txt, reply_markup=kb_sports())
+                await q.edit_message_text(txt, reply_markup=kb_sports(user_id))
             except Exception:
-                await q.message.reply_text(txt, reply_markup=kb_sports())
+                await q.message.reply_text(txt, reply_markup=kb_sports(user_id))
             return
 
         text, kb = await _render_sport_nav_root(user_id, sport_slug)
@@ -808,9 +809,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         mode = parts[2].strip().lower()
         action = parts[3].strip().lower()
 
-        # ВАЖНО:
-        # НЕ блокируем LIVE PRO здесь — иначе Trial (1/1) из parsing.py никогда не сработает.
-        # Вся логика trial/pro/teaser — в src/parsing.py (_run_ui_llm).
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
 
@@ -895,31 +893,24 @@ async def telegram_shutdown() -> None:
         await _telegram_app.shutdown()
     finally:
         _telegram_app = None
+
+
 # ============================================================
 # FastAPI routes mount for Telegram webhook (Render / FastAPI)
 # ============================================================
-
-from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import JSONResponse
-from telegram import Update as TgUpdate
-
 telegram_router = APIRouter()
 
 
 @telegram_router.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    """
-    Telegram webhook endpoint: принимает Update JSON и прокидывает в python-telegram-bot Application.
-    """
     payload = await request.json()
 
-    # используем твой глобальный PTB app
     if _telegram_app is None:
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
 
     try:
-        upd = TgUpdate.de_json(payload, _telegram_app.bot)
+        upd = Update.de_json(payload, _telegram_app.bot)
         await _telegram_app.process_update(upd)
         return JSONResponse({"ok": True})
     except Exception:
@@ -928,9 +919,5 @@ async def telegram_webhook(request: Request):
 
 
 def mount_telegram_routes(app: FastAPI) -> None:
-    """
-    Эту функцию требует src/service.py для монтирования маршрутов.
-    """
     app.include_router(telegram_router)
     logger.info("Telegram routes mounted.")
-
