@@ -109,9 +109,17 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
 
 async def call_agent_local(user_id: int, text: str) -> str:
     """Вызываем локального агента (src/parsing.py)."""
-    from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
+    try:
+        from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
+    except Exception as e:
+        logger.exception("AI agent import failed: %s", e)
+        return "⚠️ AI модуль временно недоступен. Мы уже чиним."
+    try:
+        return await run_dialog_agent(user_id, text)
+    except Exception as e:
+        logger.exception("AI agent runtime failed: %s", e)
+        return "⚠️ AI временно недоступен, попробуй позже."
 
-    return await run_dialog_agent(user_id, text)
 
 
 def _text_buy_pro(user_id: int) -> str:
@@ -391,18 +399,16 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
 
 
 def kb_buy_pro() -> InlineKeyboardMarkup:
-    # чтобы бот не падал, если payments/user_store ещё не готовы
     try:
-        from .payments import kb_buy_pro as kb  # type: ignore
-
+        from .payments import kb_buy_pro as kb
         return kb()
     except Exception:
-        return InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Написать админу", url="https://t.me/")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
-            ]
-        )
+        logger.exception("payments.kb_buy_pro failed; fallback keyboard used")
+        rows = [
+            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
 
 
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
