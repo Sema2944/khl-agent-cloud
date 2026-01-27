@@ -1202,6 +1202,149 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     return out
 import asyncio
 
+# --- REPLACE THIS WHOLE FUNCTION in src/parsing.py ---
+
 async def run_dialog_agent(user_id: int, text: str) -> str:
-    return await run_agent(user_id, text)
+    """
+    Главный entrypoint для Telegram/HTTP.
+    Команды:
+      - ping
+      - матчи сегодня [sport_slug]
+      - матч <match_id>
+      - ui match <match_id> <pre|live> <overview|pro|refresh>
+      - профиль
+      - стратегия
+    """
+    user_id = int(user_id or 0)
+    raw = (text or "").strip()
+    norm = raw.lower().strip()
+
+    # 0) healthcheck
+    if norm in {"ping", "/ping", "ping!", "пинг"}:
+        return "pong ✅"
+
+    # 1) UI command from telegram_bot/app.py
+    #    format: "ui match <id> <mode> <action>"
+    if norm.startswith("ui match "):
+        parts = raw.split()
+        # ui match {id} {mode} {action}
+        if len(parts) >= 5:
+            match_id = parts[2].strip()
+            mode = parts[3].strip().lower()
+            action = parts[4].strip().lower()
+            try:
+                fn = globals().get("_run_ui_llm")
+                if fn is None:
+                    return "⚠️ UI недоступен: не найдена функция _run_ui_llm в parsing.py"
+                return await fn(user_id, match_id, mode, action)
+            except Exception as e:
+                return f"⚠️ UI ошибка: {type(e).__name__}: {str(e)[:200]}"
+        return "⚠️ Неверная команда UI. Пример: ui match 123 live overview"
+
+    # 2) matches today
+    if norm.startswith("матчи сегодня"):
+        # "матчи сегодня" or "матчи сегодня ice-hockey"
+        sport_slug = "ice-hockey"
+        try:
+            parts = raw.split()
+            if len(parts) >= 3:
+                sport_slug = parts[2].strip().lower()
+        except Exception:
+            pass
+
+        # если у тебя есть уже готовый форматтер — используем его
+        fmt = globals().get("_format_matches_today_api")
+        if callable(fmt):
+            try:
+                return await fmt(user_id, sport_slug)
+            except Exception as e:
+                return f"⚠️ Ошибка загрузки матчей: {type(e).__name__}: {str(e)[:200]}"
+
+        # fallback (если вдруг форматтера нет)
+        try:
+            from datetime import date
+            from src.integrations.sport_api import SportAPIClient
+            api = SportAPIClient()
+            matches = await api.matches_by_date(sport_slug, date.today())
+            if not matches:
+                return "Матчей на сегодня нет."
+            lines = [f"🏟 Матчи сегодня — {sport_slug}", ""]
+            for m in matches[:30]:
+                lines.append(f"• {m.title} ({m.league}) {m.start_time} {m.score}".strip())
+            if len(matches) > 30:
+                lines.append(f"\n…и ещё {len(matches)-30}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"⚠️ Ошибка API: {type(e).__name__}: {str(e)[:200]}"
+
+    # 3) match details
+    if norm.startswith("матч "):
+        match_id = raw.split(" ", 1)[1].strip()
+
+        # пытаемся угадать спорт (перебором) — надёжно и без кешей
+        try:
+            from src.integrations.sport_api import SportAPIClient, SportAPIError
+
+            api = SportAPIClient()
+            candidates = ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]
+            last_err = None
+            dto = None
+            used_sport = None
+            for sport in candidates:
+                try:
+                    dto = await api.match_details(sport, match_id)
+                    used_sport = sport
+                    break
+                except Exception as e:
+                    last_err = e
+
+            if dto is None:
+                return f"⚠️ Не нашёл матч {match_id}. Последняя ошибка: {type(last_err).__name__}: {str(last_err)[:160]}"
+
+            status = (dto.status or "").strip()
+            score = (dto.score or "").strip()
+            when = (dto.start_time or "").strip()
+            league = (dto.league or "").strip()
+            country = (dto.country or "").strip()
+
+            out = [
+                f"🏟 {dto.title}",
+                f"🏆 {league}" if league else "",
+                f"🏳️ {country}" if country else "",
+                f"🕒 {when}" if when else "",
+                f"ℹ️ {status}" if status else "",
+                f"📊 Счёт: {score}" if score else "",
+                "",
+                "Кнопки: PRE / LIVE / LIVE PRO доступны в Telegram интерфейсе.",
+                f"(sport={used_sport})",
+            ]
+            return "\n".join([x for x in out if x])
+
+        except Exception as e:
+            return f"⚠️ Ошибка матча: {type(e).__name__}: {str(e)[:200]}"
+
+    # 4) профиль / стратегия (если есть соответствующие функции)
+    if "профиль" in norm:
+        fn = globals().get("_format_profile_text")
+        if callable(fn):
+            try:
+                # профиль в твоём файле обычно тянется из БД через session/stats,
+                # поэтому здесь просто fallback текст
+                return "📊 Профиль: команда в разработке."
+            except Exception as e:
+                return f"⚠️ Профиль ошибка: {type(e).__name__}: {str(e)[:200]}"
+        return "📊 Профиль: команда в разработке."
+
+    if "стратег" in norm:
+        fn = globals().get("_format_expert_strategy_for_today")
+        if callable(fn):
+            try:
+                return fn()
+            except Exception as e:
+                return f"⚠️ Стратегия ошибка: {type(e).__name__}: {str(e)[:200]}"
+        return "👤 Стратегия: пока недоступно."
+
+    # 5) default
+    return "Напиши: «матчи сегодня», «матч <id>» или «ping»."
+
 
