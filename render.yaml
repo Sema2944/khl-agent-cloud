@@ -1,11 +1,11 @@
 databases:
-  - name: khl-db
+  - name: autochehol-db
     plan: free
     postgresMajorVersion: 16
 
 services:
   - type: web
-    name: khl-agent-api
+    name: autochehol-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -13,14 +13,14 @@ services:
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: khl-db
+          name: autochehol-db
           property: connectionString
 
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
       - key: PUBLIC_URL
-        value: https://khl-agent-api-9dw6.onrender.com
+        value: https://autochehol-bot.onrender.com
 
       - key: TELEGRAM_WEBHOOK_PATH
         value: /telegram/webhook
