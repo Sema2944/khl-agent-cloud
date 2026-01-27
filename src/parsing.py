@@ -1247,25 +1247,24 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             # LIVE: стабильный cache_key без снапшот-хеша => меньше LLM вызовов / меньше TPM
             cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
 
-            if _llm_is_disabled():
-    # сразу fallback без запроса к OpenAI
-    return "AI временно недоступен — попробуй позже."
+                        if _llm_is_disabled():
+                # сразу fallback без запроса к OpenAI
+                return "AI временно недоступен — попробуй позже."
 
-try:
-    analysis, meta = await analyze_with_llm_cached(
-        prompt,
-        cache_key=cache_key,
-        schema=schema,
-        ttl_s=int(ttl_s),
-        user_id=user_id,
-    )
-except Exception as e:
-    if _is_quota_error(e):
-        _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
-        return "AI временно недоступен (лимит/квота). Попробуй позже."
-    raise
+            try:
+                analysis, meta = await analyze_with_llm_cached(
+                    prompt,
+                    cache_key=cache_key,
+                    schema=schema,
+                    ttl_s=int(ttl_s),
+                    user_id=user_id,
+                )
+            except Exception as e:
+                if _is_quota_error(e):
+                    _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
+                    return "AI временно недоступен (лимит/квота). Попробуй позже."
+                raise
 
-            )
             _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
 
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
@@ -1273,6 +1272,7 @@ except Exception as e:
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
             return out
+
 
         # trial активирован — продолжаем как PRO (ниже)
 
