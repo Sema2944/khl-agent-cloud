@@ -406,7 +406,9 @@ def kb_buy_pro() -> InlineKeyboardMarkup:
     # временная заглушка, чтобы бот не падал из-за payments.py
     rows = [
         [InlineKeyboardButton("⭐ Оформить Premium (скоро)", callback_data="BUY:PRO")],
-        [InlineKeyboardButton("⬅️ Назад",
+        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 
