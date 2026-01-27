@@ -1190,29 +1190,48 @@ def _pro_teaser_footer() -> str:
 
 
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
+    """
+    UI-обработчик для Telegram:
+      - ui match <id> <pre|live> <overview|pro|refresh>
+    Делает:
+      - сбор контекста матча
+      - снапшоты для LIVE (prev/cur)
+      - кеширование рендера в LIVE (если нет изменений)
+      - trial gating для LIVE PRO (1/1) + teaser если trial уже использован
+      - вызов analyze_with_llm_cached + фоллбеки по квоте/лимитам
+    """
+    user_id = int(user_id or 0)
+    match_id = str(match_id or "").strip()
+    mode = (mode or "").strip().lower()
+    action = (action or "").strip().lower()
+
+    if mode not in {"pre", "live"}:
+        mode = "pre"
+    if action not in {"overview", "pro", "refresh"}:
+        action = "overview"
+
+    # refresh -> overview (логика одна, просто принудительно обновляем снапшот/кеш)
+    if action == "refresh":
+        action = "overview"
+
+    # 1) Контекст матча (из кеша/дня/деталей/odds)
     match_meta = await _get_match_context(user_id, match_id)
+    sport_slug = (match_meta.get("sport_slug") or match_meta.get("sport") or "ice-hockey").strip().lower()
 
-    sport_slug = str(match_meta.get("sport") or "").strip().lower()
-    match_id = str(match_meta.get("id") or match_id).strip()
-    mode = (mode or "pre").strip().lower()
-    action = (action or "overview").strip().lower()
-
-    cur_snap = {
-        "status": match_meta.get("status"),
-        "start_time": match_meta.get("start_time"),
-        "score": match_meta.get("score"),
-        **_oddsbase_snapshot(match_meta, mode),
-    }
-
+    # 2) LIVE снапшоты (для определения "нет изменений")
     prev_snap = None
+    cur_snap = {}
+
     if mode == "live":
         prev_snap = _LIVE_SNAPSHOT_BY_MATCH.get(match_id)
-        if action == "refresh":
-            action = "overview"
+        cur_snap = _oddsbase_snapshot(match_meta, mode="live")
+
+        # если обновления нет — отдаём закешированный рендер или "нет изменений"
         if prev_snap is not None and cur_snap == prev_snap:
             cached = _LIVE_RENDER_BY_MATCH.get((match_id, action))
             if cached:
                 return cached
+
             no_change = _live_no_change_text(match_meta, action)
             _LAST_LLM_META_BY_USER[user_id] = {
                 "provider": "local",
@@ -1225,7 +1244,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_RENDER_BY_MATCH[(match_id, action)] = no_change
             return no_change
 
-    # ---------- LIVE PRO gating + TRIAL ----------
+    else:
+        # PRE: тоже снапшот нужен для cache_key hash (чтобы разбор менялся при изменениях)
+        cur_snap = _oddsbase_snapshot(match_meta, mode="pre")
+
+    # 3) LIVE PRO gating + TRIAL
     trial_banner = ""
 
     if mode == "live" and action == "pro" and not is_pro(user_id):
@@ -1240,15 +1263,19 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 else:
                     trial_used = True
 
+        # Если триал уже использован — не даём PRO, отдаём teaser (overview + футер)
         if trial_used:
             teaser_action = "overview"
             prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
 
-            # LIVE: стабильный cache_key без снапшот-хеша => меньше LLM вызовов / меньше TPM
+            # TTL / schema для teaser (это обычный ui_live)
+            schema = "ui_live"
+            ttl_s = TTL_LIVE_S
+
+            # LIVE: стабильный cache_key (без снапшот-хеша) => меньше LLM вызовов / меньше TPM
             cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
 
-                        if _llm_is_disabled():
-                # сразу fallback без запроса к OpenAI
+            if _llm_is_disabled():
                 return "AI временно недоступен — попробуй позже."
 
             try:
@@ -1269,9 +1296,121 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
             out = _truncate_telegram(base_txt) + _pro_teaser_footer()
+
+            # сохраняем снапшоты/рендер
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
             _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
             return out
+
+        # если триал активирован (trial_banner выставлен) — продолжаем как PRO ниже
+
+    # 4) Normal / PRO
+    prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
+
+    # schema + ttl
+    if mode == "live" and action == "pro":
+        schema = "ui_live_pro"
+        ttl_s = TTL_LIVE_PRO_S
+    else:
+        schema = "ui_live" if mode == "live" else "ui_pre"
+        ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
+
+    # cache_key:
+    # - LIVE: стабильный (без hash) => экономим запросы
+    # - PRE: с hash по снапшоту => меняется при изменениях
+    if mode == "live":
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}"
+    else:
+        h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+
+    if _llm_is_disabled():
+        return "AI временно недоступен — попробуй позже."
+
+    try:
+        analysis, meta = await analyze_with_llm_cached(
+            prompt,
+            cache_key=cache_key,
+            schema=schema,
+            ttl_s=int(ttl_s),
+            user_id=user_id,
+        )
+    except Exception as e:
+        if _is_quota_error(e):
+            _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
+            return "AI временно недоступен (лимит/квота). Попробуй позже."
+        raise
+
+    _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
+    out = _render_ui_json(analysis, mode=mode, action=action)
+
+    # если это был триал на LIVE PRO — добавим баннер сверху
+    if trial_banner and mode == "live" and action == "pro":
+        out = trial_banner + out
+
+    # LIVE: сохраняем снапшот + рендер
+    if mode == "live":
+        _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
+        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
+
+    return out
+
+
+        # если триал активирован (trial_banner выставлен) — продолжаем как PRO ниже
+
+    # 4) Normal / PRO
+    prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
+
+    # schema + ttl
+    if mode == "live" and action == "pro":
+        schema = "ui_live_pro"
+        ttl_s = TTL_LIVE_PRO_S
+    else:
+        schema = "ui_live" if mode == "live" else "ui_pre"
+        ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
+
+    # cache_key:
+    # - LIVE: стабильный (без hash) => экономим запросы
+    # - PRE: с hash по снапшоту => меняется при изменениях
+    if mode == "live":
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}"
+    else:
+        h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
+        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
+
+    if _llm_is_disabled():
+        return "AI временно недоступен — попробуй позже."
+
+    try:
+        analysis, meta = await analyze_with_llm_cached(
+            prompt,
+            cache_key=cache_key,
+            schema=schema,
+            ttl_s=int(ttl_s),
+            user_id=user_id,
+        )
+    except Exception as e:
+        if _is_quota_error(e):
+            _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
+            return "AI временно недоступен (лимит/квота). Попробуй позже."
+        raise
+
+    _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
+    out = _render_ui_json(analysis, mode=mode, action=action)
+
+    # если это был триал на LIVE PRO — добавим баннер сверху
+    if trial_banner and mode == "live" and action == "pro":
+        out = trial_banner + out
+
+    # LIVE: сохраняем снапшот + рендер
+    if mode == "live":
+        _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
+        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
+
+    return out
+
 
 
         # trial активирован — продолжаем как PRO (ниже)
