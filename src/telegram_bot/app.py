@@ -403,20 +403,11 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
 
 
 def kb_buy_pro() -> InlineKeyboardMarkup:
-    """
-    Пока payments.py/user_store не готовы — показываем безопасную кнопку.
-    Если задан PRO_BUY_URL в ENV, кнопка ведёт на URL.
-    Иначе — показывает callback BUY:PRO.
-    """
-    buy_url = (os.getenv("PRO_BUY_URL") or "").strip()
+    # временная заглушка, чтобы бот не падал из-за payments.py
+    rows = [
+        [InlineKeyboardButton("⭐ Оформить Premium (скоро)", callback_data="BUY:PRO")],
+        [InlineKeyboardButton("⬅️ Назад",
 
-    if buy_url:
-        rows = [[InlineKeyboardButton("⭐ Оформить Premium", url=buy_url)]]
-    else:
-        rows = [[InlineKeyboardButton("⭐ Оформить Premium", callback_data="BUY:PRO")]]
-
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
-    return InlineKeyboardMarkup(rows)
 
 
 
