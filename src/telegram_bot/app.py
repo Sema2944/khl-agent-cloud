@@ -404,8 +404,9 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
 
 def kb_buy_pro() -> InlineKeyboardMarkup:
     """
-    Пока payments.py не готов — показываем простую кнопку.
-    Можно задать PRO_BUY_URL в ENV, чтобы вести на оплату/страницу.
+    Пока payments.py/user_store не готовы — показываем безопасную кнопку.
+    Если задан PRO_BUY_URL в ENV, кнопка ведёт на URL.
+    Иначе — показывает callback BUY:PRO.
     """
     buy_url = (os.getenv("PRO_BUY_URL") or "").strip()
 
@@ -416,6 +417,7 @@ def kb_buy_pro() -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
+
 
 
 
