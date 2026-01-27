@@ -837,6 +837,54 @@ def _build_ui_prompt(
     schema_hint = _schema_prompt(mode, action)
     return "\n".join(head + ctx + meta + ["", schema_hint])
 
+# --- UI schemas (fallback, если схемы не объявлены выше) ---
+# Нужны для _schema_prompt(); иначе NameError.
+try:
+    _SCHEMA_UI_PRE
+except NameError:
+    _SCHEMA_UI_PRE = """
+{
+  "title": "string",
+  "summary": "string",
+  "context": ["string"],
+  "insights": ["string"],
+  "risks": ["string"],
+  "disclaimer": "string"
+}
+""".strip()
+
+try:
+    _SCHEMA_UI_LIVE
+except NameError:
+    _SCHEMA_UI_LIVE = """
+{
+  "title": "string",
+  "summary": "string",
+  "context": ["string"],
+  "live_state": "string",
+  "key_events": ["string"],
+  "insights": ["string"],
+  "risks": ["string"],
+  "disclaimer": "string"
+}
+""".strip()
+
+try:
+    _SCHEMA_UI_LIVE_PRO
+except NameError:
+    _SCHEMA_UI_LIVE_PRO = """
+{
+  "title": "string",
+  "summary": "string",
+  "context": ["string"],
+  "live_state": "string",
+  "key_events": ["string"],
+  "pro_angles": ["string"],
+  "bets": ["string"],
+  "risks": ["string"],
+  "disclaimer": "string"
+}
+""".strip()
 
 def _schema_prompt(mode: str, action: str) -> str:
     if mode == "live" and action == "pro":
