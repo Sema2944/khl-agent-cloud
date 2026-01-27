@@ -65,6 +65,50 @@ _BANNED_PHRASES = (
 # -----------------------------
 _PER_USER_LAST_CALL: Dict[int, float] = {}
 _PER_USER_LOCK = asyncio.Lock()
+# -----------------------------
+# LLM Circuit Breaker (quota/429)
+# -----------------------------
+_LLM_DISABLED_UNTIL_TS: float = 0.0
+_LLM_DISABLED_REASON: str = ""
+
+
+def _llm_is_disabled() -> bool:
+    return time.time() < _LLM_DISABLED_UNTIL_TS
+
+
+def _llm_disable_for(seconds: float, reason: str) -> None:
+    global _LLM_DISABLED_UNTIL_TS, _LLM_DISABLED_REASON
+    _LLM_DISABLED_UNTIL_TS = time.time() + float(seconds)
+    _LLM_DISABLED_REASON = (reason or "")[:240]
+
+
+def _is_quota_or_429(e: Exception) -> bool:
+    s = (str(e) or "").lower()
+    return (
+        "insufficient_quota" in s
+        or "you exceeded your current quota" in s
+        or "http 429" in s
+        or "status code: 429" in s
+        or "rate limit" in s
+    )
+
+
+def _fallback_ui(schema: str, reason: str) -> Dict[str, Any]:
+    # Универсальный fallback под UI-схемы
+    if schema in {"ui_live", "ui_live_pro"}:
+        return _normalize_ui_obj(schema, {
+            "title": "🟢 LIVE-обзор",
+            "disclaimer": "Аналитический материал, не является рекомендацией.",
+            "context": [],
+            "markets": [],
+            "risks": ["AI временно недоступен — попробуй позже."],
+            "debug": {"llm_reason": reason},
+        })
+
+    # ui_pre / legacy
+    return _normalize_ui_obj("ui_pre", {
+        "title": "📊 Обзор рынков",
+        "summary": "AI временно недоступен — показываю базовую
 
 
 @dataclass
