@@ -1204,10 +1204,14 @@ import asyncio
 
 # --- REPLACE THIS WHOLE FUNCTION in src/parsing.py ---
 
+# ============================================================
+# Telegram / HTTP entrypoint
+# ============================================================
+
 async def run_dialog_agent(user_id: int, text: str) -> str:
     """
     Главный entrypoint для Telegram/HTTP.
-    Команды:
+    Поддерживает:
       - ping
       - матчи сегодня [sport_slug]
       - матч <match_id>
@@ -1223,128 +1227,135 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
     if norm in {"ping", "/ping", "ping!", "пинг"}:
         return "pong ✅"
 
-    # 1) UI command from telegram_bot/app.py
-    #    format: "ui match <id> <mode> <action>"
+    # 1) UI command from telegram_bot/app.py: "ui match <id> <mode> <action>"
     if norm.startswith("ui match "):
         parts = raw.split()
-        # ui match {id} {mode} {action}
         if len(parts) >= 5:
             match_id = parts[2].strip()
             mode = parts[3].strip().lower()
             action = parts[4].strip().lower()
             try:
-                fn = globals().get("_run_ui_llm")
-                if fn is None:
-                    return "⚠️ UI недоступен: не найдена функция _run_ui_llm в parsing.py"
-                return await fn(user_id, match_id, mode, action)
+                return await _run_ui_llm(user_id, match_id, mode, action)
             except Exception as e:
-                return f"⚠️ UI ошибка: {type(e).__name__}: {str(e)[:200]}"
-        return "⚠️ Неверная команда UI. Пример: ui match 123 live overview"
+                logger.exception("ui command failed")
+                return f"⚠️ Ошибка UI: {type(e).__name__}: {str(e)[:160]}"
+        return "⚠️ Формат: ui match <match_id> <pre|live> <overview|pro|refresh>"
 
-    # 2) matches today
-    if norm.startswith("матчи сегодня"):
-        # "матчи сегодня" or "матчи сегодня ice-hockey"
+    # 2) "матчи сегодня" (+ необязательный sport_slug)
+    if "матчи сегодня" in norm:
+        # пробуем вытащить slug последним токеном
+        sport_slug = "ice-hockey"
+        parts = norm.split()
+        if parts:
+            last = parts[-1].strip()
+            # если последнее слово похоже на slug спорта — используем
+            if last in {
+                "ice-hockey",
+                "hockey",
+                "football",
+                "basketball",
+                "tennis",
+                "table-tennis",
+                "esports",
+            }:
+                # нормализуем alias
+                sport_slug = "ice-hockey" if last == "hockey" else last
+
+        try:
+            return await _format_matches_today_api(user_id, sport_slug)
+        except Exception as e:
+            logger.exception("format matches today failed")
+            return f"⚠️ Не удалось получить матчи: {type(e).__name__}: {str(e)[:200]}"
+
+    # 3) "матч <id>"
+    if norm.startswith("матч "):
+        match_id = raw.split(" ", 1)[1].strip()
+        if not match_id:
+            return "⚠️ Укажи id матча: матч <match_id>"
+
+        # определяем sport_slug из индекса (если матч уже был загружен списком)
         sport_slug = "ice-hockey"
         try:
-            parts = raw.split()
-            if len(parts) >= 3:
-                sport_slug = parts[2].strip().lower()
+            idx = _build_index_for_user(user_id)  # dict with cached entities
+            mm = (idx.get("match_meta") or {}).get(str(match_id))
+            if isinstance(mm, dict) and mm.get("sport_slug"):
+                sport_slug = str(mm["sport_slug"]).strip() or sport_slug
         except Exception:
             pass
 
-        # если у тебя есть уже готовый форматтер — используем его
-        fmt = globals().get("_format_matches_today_api")
-        if callable(fmt):
-            try:
-                return await fmt(user_id, sport_slug)
-            except Exception as e:
-                return f"⚠️ Ошибка загрузки матчей: {type(e).__name__}: {str(e)[:200]}"
-
-        # fallback (если вдруг форматтера нет)
+        # тянем details из API и рендерим хаб-текст
         try:
-            from datetime import date
-            from src.integrations.sport_api import SportAPIClient
-            api = SportAPIClient()
-            matches = await api.matches_by_date(sport_slug, date.today())
-            if not matches:
-                return "Матчей на сегодня нет."
-            lines = [f"🏟 Матчи сегодня — {sport_slug}", ""]
-            for m in matches[:30]:
-                lines.append(f"• {m.title} ({m.league}) {m.start_time} {m.score}".strip())
-            if len(matches) > 30:
-                lines.append(f"\n…и ещё {len(matches)-30}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"⚠️ Ошибка API: {type(e).__name__}: {str(e)[:200]}"
-
-    # 3) match details
-    if norm.startswith("матч "):
-        match_id = raw.split(" ", 1)[1].strip()
-
-        # пытаемся угадать спорт (перебором) — надёжно и без кешей
-        try:
-            from src.integrations.sport_api import SportAPIClient, SportAPIError
+            from .integrations.sport_api import SportAPIClient
 
             api = SportAPIClient()
-            candidates = ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]
-            last_err = None
-            dto = None
-            used_sport = None
-            for sport in candidates:
-                try:
-                    dto = await api.match_details(sport, match_id)
-                    used_sport = sport
-                    break
-                except Exception as e:
-                    last_err = e
+            dto = await api.match_details(sport_slug, match_id)
 
-            if dto is None:
-                return f"⚠️ Не нашёл матч {match_id}. Последняя ошибка: {type(last_err).__name__}: {str(last_err)[:160]}"
-
-            status = (dto.status or "").strip()
-            score = (dto.score or "").strip()
-            when = (dto.start_time or "").strip()
+            # минимальный, но стабильный текст
+            title = (dto.title or f"Матч {match_id}").strip()
             league = (dto.league or "").strip()
             country = (dto.country or "").strip()
+            status = (dto.status or "").strip()
+            score = (dto.score or "").strip()
+            start_time = (dto.start_time or "").strip()
 
-            out = [
-                f"🏟 {dto.title}",
-                f"🏆 {league}" if league else "",
-                f"🏳️ {country}" if country else "",
-                f"🕒 {when}" if when else "",
-                f"ℹ️ {status}" if status else "",
-                f"📊 Счёт: {score}" if score else "",
-                "",
-                "Кнопки: PRE / LIVE / LIVE PRO доступны в Telegram интерфейсе.",
-                f"(sport={used_sport})",
-            ]
-            return "\n".join([x for x in out if x])
+            # приводим score к адекватному виду (иногда там dict-строка)
+            try:
+                st, sc = _format_status_and_score(status, score)
+            except Exception:
+                st, sc = status, score
+
+            lines = [f"🏟 {title}"]
+            if league:
+                lines.append(f"🏆 {league}")
+            if country and country != "Other":
+                lines.append(f"🏳️ {country}")
+            if start_time:
+                lines.append(f"🕒 {start_time}")
+            if st or sc:
+                lines.append(f"{st} {sc}".strip())
+
+            lines.append("")
+            lines.append("Кнопки: PRE / LIVE / LIVE PRO / Обновить LIVE")
+
+            return "\n".join(lines).strip()
 
         except Exception as e:
-            return f"⚠️ Ошибка матча: {type(e).__name__}: {str(e)[:200]}"
+            logger.exception("match details failed")
+            return f"⚠️ Не удалось открыть матч {match_id}: {type(e).__name__}: {str(e)[:200]}"
 
-    # 4) профиль / стратегия (если есть соответствующие функции)
+    # 4) профиль
     if "профиль" in norm:
-        fn = globals().get("_format_profile_text")
-        if callable(fn):
-            try:
-                # профиль в твоём файле обычно тянется из БД через session/stats,
-                # поэтому здесь просто fallback текст
-                return "📊 Профиль: команда в разработке."
-            except Exception as e:
-                return f"⚠️ Профиль ошибка: {type(e).__name__}: {str(e)[:200]}"
-        return "📊 Профиль: команда в разработке."
+        try:
+            # если у тебя есть bank/stats — это место можно расширить,
+            # но сейчас хотя бы не падаем
+            return "📊 Профиль временно в разработке.\nНапиши: матчи сегодня"
+        except Exception as e:
+            logger.exception("profile failed")
+            return f"⚠️ Профиль недоступен: {type(e).__name__}: {str(e)[:160]}"
 
+    # 5) стратегия
     if "стратег" in norm:
-        fn = globals().get("_format_expert_strategy_for_today")
-        if callable(fn):
-            try:
-                return fn()
-            except Exception as e:
-                return f"⚠️ Стратегия ошибка: {type(e).__name__}: {str(e)[:200]}"
-        return "👤 Стратегия: пока недоступно."
+        try:
+            return _format_expert_strategy_for_today()
+        except Exception as e:
+            logger.exception("strategy failed")
+            return f"⚠️ Стратегия недоступна: {type(e).__name__}: {str(e)[:160]}"
 
-    # 5) default
-    return "Напиши: «матчи сегодня», «матч <id>» или «ping»."
+    # fallback: пробуем админ-обновление стратегии, иначе help
+    try:
+        ok, msg = _try_admin_update_strategy(user_id, raw)
+        if ok:
+            return msg
+    except Exception:
+        pass
+
+    return (
+        "Не понял команду.\n\n"
+        "Доступно:\n"
+        "• ping\n"
+        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]\n"
+        "• матч <match_id>\n"
+    )
+
 
 
