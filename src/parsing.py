@@ -20,6 +20,58 @@ from .db import get_session
 from . import bets_db
 from .expert_db import ExpertStrategy
 from .llm_client import analyze_with_llm_cached
+import time
+
+# --- LLM cooldown (anti-spam on 429 / insufficient_quota) ---
+_LLM_DISABLED_UNTIL_TS = 0
+_LLM_DISABLED_REASON = ""
+
+
+def _is_quota_error(err: Exception) -> bool:
+    s = str(err)
+    return (
+        "insufficient_quota" in s
+        or "You exceeded your current quota" in s
+        or "HTTP 429" in s
+        or '"code": "insufficient_quota"' in s
+    )
+
+
+def _fallback_analysis(reason: str) -> dict:
+    # Универсальный fallback (подходит для UI и для общего ответа)
+    return {
+        "title": "📊 Обзор рынков",
+        "summary": "AI временно недоступен — показываю базовую справку.",
+        "risks": ["Недостаточно данных для детального разбора."],
+        "disclaimer": "Аналитический материал, не является рекомендацией.",
+        "debug": {"llm_reason": reason},
+    }
+
+
+async def analyze_with_llm_cached_safe(*args, **kwargs):
+    """
+    Обертка над analyze_with_llm_cached:
+    - если недавно был quota/429 -> не зовем OpenAI
+    - если получили quota/429 -> ставим блок на N минут и возвращаем fallback
+    """
+    global _LLM_DISABLED_UNTIL_TS, _LLM_DISABLED_REASON
+
+    now = int(time.time())
+    if now < _LLM_DISABLED_UNTIL_TS:
+        reason = _LLM_DISABLED_REASON or "llm_cooldown_active"
+        return _fallback_analysis(reason), {"llm_disabled": True, "reason": reason}
+
+    try:
+        return await analyze_with_llm_cached(*args, **kwargs)
+    except Exception as e:
+        if _is_quota_error(e):
+            _LLM_DISABLED_REASON = f"quota/429: {str(e)[:180]}"
+            _LLM_DISABLED_UNTIL_TS = int(time.time()) + 20 * 60  # 20 минут
+            return _fallback_analysis(_LLM_DISABLED_REASON), {"llm_disabled": True, "reason": _LLM_DISABLED_REASON}
+
+        # любые другие ошибки НЕ прячем
+        raise
+
 from .pro_db import is_pro
 
 logger = logging.getLogger(__name__)
@@ -1195,7 +1247,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             # LIVE: стабильный cache_key без снапшот-хеша => меньше LLM вызовов / меньше TPM
             cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
 
-            analysis, meta = await analyze_with_llm_cached(
+            analysis, meta = await analyze_with_llm_cached_safe(
+    ...
+)
                 prompt,
                 cache_key=cache_key,
                 schema="ui_live",
@@ -1229,7 +1283,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         schema = "ui_live" if mode == "live" else "ui_pre"
         ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
 
-    analysis, meta = await analyze_with_llm_cached(
+    analysis, meta = await analyze_with_llm_cached_safe(
+    ...
+)
         prompt,
         cache_key=cache_key,
         schema=schema,
