@@ -403,15 +403,19 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
 
 
 def kb_buy_pro() -> InlineKeyboardMarkup:
-    try:
-        from .payments import kb_buy_pro as kb
-        return kb()
-    except Exception:
-        logger.exception("payments.kb_buy_pro failed; fallback keyboard used")
-        rows = [
-            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
-        ]
-        return InlineKeyboardMarkup(rows)
+    """
+    Пока payments.py не готов — показываем простую кнопку.
+    Можно задать PRO_BUY_URL в ENV, чтобы вести на оплату/страницу.
+    """
+    buy_url = (os.getenv("PRO_BUY_URL") or "").strip()
+
+    if buy_url:
+        rows = [[InlineKeyboardButton("⭐ Оформить Premium", url=buy_url)]]
+    else:
+        rows = [[InlineKeyboardButton("⭐ Оформить Premium", callback_data="BUY:PRO")]]
+
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
 
 
 
