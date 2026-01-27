@@ -110,15 +110,19 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
 async def call_agent_local(user_id: int, text: str) -> str:
     """Вызываем локального агента (src/parsing.py)."""
     try:
-        from ..parsing import run_dialog_agent  # локальный импорт, чтобы избежать циклов
+        import importlib
+
+        parsing_mod = importlib.import_module("src.parsing")
+        fn = getattr(parsing_mod, "run_dialog_agent", None)
+        if fn is None:
+            return "⚠️ Агент не подключен: в src.parsing нет run_dialog_agent"
+
+        return await fn(int(user_id), text)
+
     except Exception as e:
-        logger.exception("AI agent import failed: %s", e)
-        return "⚠️ AI модуль временно недоступен. Мы уже чиним."
-    try:
-        return await run_dialog_agent(user_id, text)
-    except Exception as e:
-        logger.exception("AI agent runtime failed: %s", e)
-        return "⚠️ AI временно недоступен, попробуй позже."
+        logger.exception("call_agent_local failed")
+        return f"⚠️ Агент временно недоступен: {type(e).__name__}: {str(e)[:160]}"
+
 
 
 
