@@ -1279,7 +1279,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
             return out
 
-        # trial активирован — продолжаем как PRO (ниже)
+        # trial активирован — продолжаем как PRO
 
     # 5) Normal / PRO
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
@@ -1327,61 +1327,6 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     return out
 
-
-
-        # если триал активирован (trial_banner выставлен) — продолжаем как PRO ниже
-
-    # 4) Normal / PRO
-    prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
-
-    # schema + ttl
-    if mode == "live" and action == "pro":
-        schema = "ui_live_pro"
-        ttl_s = TTL_LIVE_PRO_S
-    else:
-        schema = "ui_live" if mode == "live" else "ui_pre"
-        ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
-
-    # cache_key:
-    # - LIVE: стабильный (без hash) => экономим запросы
-    # - PRE: с hash по снапшоту => меняется при изменениях
-    if mode == "live":
-        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}"
-    else:
-        h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
-        cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
-
-    if _llm_is_disabled():
-        return "AI временно недоступен — попробуй позже."
-
-    try:
-        analysis, meta = await analyze_with_llm_cached(
-            prompt,
-            cache_key=cache_key,
-            schema=schema,
-            ttl_s=int(ttl_s),
-            user_id=user_id,
-        )
-    except Exception as e:
-        if _is_quota_error(e):
-            _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
-            return "AI временно недоступен (лимит/квота). Попробуй позже."
-        raise
-
-    _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
-
-    out = _render_ui_json(analysis, mode=mode, action=action)
-
-    # если это был триал на LIVE PRO — добавим баннер сверху
-    if trial_banner and mode == "live" and action == "pro":
-        out = trial_banner + out
-
-    # LIVE: сохраняем снапшот + рендер
-    if mode == "live":
-        _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
-        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
-
-    return out
 
 
 
