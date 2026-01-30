@@ -1192,8 +1192,8 @@ def _pro_teaser_footer() -> str:
 async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> str:
     user_id = int(user_id or 0)
     match_id = str(match_id or "").strip()
-    mode = (mode or "").strip().lower()
-    action = (action or "").strip().lower()
+    mode = (mode or "pre").lower()
+    action = (action or "overview").lower()
 
     # нормализация
     if mode not in {"pre", "live"}:
@@ -1205,92 +1205,45 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     # 1) контекст матча
     match_meta = await _get_match_context(user_id, match_id)
-    sport_slug = str(match_meta.get("sport_slug") or "ice-hockey").strip().lower()
+    sport_slug = str(match_meta.get("sport") or "ice-hockey").strip().lower()
 
-    # 2) снапшоты (для LIVE кеша)
+    # 2) снапшоты
     prev_snap = _LIVE_SNAPSHOT_BY_MATCH.get(match_id) if mode == "live" else None
     cur_snap = _oddsbase_snapshot(match_meta, mode=mode)
 
-    # 3) LIVE: если данные не поменялись — возвращаем кеш/стабильный текст
-    if mode == "live":
-        if prev_snap is not None and cur_snap == prev_snap:
-            cached = _LIVE_RENDER_BY_MATCH.get((match_id, action))
-            if cached:
-                return cached
+    # 3) LIVE: если данных нет — вернуть кеш
+    if mode == "live" and prev_snap is not None and cur_snap == prev_snap:
+        cached = _LIVE_RENDER_BY_MATCH.get((match_id, action))
+        if cached:
+            return cached
 
-            no_change = _live_no_change_text(match_meta, action)
-            _LAST_LLM_META_BY_USER[user_id] = {
-                "provider": "local",
-                "attempts": 0,
-                "elapsed_ms": 0,
-                "used_fallback": True,
-                "last_error": "no_new_data",
-                "cache": "no_change",
-            }
-            _LIVE_RENDER_BY_MATCH[(match_id, action)] = no_change
-            return no_change
+        out = _live_no_change_text(match_meta, action)
+        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
+        return out
 
-    # 4) LIVE PRO gating + TRIAL (ВАЖНО: Trial даём 1 раз)
+    # 4) LIVE PRO + TRIAL
     trial_banner = ""
     if mode == "live" and action == "pro" and not is_pro(user_id):
-        trial_used = False
         with db_session() as session:
-            trial_used = _trial_live_used(session, user_id)
-
-            if not trial_used:
-                ok = _consume_trial_live(session, user_id)
-                if ok:
+            if not _trial_live_used(session, user_id):
+                if _consume_trial_live(session, user_id):
                     trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
                 else:
-                    trial_used = True
+                    action = "overview"
+            else:
+                action = "overview"
 
-        # если trial уже использован — показываем teaser (overview + футер)
-        if trial_used:
-            teaser_action = "overview"
-            prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
-
-            # LIVE: стабильный cache_key (без снапшот-хеша)
-            cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
-            schema = "ui_live"
-            ttl_s = TTL_LIVE_S
-
-            if _llm_is_disabled():
-                return "AI временно недоступен — попробуй позже."
-
-            try:
-                analysis, meta = await analyze_with_llm_cached(
-                    prompt,
-                    cache_key=cache_key,
-                    schema=schema,
-                    ttl_s=int(ttl_s),
-                    user_id=user_id,
-                )
-            except Exception as e:
-                if _is_quota_error(e):
-                    _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
-                    return "AI временно недоступен (лимит/квота). Попробуй позже."
-                raise
-
-            _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
-            base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
-
-            out = _truncate_telegram(base_txt) + _pro_teaser_footer()
-            _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
-            _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
-            return out
-
-        # trial активирован — продолжаем как PRO
-
-    # 5) Normal / PRO
+    # 5) prompt
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
 
-    # LIVE: стабильный cache_key (без хеша); PRE: hash по снапшоту
+    # 6) cache key
     if mode == "live":
         cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}"
     else:
         h = _hash_cache_key(match_id, sport_slug, mode, action, cur_snap)
         cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{action}:{h}"
 
+    # 7) schema + ttl
     if mode == "live" and action == "pro":
         schema = "ui_live_pro"
         ttl_s = TTL_LIVE_PRO_S
@@ -1298,9 +1251,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         schema = "ui_live" if mode == "live" else "ui_pre"
         ttl_s = TTL_LIVE_S if mode == "live" else TTL_PRE_S
 
+    # 8) LLM disabled
     if _llm_is_disabled():
         return "AI временно недоступен — попробуй позже."
 
+    # 9) call LLM
     try:
         analysis, meta = await analyze_with_llm_cached(
             prompt,
@@ -1311,11 +1266,12 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         )
     except Exception as e:
         if _is_quota_error(e):
-            _llm_trip_disable(20)  # 20 минут не стучимся в OpenAI
+            _llm_trip_disable(20)
             return "AI временно недоступен (лимит/квота). Попробуй позже."
         raise
 
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
+
     out = _render_ui_json(analysis, mode=mode, action=action)
 
     if trial_banner and mode == "live" and action == "pro":
@@ -1326,8 +1282,6 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
 
     return out
-
-
 
 
         # trial активирован — продолжаем как PRO (ниже)
