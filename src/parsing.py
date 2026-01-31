@@ -1307,6 +1307,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     # сразу fallback без запроса к OpenAI
     return "AI временно недоступен — попробуй позже."
 
+
 try:
     analysis, meta = await analyze_with_llm_cached(
         prompt,
