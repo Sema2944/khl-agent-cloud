@@ -96,19 +96,33 @@ def _is_quota_or_429(e: Exception) -> bool:
 def _fallback_ui(schema: str, reason: str) -> Dict[str, Any]:
     # Универсальный fallback под UI-схемы
     if schema in {"ui_live", "ui_live_pro"}:
-        return _normalize_ui_obj(schema, {
-            "title": "🟢 LIVE-обзор",
-            "disclaimer": "Аналитический материал, не является рекомендацией.",
-            "context": [],
-            "markets": [],
-            "risks": ["AI временно недоступен — попробуй позже."],
-            "debug": {"llm_reason": reason},
-        })
+        return _normalize_ui_obj(
+            schema,
+            {
+                "title": "🟢 LIVE-обзор",
+                "summary": "AI временно недоступен — показываю базовую справку.",
+                "disclaimer": "Аналитический материал, не является рекомендацией.",
+                "context": [],
+                "markets": [],
+                "risks": ["AI временно недоступен — попробуй позже."],
+                "debug": {"llm_reason": reason},
+            },
+        )
 
     # ui_pre / legacy
-    return _normalize_ui_obj("ui_pre", {
-        "title": "📊 Обзор рынков",
-        "summary": "AI временно недоступен — показываю базовую
+    return _normalize_ui_obj(
+        "ui_pre",
+        {
+            "title": "📊 Обзор рынков",
+            "summary": "AI временно недоступен — показываю базовую справку.",
+            "context": [],
+            "insights": [],
+            "risks": ["AI временно недоступен — попробуй позже."],
+            "disclaimer": "Аналитический материал, не является рекомендацией.",
+            "debug": {"llm_reason": reason},
+        },
+    )
+
 
 
 @dataclass
