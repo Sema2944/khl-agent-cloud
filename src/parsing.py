@@ -474,6 +474,43 @@ def _parse_nav_league(text_raw: str) -> Optional[Tuple[str, str, int]]:
 async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     from .integrations.sport_api import SportAPIClient, SportAPIError
 
+    def _infer_country_from_league(league: str) -> str:
+        """
+        Мини-эвристика: угадываем страну по названию лиги.
+        Расширяй маппинг под себя.
+        """
+        lg = (league or "").strip().lower()
+        if not lg:
+            return ""
+
+        # Хоккейные + общие частые
+        MAP = {
+            "khl": "Russia",
+            "вхл": "Russia",
+            "мхл": "Russia",
+            "nhl": "USA",
+            "ahl": "USA",
+            "echl": "USA",
+            "shl": "Sweden",
+            "liiga": "Finland",
+            "del": "Germany",
+            "national league": "Switzerland",
+            "swiss league": "Switzerland",
+            "extraliga": "Czech Republic",
+            "tipsport extraliga": "Czech Republic",
+            "slovak extraliga": "Slovakia",
+            "icehl": "Austria",
+            "iihf": "International",
+            "champions hockey league": "International",
+            "world championship": "International",
+            "chl": "International",
+        }
+
+        for k, v in MAP.items():
+            if k in lg:
+                return v
+        return ""
+
     sport_slug = (sport_slug or "").strip().lower()
     if sport_slug not in API_SPORTS_LABELS:
         return (
@@ -516,6 +553,26 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
 
     _MATCH_CACHE_BY_USER[user_id] = {}
     for m in matches:
+        # 1) пробуем вытащить страну из разных полей
+        country = (
+            getattr(m, "country", "")
+            or getattr(m, "league_country", "")
+            or getattr(m, "leagueCountry", "")
+            or getattr(m, "country_name", "")
+            or getattr(m, "countryName", "")
+            or getattr(m, "league_country_name", "")
+            or ""
+        )
+        country = str(country).strip()
+
+        # 2) если всё ещё пусто — угадываем по лиге
+        if not country:
+            country = _infer_country_from_league(getattr(m, "league", "") or "")
+
+        # 3) финальный гарант (чтобы не было Other вообще)
+        if not country:
+            country = "International"  # можешь заменить на "Международные"
+
         _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
             "sport": getattr(m, "sport_slug", sport_slug),
             "title": getattr(m, "title", f"Матч {m.id}"),
@@ -524,10 +581,11 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "start_time": getattr(m, "start_time", ""),
             "score": getattr(m, "score", "") or "",
             "odds_base": getattr(m, "odds_base", None),
-            "country": getattr(m, "country", "") or "",
+            "country": country,
         }
 
     return _render_countries(user_id, title, today.isoformat())
+
 
 
 def _extract_date_from_start_time(start_time: str) -> Optional[date]:
