@@ -476,21 +476,31 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
 
     def _infer_country_from_league(league: str) -> str:
         """
-        Мини-эвристика: угадываем страну по названию лиги.
-        Расширяй маппинг под себя.
+        Эвристика: угадываем страну по названию лиги.
+        Можно расширять безболезненно.
         """
         lg = (league or "").strip().lower()
         if not lg:
             return ""
 
-        # Хоккейные + общие частые
         MAP = {
+            # Russia
             "khl": "Russia",
             "вхл": "Russia",
+            "vhl": "Russia",
             "мхл": "Russia",
+            "mhl": "Russia",
+
+            # USA / Canada
             "nhl": "USA",
             "ahl": "USA",
             "echl": "USA",
+            "whl": "Canada",
+            "ohl": "Canada",
+            "qmjhl": "Canada",
+            "university league": "USA",
+
+            # Europe
             "shl": "Sweden",
             "liiga": "Finland",
             "del": "Germany",
@@ -500,6 +510,8 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "tipsport extraliga": "Czech Republic",
             "slovak extraliga": "Slovakia",
             "icehl": "Austria",
+
+            # International
             "iihf": "International",
             "champions hockey league": "International",
             "world championship": "International",
@@ -551,32 +563,32 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             )
         )
 
+    # ---- кеш матчей пользователя ----
     _MATCH_CACHE_BY_USER[user_id] = {}
+
     for m in matches:
-        # 1) пробуем вытащить страну из разных полей
+        league = getattr(m, "league", "") or ""
+
+        # 1) пробуем достать страну напрямую
         country = (
-            getattr(m, "country", "")
-            or getattr(m, "league_country", "")
-            or getattr(m, "leagueCountry", "")
-            or getattr(m, "country_name", "")
-            or getattr(m, "countryName", "")
-            or getattr(m, "league_country_name", "")
-            or ""
-        )
-        country = str(country).strip()
+            getattr(m, "country", "") or
+            getattr(m, "league_country", "") or
+            getattr(m, "leagueCountry", "") or
+            getattr(m, "country_name", "")
+        ).strip()
 
-        # 2) если всё ещё пусто — угадываем по лиге
+        # 2) если не получилось — угадываем по лиге
         if not country:
-            country = _infer_country_from_league(getattr(m, "league", "") or "")
+            country = _infer_country_from_league(league)
 
-        # 3) финальный гарант (чтобы не было Other вообще)
+        # 3) если всё ещё пусто — считаем International
         if not country:
-            country = "International"  # можешь заменить на "Международные"
+            country = "International"
 
         _MATCH_CACHE_BY_USER[user_id][str(m.id)] = {
             "sport": getattr(m, "sport_slug", sport_slug),
             "title": getattr(m, "title", f"Матч {m.id}"),
-            "league": getattr(m, "league", ""),
+            "league": league,
             "status": getattr(m, "status", ""),
             "start_time": getattr(m, "start_time", ""),
             "score": getattr(m, "score", "") or "",
@@ -585,6 +597,7 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
         }
 
     return _render_countries(user_id, title, today.isoformat())
+
 
 
 
