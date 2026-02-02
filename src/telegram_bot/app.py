@@ -220,6 +220,34 @@ def _msk_today_iso() -> str:
 
 def _league_ru(league: str) -> str:
     return (league or "").strip() or "Other"
+    
+def _country_ru(country: str) -> str:
+    """
+    Локализация стран для UI (кнопки).
+    Все пустые/Other/Unknown -> "🌍 Международные"
+    """
+    c = (country or "").strip()
+
+    if not c or c.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
+        return "🌍 Международные"
+
+    MAP = {
+        "Russia": "🇷🇺 Россия",
+        "Russian Federation": "🇷🇺 Россия",
+        "USA": "🇺🇸 США",
+        "United States": "🇺🇸 США",
+        "Czech": "🇨🇿 Чехия",
+        "Czech Republic": "🇨🇿 Чехия",
+        "Finland": "🇫🇮 Финляндия",
+        "Sweden": "🇸🇪 Швеция",
+        "Germany": "🇩🇪 Германия",
+        "Switzerland": "🇨🇭 Швейцария",
+        "Slovakia": "🇸🇰 Словакия",
+        "Austria": "🇦🇹 Австрия",
+        "International": "🌍 Международные",
+    }
+
+    return MAP.get(c, c)
 
 
 def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
@@ -236,9 +264,24 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         if not mid:
             continue
 
-        country = (getattr(m, "country", "") or "").strip() or "Other"
-        league_raw = (getattr(m, "league", "") or "").strip() or "Other"
-        league = _league_ru(league_raw)
+        # ---- страна: "жадное" извлечение + НИКАКОГО Other ----
+country_raw = (
+    getattr(m, "country", "") or
+    getattr(m, "league_country", "") or
+    getattr(m, "leagueCountry", "") or
+    getattr(m, "country_name", "") or
+    ""
+).strip()
+
+    # если страна не пришла — считаем международным блоком
+       if not country_raw or country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
+    country_raw = "International"
+
+    country = country_raw
+
+    league_raw = (getattr(m, "league", "") or "").strip() or "Other"
+    league = _league_ru(league_raw)
+
 
         ckey = _short_key(country)
         lkey = _short_key(f"{country}::{league}")
@@ -280,7 +323,7 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
 def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
     rows: List[List[InlineKeyboardButton]] = []
-    if not st:
+     if not st:
         rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
         return InlineKeyboardMarkup(rows)
 
@@ -295,8 +338,9 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
 
     buf: List[InlineKeyboardButton] = []
     for ckey, n in counts[:18]:
-        cname = st.country_by_key.get(ckey, "Other")
-        buf.append(InlineKeyboardButton(f"{cname} ({n})", callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}"))
+        cname = st.country_by_key.get(ckey, "International")
+buf.append(InlineKeyboardButton(f"{_country_ru(cname)} ({n})", callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}"))
+
         if len(buf) == 2:
             rows.append(buf)
             buf = []
