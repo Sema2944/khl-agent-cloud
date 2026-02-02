@@ -324,8 +324,19 @@ def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
 # Группировка матчей: страна -> лига -> матчи
 # -----------------------------
 def _norm_key(s: Any) -> str:
-    s = (str(s or "")).strip()
-    return s if s else "Other"
+    """
+    Нормализуем ключи группировки (страна/лига).
+    ВАЖНО: 'Other' больше не используем вообще.
+    Всё пустое/None/'other' уходит в International.
+    """
+    v = (str(s or "")).strip()
+    if not v:
+        return "International"
+    low = v.lower()
+    if low in {"other", "unknown", "none", "null", "n/a", "-"}:
+        return "International"
+    return v
+
 
 
 def _build_index_for_user(user_id: int) -> Dict[str, Any]:
