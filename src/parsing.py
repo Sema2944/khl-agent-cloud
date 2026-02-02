@@ -352,11 +352,22 @@ def _build_index_for_user(user_id: int) -> Dict[str, Any]:
 
 
 def _render_countries(user_id: int, sport_title: str, today_iso: str) -> str:
-    idx = _build_index_for_user(user_id)["countries"]
-    items: List[Tuple[str, int]] = []
+    idx = _build_index_for_user(user_id)
+
+    # ❌ убираем Other полностью
+    if "Other" in idx:
+        # пробуем перераспределить в International
+        idx.setdefault("International", {})
+        for league, ids in idx["Other"].items():
+            idx["International"].setdefault(league, []).extend(ids)
+        del idx["Other"]
+
+    items: list[tuple[str, int]] = []
     for country, leagues in idx.items():
         n = sum(len(v) for v in leagues.values())
-        items.append((country, n))
+        if n > 0:
+            items.append((country, n))
+
     items.sort(key=lambda x: x[1], reverse=True)
 
     lines = [
@@ -365,17 +376,20 @@ def _render_countries(user_id: int, sport_title: str, today_iso: str) -> str:
         "",
         "Выбери страну:",
     ]
-    for c, n in items[:10]:
+
+    for c, n in items:
         lines.append(f"• {c} ({n})")
-    if len(items) > 10:
-        rest = sum(n for _, n in items[10:])
-        lines.append(f"• Другие ({rest})")
+
+    if not items:
+        lines.append("• Матчи не найдены")
 
     lines.append("")
     lines.append("Команды навигации:")
     lines.append("• страна: <название>")
     lines.append("• лига: <страна> | <лига> | <страница?>")
+
     return _truncate_telegram("\n".join(lines))
+
 
 
 def _render_leagues(user_id: int, country: str) -> str:
