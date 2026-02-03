@@ -316,29 +316,26 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
     today_iso = _msk_today_iso()
 
     def _infer_country_from_league(league: str) -> str:
-        """
-        Эвристика: если страна пустая, определяем по названию лиги.
-        ВАЖНО: MHL/VHL/KHL -> Russia
-        """
         lg = (league or "").strip().lower()
         if not lg:
             return ""
 
-        # Россия (обязательно!)
+        # RU хоккей
         if lg in {"mhl", "vhl", "khl", "мхл", "вхл", "кхл"}:
             return "Russia"
         if "mhl" in lg or "vhl" in lg or "khl" in lg:
             return "Russia"
 
-        # США
-        if lg in {"nhl", "ahl", "echl"} or "nhl" in lg or "ahl" in lg or "echl" in lg:
+        # USA хоккей
+        if lg in {"nhl", "ahl", "echl"}:
+            return "USA"
+        if "nhl" in lg or "ahl" in lg or "echl" in lg:
             return "USA"
 
-        # Чехия
-        if "extraliga" in lg or "tipsport" in lg:
+        # Czech
+        if "tipsport" in lg or "extraliga" in lg:
             return "Czech Republic"
 
-        # Остальное — не угадываем
         return ""
 
     country_by_key: Dict[str, str] = {}
@@ -351,10 +348,10 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         if not mid:
             continue
 
-        league_raw = (getattr(m, "league", "") or "").strip() or "Other"
+        league_raw = (getattr(m, "league", "") or "").strip()
         league = _league_ru(league_raw)
 
-        # ---- страна: "жадное" извлечение + эвристика по лиге ----
+        # страна: жадно берём из разных полей
         country_raw = (
             getattr(m, "country", "") or
             getattr(m, "league_country", "") or
@@ -363,11 +360,12 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
             ""
         ).strip()
 
-        # если страна пустая / мусорная — пробуем угадать по лиге
-        if not country_raw or country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
+        bad = (not country_raw) or (country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"})
+
+        if bad:
             country_raw = _infer_country_from_league(league_raw) or "International"
 
-        # если вдруг ранее проставили International, но лига явно российская — перезапишем
+        # защита: если API дал International, но лига явно RU/USA — исправим
         if country_raw == "International":
             inferred = _infer_country_from_league(league_raw)
             if inferred:
@@ -395,6 +393,19 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         def _sk(mid_: str) -> str:
             return (match_meta.get(mid_) or {}).get("start_time") or ""
         ids.sort(key=_sk)
+
+    return _NavState(
+        sport=sport_slug,
+        today_iso=today_iso,
+        country_by_key=country_by_key,
+        league_by_key=league_by_key,
+        match_ids_by_league=match_ids_by_league,
+        match_meta=match_meta,
+        last_screen="COUNTRIES",
+        last_ckey="",
+        last_lkey="",
+        last_page=1,
+    )
 
     return _NavState(
         sport=sport_slug,
