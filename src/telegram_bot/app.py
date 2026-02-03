@@ -238,14 +238,13 @@ def _infer_country_from_league(league: str) -> str:
         "vhl": "Russia",
         "мхл": "Russia",
         "mhl": "Russia",
-        "vysshaya league": "Russia",
 
         # 🇺🇸 США
         "nhl": "USA",
         "ahl": "USA",
         "echl": "USA",
 
-        # 🇪🇺 Европа
+        # Европа
         "shl": "Sweden",
         "liiga": "Finland",
         "del": "Germany",
@@ -273,71 +272,35 @@ def _infer_country_from_league(league: str) -> str:
 def _country_title(country: str) -> str:
     """
     Отображение страны в UI (кнопки).
-    🇷🇺 Россия — С ФЛАГОМ
-    🌍 International — международные
-    Остальные — с флагами
+    Россия — с флагом.
+    International/пусто/Other — 🌍 Международные.
+    Остальные — с флагами.
     """
     c = (country or "").strip()
-
-    if not c or c.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
+    if (not c) or (c.lower() in {"other", "unknown", "none", "null", "n/a", "-"}):
         return "🌍 Международные"
 
     MAP = {
-        # 🇷🇺 Россия (флаг ОСТАВЛЯЕМ)
         "Russia": "🇷🇺 Россия",
         "Russian Federation": "🇷🇺 Россия",
-
-        # 🇺🇸 США
         "USA": "🇺🇸 США",
         "United States": "🇺🇸 США",
-
-        # 🇨🇿 Чехия
-        "Czech": "🇨🇿 Чехия",
         "Czech Republic": "🇨🇿 Чехия",
-
-        # 🇪🇺 Европа
+        "Czech": "🇨🇿 Чехия",
         "Finland": "🇫🇮 Финляндия",
         "Sweden": "🇸🇪 Швеция",
         "Germany": "🇩🇪 Германия",
         "Switzerland": "🇨🇭 Швейцария",
         "Slovakia": "🇸🇰 Словакия",
         "Austria": "🇦🇹 Австрия",
-
-        # 🌍 Международные
         "International": "🌍 Международные",
     }
-
     return MAP.get(c, c)
-
-
 
 
 def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
     _ = user_id
     today_iso = _msk_today_iso()
-
-    def _infer_country_from_league(league: str) -> str:
-        lg = (league or "").strip().lower()
-        if not lg:
-            return ""
-
-        # RU хоккей
-        if lg in {"mhl", "vhl", "khl", "мхл", "вхл", "кхл"}:
-            return "Russia"
-        if "mhl" in lg or "vhl" in lg or "khl" in lg:
-            return "Russia"
-
-        # USA хоккей
-        if lg in {"nhl", "ahl", "echl"}:
-            return "USA"
-        if "nhl" in lg or "ahl" in lg or "echl" in lg:
-            return "USA"
-
-        # Czech
-        if "tipsport" in lg or "extraliga" in lg:
-            return "Czech Republic"
-
-        return ""
 
     country_by_key: Dict[str, str] = {}
     league_by_key: Dict[Tuple[str, str], str] = {}
@@ -352,7 +315,7 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         league_raw = (getattr(m, "league", "") or "").strip()
         league = _league_ru(league_raw)
 
-        # страна: жадно берём из разных полей
+        # "жадно" достаем страну из разных полей
         country_raw = (
             getattr(m, "country", "") or
             getattr(m, "league_country", "") or
@@ -362,7 +325,6 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         ).strip()
 
         bad = (not country_raw) or (country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"})
-
         if bad:
             country_raw = _infer_country_from_league(league_raw) or "International"
 
@@ -390,7 +352,7 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
             "start_time": str(getattr(m, "start_time", "") or ""),
         }
 
-    for key, ids in match_ids_by_league.items():
+    for _key, ids in match_ids_by_league.items():
         def _sk(mid_: str) -> str:
             return (match_meta.get(mid_) or {}).get("start_time") or ""
         ids.sort(key=_sk)
@@ -407,6 +369,7 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         last_lkey="",
         last_page=1,
     )
+
 
     return _NavState(
         sport=sport_slug,
