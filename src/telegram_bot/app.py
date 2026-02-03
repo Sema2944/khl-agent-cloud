@@ -225,14 +225,14 @@ def _league_ru(league: str) -> str:
 def _infer_country_from_league(league: str) -> str:
     """
     Если API не прислал страну — угадываем по лиге.
-    ВАЖНО: MHL/VHL должны уходить в Россию.
+    ВАЖНО: MHL / VHL всегда относятся к России.
     """
     lg = (league or "").strip().lower()
     if not lg:
         return ""
 
     MAP = {
-        # Россия
+        # 🇷🇺 Россия
         "khl": "Russia",
         "вхл": "Russia",
         "vhl": "Russia",
@@ -240,12 +240,12 @@ def _infer_country_from_league(league: str) -> str:
         "mhl": "Russia",
         "vysshaya league": "Russia",
 
-        # США
+        # 🇺🇸 США
         "nhl": "USA",
         "ahl": "USA",
         "echl": "USA",
 
-        # Европа
+        # 🇪🇺 Европа
         "shl": "Sweden",
         "liiga": "Finland",
         "del": "Germany",
@@ -256,7 +256,7 @@ def _infer_country_from_league(league: str) -> str:
         "slovak": "Slovakia",
         "icehl": "Austria",
 
-        # международные
+        # 🌍 Международные
         "champions hockey league": "International",
         "chl": "International",
         "world championship": "International",
@@ -274,7 +274,7 @@ def _country_title(country: str) -> str:
     """
     Отображение страны в UI (кнопки).
     🇷🇺 Россия — С ФЛАГОМ
-    International — 🌍
+    🌍 International — международные
     Остальные — с флагами
     """
     c = (country or "").strip()
@@ -283,7 +283,7 @@ def _country_title(country: str) -> str:
         return "🌍 Международные"
 
     MAP = {
-        # 🇷🇺 Россия — флаг ОСТАВЛЯЕМ
+        # 🇷🇺 Россия (флаг ОСТАВЛЯЕМ)
         "Russia": "🇷🇺 Россия",
         "Russian Federation": "🇷🇺 Россия",
 
@@ -308,6 +308,7 @@ def _country_title(country: str) -> str:
     }
 
     return MAP.get(c, c)
+
 
 
 
