@@ -272,9 +272,10 @@ def _infer_country_from_league(league: str) -> str:
 
 def _country_title(country: str) -> str:
     """
-    Отображение страны на кнопке.
-    Россия — БЕЗ флага (просто "Россия").
-    Остальные — с флагами.
+    Отображение страны в UI (кнопки).
+    🇷🇺 Россия — С ФЛАГОМ
+    International — 🌍
+    Остальные — с флагами
     """
     c = (country or "").strip()
 
@@ -282,15 +283,19 @@ def _country_title(country: str) -> str:
         return "🌍 Международные"
 
     MAP = {
-        "Russia": "Россия",
-        "Russian Federation": "Россия",
+        # 🇷🇺 Россия — флаг ОСТАВЛЯЕМ
+        "Russia": "🇷🇺 Россия",
+        "Russian Federation": "🇷🇺 Россия",
 
+        # 🇺🇸 США
         "USA": "🇺🇸 США",
         "United States": "🇺🇸 США",
 
+        # 🇨🇿 Чехия
         "Czech": "🇨🇿 Чехия",
         "Czech Republic": "🇨🇿 Чехия",
 
+        # 🇪🇺 Европа
         "Finland": "🇫🇮 Финляндия",
         "Sweden": "🇸🇪 Швеция",
         "Germany": "🇩🇪 Германия",
@@ -298,10 +303,12 @@ def _country_title(country: str) -> str:
         "Slovakia": "🇸🇰 Словакия",
         "Austria": "🇦🇹 Австрия",
 
+        # 🌍 Международные
         "International": "🌍 Международные",
     }
 
     return MAP.get(c, c)
+
 
 
 def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavState:
