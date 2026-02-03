@@ -222,10 +222,59 @@ def _league_ru(league: str) -> str:
     return (league or "").strip() or "Other"
 
 
-def _country_ru(country: str) -> str:
+def _infer_country_from_league(league: str) -> str:
     """
-    Локализация стран для UI (кнопки).
-    Все пустые/Other/Unknown -> 🌍 Международные
+    Если API не прислал страну — угадываем по лиге.
+    ВАЖНО: MHL/VHL должны уходить в Россию.
+    """
+    lg = (league or "").strip().lower()
+    if not lg:
+        return ""
+
+    MAP = {
+        # Россия
+        "khl": "Russia",
+        "вхл": "Russia",
+        "vhl": "Russia",
+        "мхл": "Russia",
+        "mhl": "Russia",
+        "vysshaya league": "Russia",
+
+        # США
+        "nhl": "USA",
+        "ahl": "USA",
+        "echl": "USA",
+
+        # Европа
+        "shl": "Sweden",
+        "liiga": "Finland",
+        "del": "Germany",
+        "national league": "Switzerland",
+        "swiss league": "Switzerland",
+        "extraliga": "Czech Republic",
+        "tipsport": "Czech Republic",
+        "slovak": "Slovakia",
+        "icehl": "Austria",
+
+        # международные
+        "champions hockey league": "International",
+        "chl": "International",
+        "world championship": "International",
+        "iihf": "International",
+    }
+
+    for key, country in MAP.items():
+        if key in lg:
+            return country
+
+    return ""
+
+
+def _country_title(country: str) -> str:
+    """
+    Отображение страны на кнопке.
+    Россия — БЕЗ флага (просто "Россия").
+    Остальные — с флагами.
     """
     c = (country or "").strip()
 
@@ -233,20 +282,25 @@ def _country_ru(country: str) -> str:
         return "🌍 Международные"
 
     MAP = {
-        "Russia": "🇷🇺 Россия",
-        "Russian Federation": "🇷🇺 Россия",
+        "Russia": "Россия",
+        "Russian Federation": "Россия",
+
         "USA": "🇺🇸 США",
         "United States": "🇺🇸 США",
+
         "Czech": "🇨🇿 Чехия",
         "Czech Republic": "🇨🇿 Чехия",
+
         "Finland": "🇫🇮 Финляндия",
         "Sweden": "🇸🇪 Швеция",
         "Germany": "🇩🇪 Германия",
         "Switzerland": "🇨🇭 Швейцария",
         "Slovakia": "🇸🇰 Словакия",
         "Austria": "🇦🇹 Австрия",
+
         "International": "🌍 Международные",
     }
+
     return MAP.get(c, c)
 
 
@@ -264,7 +318,10 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
         if not mid:
             continue
 
-        # ---- страна: "жадное" извлечение + НИКАКОГО Other ----
+        league_raw = (getattr(m, "league", "") or "").strip()
+        league = _league_ru(league_raw)
+
+        # "жадно" берём страну из разных полей
         country_raw = (
             getattr(m, "country", "") or
             getattr(m, "league_country", "") or
@@ -273,14 +330,16 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
             ""
         ).strip()
 
-        # если страна не пришла — считаем международным блоком
-        if not country_raw or country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
+        # если страна не пришла — пытаемся угадать по лиге (MHL/VHL -> Russia)
+        if not country_raw:
+            inferred = _infer_country_from_league(league_raw)
+            country_raw = inferred or "International"
+
+        # если пришло "Other/Unknown" — тоже в International
+        if country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"}:
             country_raw = "International"
 
         country = country_raw
-
-        league_raw = (getattr(m, "league", "") or "").strip() or "Other"
-        league = _league_ru(league_raw)
 
         ckey = _short_key(country)
         lkey = _short_key(f"{country}::{league}")
@@ -337,14 +396,9 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
 
     buf: List[InlineKeyboardButton] = []
     for ckey, n in counts[:18]:
-        cname = st.country_by_key.get(ckey, "International")
-        buf.append(
-            InlineKeyboardButton(
-                f"{_country_ru(cname)} ({n})",
-                callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}",
-            )
-        )
-
+        cname_raw = st.country_by_key.get(ckey, "International")
+        cname = _country_title(cname_raw)
+        buf.append(InlineKeyboardButton(f"{cname} ({n})", callback_data=f"NAV:COUNTRY:{sport_slug}:{ckey}"))
         if len(buf) == 2:
             rows.append(buf)
             buf = []
@@ -354,6 +408,7 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")])
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
+
 
 
 def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarkup:
