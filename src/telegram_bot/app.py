@@ -124,8 +124,6 @@ async def call_agent_local(user_id: int, text: str) -> str:
         return f"⚠️ Агент временно недоступен: {type(e).__name__}: {str(e)[:160]}"
 
 
-
-
 def _text_buy_pro(user_id: int) -> str:
     return (
         "⭐ Premium\n\n"
@@ -219,6 +217,7 @@ def _msk_today_iso() -> str:
 
 
 def _league_ru(league: str) -> str:
+    # Лигу "Other" можно оставить как запасной вариант, но UI "Other" по странам мы не используем
     return (league or "").strip() or "Other"
 
 
@@ -271,7 +270,7 @@ def _infer_country_from_league(league: str) -> str:
 
 def _country_title(country: str) -> str:
     """
-    Отображение страны в UI (кнопки).
+    Отображение страны в UI (кнопки/заголовки).
     Россия — с флагом.
     International/пусто/Other — 🌍 Международные.
     Остальные — с флагами.
@@ -317,18 +316,18 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
 
         # "жадно" достаем страну из разных полей
         country_raw = (
-            getattr(m, "country", "") or
-            getattr(m, "league_country", "") or
-            getattr(m, "leagueCountry", "") or
-            getattr(m, "country_name", "") or
-            ""
+            getattr(m, "country", "")
+            or getattr(m, "league_country", "")
+            or getattr(m, "leagueCountry", "")
+            or getattr(m, "country_name", "")
+            or ""
         ).strip()
 
         bad = (not country_raw) or (country_raw.lower() in {"other", "unknown", "none", "null", "n/a", "-"})
         if bad:
             country_raw = _infer_country_from_league(league_raw) or "International"
 
-        # защита: если API дал International, но лига явно RU/USA — исправим
+        # защита: если API дал International, но лига явно RU/USA — исправим (MHL/VHL сюда тоже попадают)
         if country_raw == "International":
             inferred = _infer_country_from_league(league_raw)
             if inferred:
@@ -371,30 +370,6 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
     )
 
 
-    return _NavState(
-        sport=sport_slug,
-        today_iso=t
-
-
-        def _sk(mid_: str) -> str:
-            return (match_meta.get(mid_) or {}).get("start_time") or ""
-
-        ids.sort(key=_sk)
-
-    return _NavState(
-        sport=sport_slug,
-        today_iso=today_iso,
-        country_by_key=country_by_key,
-        league_by_key=league_by_key,
-        match_ids_by_league=match_ids_by_league,
-        match_meta=match_meta,
-        last_screen="COUNTRIES",
-        last_ckey="",
-        last_lkey="",
-        last_page=1,
-    )
-
-
 def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
     rows: List[List[InlineKeyboardButton]] = []
@@ -405,7 +380,7 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     counts: List[Tuple[str, int]] = []
     for ckey in st.country_by_key.keys():
         n = 0
-        for (ck, lk), ids in st.match_ids_by_league.items():
+        for (ck, _lk), ids in st.match_ids_by_league.items():
             if ck == ckey:
                 n += len(ids)
         counts.append((ckey, n))
@@ -427,7 +402,6 @@ def _kb_countries(user_id: int, sport_slug: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-
 def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarkup:
     st = _NAV_BY_USER.get(user_id)
     rows: List[List[InlineKeyboardButton]] = []
@@ -445,14 +419,11 @@ def _kb_leagues(user_id: int, sport_slug: str, ckey: str) -> InlineKeyboardMarku
 
     for lk, n in items[:30]:
         lname = st.league_by_key.get((ckey, lk), "Другое")
-        rows.append(
-            [InlineKeyboardButton(f"{lname} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{ckey}:{lk}")]
-        )
+        rows.append([InlineKeyboardButton(f"{lname} ({n})", callback_data=f"NAV:LEAGUE:{sport_slug}:{ckey}:{lk}")])
 
     rows.append([InlineKeyboardButton("⬅️ Страны", callback_data=f"BACK:COUNTRIES:{sport_slug}")])
     rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
     return InlineKeyboardMarkup(rows)
-
 
 
 def _kb_matches(user_id: int, sport_slug: str, ckey: str, lkey: str, page: int) -> InlineKeyboardMarkup:
@@ -468,7 +439,7 @@ def _kb_matches(user_id: int, sport_slug: str, ckey: str, lkey: str, page: int) 
     page = max(1, min(page, pages))
 
     start = (page - 1) * _PER_PAGE
-    chunk = ids[start : start + _PER_PAGE]
+    chunk = ids[start: start + _PER_PAGE]
 
     for mid in chunk:
         meta = st.match_meta.get(mid) or {}
@@ -503,7 +474,8 @@ def _text_leagues(user_id: int, ckey: str) -> str:
     st = _NAV_BY_USER.get(user_id)
     if not st:
         return "Нет данных."
-    country = st.country_by_key.get(ckey, "Other")
+    country_raw = st.country_by_key.get(ckey, "International")
+    country = _country_title(country_raw)
     return f"🏳️ Страна: {country}\n\nВыбери лигу:"
 
 
@@ -511,7 +483,8 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
     st = _NAV_BY_USER.get(user_id)
     if not st:
         return "Нет данных."
-    country = st.country_by_key.get(ckey, "Other")
+    country_raw = st.country_by_key.get(ckey, "International")
+    country = _country_title(country_raw)
     league = st.league_by_key.get((ckey, lkey), "Другое")
     ids = st.match_ids_by_league.get((ckey, lkey), [])
     total = len(ids)
@@ -532,9 +505,6 @@ def kb_buy_pro() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
     ]
     return InlineKeyboardMarkup(rows)
-
-
-
 
 
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
