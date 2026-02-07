@@ -2,7 +2,7 @@ name: Daily Pro Job
 
 on:
   schedule:
-    - cron: "0 8 * * *"  # 08:00 UTC = 11:00 МСК
+    - cron: "0 8 * * *"   # 08:00 UTC = 11:00 МСК
   workflow_dispatch:
 
 jobs:
@@ -10,5 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Call Daily Pro endpoint
+        env:
+          DAILY_PRO_URL: ${{ secrets.DAILY_PRO_URL }}
         run: |
-          curl -sS -X POST "${{ secrets.DAILY_PRO_URL }}"
+          echo "Calling Daily Pro endpoint..."
+          curl -sS -X POST "$DAILY_PRO_URL"
