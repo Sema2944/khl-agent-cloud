@@ -1013,6 +1013,7 @@ async def telegram_webhook(request: Request):
     if _telegram_app is None:
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
+        
         @telegram_router.post("/jobs/daily-pro")
 async def daily_pro_job(request: Request):
     """
