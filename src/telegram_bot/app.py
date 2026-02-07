@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -37,6 +37,9 @@ WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()
 
 # feature flags
 HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
+# jobs / cron security
+DAILY_PRO_JOB_KEY = (os.getenv("DAILY_PRO_JOB_KEY") or "").strip()
+ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or "0")
 
 MSK = datetime.now().astimezone().tzinfo
 
@@ -1010,6 +1013,38 @@ async def telegram_webhook(request: Request):
     if _telegram_app is None:
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
+        @telegram_router.post("/jobs/daily-pro")
+async def daily_pro_job(request: Request):
+    """
+    Secure endpoint for GitHub Actions / cron:
+      POST /jobs/daily-pro?key=...
+    """
+    key = (request.query_params.get("key") or "").strip()
+
+    if not DAILY_PRO_JOB_KEY:
+        raise HTTPException(status_code=503, detail="DAILY_PRO_JOB_KEY missing")
+    if key != DAILY_PRO_JOB_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    if _telegram_app is None:
+        raise HTTPException(status_code=503, detail="telegram app not initialized")
+
+    if ADMIN_TELEGRAM_ID <= 0:
+        raise HTTPException(status_code=503, detail="ADMIN_TELEGRAM_ID missing")
+
+    try:
+        text = await call_agent_local(
+            ADMIN_TELEGRAM_ID,
+            "охотник дня: топ-3 события + экспресс дня + риски, кратко и структурировано. "
+            "Без прогнозов и без слов 'ставь/бери/гарантия'."
+        )
+        await _telegram_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=_truncate_tg(text))
+    except Exception:
+        logger.exception("daily_pro_job failed")
+        raise HTTPException(status_code=500, detail="job failed")
+
+    return {"ok": True}
+
 
     try:
         upd = Update.de_json(payload, _telegram_app.bot)
