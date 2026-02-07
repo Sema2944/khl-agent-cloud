@@ -1014,7 +1014,7 @@ async def telegram_webhook(request: Request):
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
         
-        @telegram_router.post("/jobs/daily-pro")
+@telegram_router.post("/jobs/daily-pro")
 async def daily_pro_job(request: Request):
     """
     Secure endpoint for GitHub Actions / cron:
@@ -1039,7 +1039,10 @@ async def daily_pro_job(request: Request):
             "охотник дня: топ-3 события + экспресс дня + риски, кратко и структурировано. "
             "Без прогнозов и без слов 'ставь/бери/гарантия'."
         )
-        await _telegram_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=_truncate_tg(text))
+        await _telegram_app.bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=_truncate_tg(text),
+        )
     except Exception:
         logger.exception("daily_pro_job failed")
         raise HTTPException(status_code=500, detail="job failed")
