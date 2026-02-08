@@ -1,134 +1,82 @@
-
-# FINAL PRODUCT VERSION — parsing.py
-# Stable, calm, user-friendly texts for PRE / LIVE / DAILY PRO
-# No technical AI wording exposed to users
+# src/parsing.py
+# Финальная стабильная версия
+# Формирование текстов PRE / LIVE / DAILY PRO
 
 from datetime import datetime
-from typing import List, Dict, Any
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def _today_str():
-    return datetime.now().strftime("%Y-%m-%d")
+from typing import List, Dict
 
 
-# ------------------------------------------------------------------
-# Core insight builder (lightweight, stable)
-# ------------------------------------------------------------------
-
-def build_match_insights(team_a: str, team_b: str) -> Dict[str, str]:
-    return {
-        "summary": (
-            "Матч без выраженного преимущества одной из сторон. "
-            "Игра может сильно зависеть от стартового отрезка."
-        ),
-        "action": (
-            "Оптимально начать с наблюдения и делать выводы по ходу встречи."
-        ),
-        "risk": (
-            "Средний — возможны резкие смены темпа."
-        ),
-        "skip": [
-            "нет подтверждений по составам",
-            "игра с первых минут уходит в хаотичный темп",
-        ],
-    }
+def _safe(val, default="—"):
+    return val if val not in (None, "", []) else default
 
 
-# ------------------------------------------------------------------
-# PRE / LIVE rendering
-# ------------------------------------------------------------------
+# =========================
+# DAILY PRO
+# =========================
+def build_daily_pro(matches: List[Dict]) -> str:
+    today = datetime.now().strftime("%Y-%m-%d")
 
-def render_pre_live(team_a: str, team_b: str, mode: str) -> str:
-    ins = build_match_insights(team_a, team_b)
-
-    title = "📊 Краткий обзор матча" if mode == "pre" else "📊 Обзор по ходу игры"
-
-    text = f"""{title}
-
-🏒 {team_a} — {team_b}
-
-Общая картина:
-{ins["summary"]}
-
-Как лучше действовать:
-{ins["action"]}
-
-Уровень риска:
-{ins["risk"]}
-
-Когда стоит пропустить:
-• {ins["skip"][0]}
-• {ins["skip"][1]}
-
-ℹ️ Обзор носит информационный характер.
-"""
-    return text
-
-
-# ------------------------------------------------------------------
-# DAILY PRO rendering
-# ------------------------------------------------------------------
-
-def render_daily_pro(matches: List[Dict[str, Any]]) -> str:
-    lines = [
-        f"🏒 DAILY PRO | ХОККЕЙ",
-        f"📅 {_today_str()}",
-        "",
-        "🔥 Матчи дня для наблюдения",
-        "",
-    ]
-
-    for i, m in enumerate(matches[:3], start=1):
-        lines.append(
-            f"{i}) {m['team_a']} — {m['team_b']}
-"
-            f"   Матч без явного фаворита. Подходит для внимательного просмотра."
-        )
-
-    lines.extend(
-        [
-            "",
-            "⛔ Когда лучше пропустить:",
-            "• нет информации по составам",
-            "• линия резко меняется без новостей",
-            "",
-            "ℹ️ Подборка носит аналитический характер и не является рекомендацией.",
-        ]
+    header = (
+        "🏒 DAILY PRO | ХОККЕЙ\n"
+        f"📅 {today}\n\n"
+        "🔥 Топ-события дня (для наблюдения)\n\n"
     )
 
-    return "\n".join(lines)
+    if not matches:
+        return (
+            header
+            + "Сегодня нет подходящих матчей для обзора.\n\n"
+            "ℹ️ Аналитика носит информационный характер."
+        )
+
+    blocks = []
+    for i, m in enumerate(matches[:3], start=1):
+        blocks.append(
+            f"{i}) {_safe(m.get('team_a'))} — {_safe(m.get('team_b'))}\n"
+            f"   🕒 {_safe(m.get('date'))}\n"
+            "   Что смотреть:\n"
+            "   • стартовые составы\n"
+            "   • темп первых минут\n"
+            "   • удаления и спецбригады\n"
+        )
+
+    footer = (
+        "\n⛔ Риски\n"
+        "• ротация составов\n"
+        "• выставочный характер матча\n\n"
+        "ℹ️ Материал является аналитическим и не является рекомендацией."
+    )
+
+    return header + "\n".join(blocks) + footer
 
 
-# ------------------------------------------------------------------
-# Main entry point
-# ------------------------------------------------------------------
-
-async def run_dialog_agent(user_id: int, text: str) -> str:
-    norm = text.lower().strip()
-
-    # DAILY PRO
-    if norm.startswith("охотник дня"):
-        dummy_matches = [
-            {"team_a": "СКА", "team_b": "Локомотив"},
-            {"team_a": "ЦСКА", "team_b": "Динамо М"},
-            {"team_a": "Ак Барс", "team_b": "Авангард"},
-        ]
-        return render_daily_pro(dummy_matches)
-
-    # PRE / LIVE
-    if "pre" in norm:
-        return render_pre_live("Команда A", "Команда B", mode="pre")
-
-    if "live" in norm:
-        return render_pre_live("Команда A", "Команда B", mode="live")
-
+# =========================
+# PRE
+# =========================
+def build_pre(match: Dict) -> str:
     return (
-        "Не понял команду.\n\n"
-        "Доступно:\n"
-        "• матчи сегодня\n"
-        "• PRE-обзор\n"
-        "• LIVE-обзор"
+        "🧠 PRE-обзор\n\n"
+        f"Матч: {_safe(match.get('team_a'))} — {_safe(match.get('team_b'))}\n"
+        f"Дата: {_safe(match.get('date'))}\n\n"
+        "Что важно до старта:\n"
+        "• составы и вратари\n"
+        "• формат турнира\n"
+        "• мотивация команд\n\n"
+        "ℹ️ Обзор носит информационный характер."
+    )
+
+
+# =========================
+# LIVE
+# =========================
+def build_live(match: Dict) -> str:
+    return (
+        "📊 LIVE-обзор\n\n"
+        f"Матч: {_safe(match.get('team_a'))} — {_safe(match.get('team_b'))}\n"
+        f"Счёт: {_safe(match.get('score'))}\n\n"
+        "На что обратить внимание:\n"
+        "• темп игры\n"
+        "• удаления\n"
+        "• давление в зоне\n\n"
+        "ℹ️ Обзор носит информационный характер."
     )
