@@ -37,6 +37,7 @@ WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()
 
 # feature flags
 HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
+
 # jobs / cron security
 DAILY_PRO_JOB_KEY = (os.getenv("DAILY_PRO_JOB_KEY") or "").strip()
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or "0")
@@ -590,8 +591,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ):
         txt = _truncate_tg(_text_buy_pro(user_id))
         await update.message.reply_text(
-            _safe_markdown(txt),
-            parse_mode=ParseMode.MARKDOWN,
+            txt,
             reply_markup=kb_buy_pro(),
         )
         return
@@ -600,8 +600,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     reply = await call_agent_local(user_id, text_raw)
     txt = _truncate_tg(reply)
     await update.message.reply_text(
-        _safe_markdown(txt),
-        parse_mode=ParseMode.MARKDOWN,
+        txt,
         reply_markup=kb_main_menu(),
     )
 
@@ -643,9 +642,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "BUY:PRO":
         txt = _truncate_tg(_text_buy_pro(user_id))
         try:
-            await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+            await q.edit_message_text(txt, reply_markup=kb_buy_pro())
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+            await q.message.reply_text(txt, reply_markup=kb_buy_pro())
         return
 
     # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
@@ -662,9 +661,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text, kb = _nav_back_to_last(user_id)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # MENU shortcuts
@@ -686,26 +685,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, "стратегия")
         txt = _truncate_tg(reply)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb_main_menu())
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb_main_menu())
         return
 
     if data == "MENU:PROFILE":
         reply = await call_agent_local(user_id, "профиль")
         txt = _truncate_tg(reply)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb_main_menu())
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb_main_menu())
         return
 
     if data == "MENU:PREMIUM":
         txt = _truncate_tg(_text_buy_pro(user_id))
         try:
-            await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+            await q.edit_message_text(txt, reply_markup=kb_buy_pro())
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+            await q.message.reply_text(txt, reply_markup=kb_buy_pro())
         return
 
     # SPORT_LOCKED
@@ -737,9 +736,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text, kb = await _render_sport_nav_root(user_id, sport_slug)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # NAV:COUNTRY
@@ -761,9 +760,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # NAV:LEAGUE
@@ -786,9 +785,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=1)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # NAV:PAGE
@@ -815,9 +814,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=page)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # BACK:COUNTRIES
@@ -838,9 +837,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = _kb_countries(user_id, sport_slug)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # BACK:LEAGUES
@@ -862,9 +861,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
         try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.edit_message_text(txt, reply_markup=kb)
         except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_text(txt, reply_markup=kb)
         return
 
     # MATCH open
@@ -888,15 +887,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         try:
             await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
+                txt,
+                reply_markup=kb_match_hub(match_id)
             )
         except Exception:
             await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
+                txt,
+                reply_markup=kb_match_hub(match_id)
             )
         return
 
@@ -919,15 +916,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         try:
             await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
+                txt,
+                reply_markup=kb_match_hub(match_id)
             )
         except Exception:
             await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
+                txt,
+                reply_markup=kb_match_hub(match_id)
             )
         return
 
@@ -1008,47 +1003,15 @@ telegram_router = APIRouter()
 
 @telegram_router.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        # not a valid json (health checks / probes)
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
 
     if _telegram_app is None:
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
-        
-@telegram_router.post("/jobs/daily-pro")
-async def daily_pro_job(request: Request):
-    """
-    Secure endpoint for GitHub Actions / cron:
-      POST /jobs/daily-pro?key=...
-    """
-    key = (request.query_params.get("key") or "").strip()
-
-    if not DAILY_PRO_JOB_KEY:
-        raise HTTPException(status_code=503, detail="DAILY_PRO_JOB_KEY missing")
-    if key != DAILY_PRO_JOB_KEY:
-        raise HTTPException(status_code=403, detail="forbidden")
-
-    if _telegram_app is None:
-        raise HTTPException(status_code=503, detail="telegram app not initialized")
-
-    if ADMIN_TELEGRAM_ID <= 0:
-        raise HTTPException(status_code=503, detail="ADMIN_TELEGRAM_ID missing")
-
-    try:
-        text = await call_agent_local(
-            ADMIN_TELEGRAM_ID,
-            "охотник дня: топ-3 события + экспресс дня + риски, кратко и структурировано. "
-            "Без прогнозов и без слов 'ставь/бери/гарантия'."
-        )
-        await _telegram_app.bot.send_message(
-            chat_id=ADMIN_TELEGRAM_ID,
-            text=_truncate_tg(text),
-        )
-    except Exception:
-        logger.exception("daily_pro_job failed")
-        raise HTTPException(status_code=500, detail="job failed")
-
-    return {"ok": True}
-
 
     try:
         upd = Update.de_json(payload, _telegram_app.bot)
@@ -1057,6 +1020,32 @@ async def daily_pro_job(request: Request):
     except Exception:
         logger.exception("Failed to process telegram update")
         return JSONResponse({"ok": False}, status_code=500)
+
+
+@telegram_router.post("/jobs/daily-pro")
+async def daily_pro_job(request: Request):
+    """Secure endpoint for GitHub Actions / cron: POST /jobs/daily-pro?key=..."""
+    key = (request.query_params.get("key") or "").strip()
+    if not DAILY_PRO_JOB_KEY:
+        raise HTTPException(status_code=503, detail="DAILY_PRO_JOB_KEY missing")
+    if key != DAILY_PRO_JOB_KEY:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if _telegram_app is None:
+        raise HTTPException(status_code=503, detail="telegram app not initialized")
+    if ADMIN_TELEGRAM_ID <= 0:
+        raise HTTPException(status_code=503, detail="ADMIN_TELEGRAM_ID missing")
+    try:
+        text = await call_agent_local(
+            ADMIN_TELEGRAM_ID,
+            "охотник дня: топ-3 события + экспресс дня + риски, кратко и структурировано. "
+            "Без прогнозов и без слов 'ставь/бери/гарантия'.",
+        )
+        await _telegram_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=_truncate_tg(text))
+        logger.info("daily_pro_job: sent to admin_id=%s", ADMIN_TELEGRAM_ID)
+    except Exception:
+        logger.exception("daily_pro_job failed")
+        raise HTTPException(status_code=500, detail="job failed")
+    return {"ok": True}
 
 
 def mount_telegram_routes(app: FastAPI) -> None:
