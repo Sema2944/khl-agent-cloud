@@ -603,11 +603,11 @@ async def build_daily_pro_hockey_text(user_id: int) -> str:
         picks.extend(pool[: max(0, 3 - len(picks))])
 
     if not picks:
-        return f"🏒 DAILY PRO | ХОККЕЙ
-📅 {today.isoformat()}
-
-Сегодня нет матчей КХЛ/НХЛ по данным API."
-
+        return (
+            f"🏒 DAILY PRO | ХОККЕЙ\n"
+            f"📅 {today.isoformat()}\n\n"
+            "Сегодня нет матчей КХЛ/НХЛ по данным API."
+        )
     def _fmt_time(st: str) -> str:
         return st or "—"
 
@@ -638,8 +638,7 @@ async def build_daily_pro_hockey_text(user_id: int) -> str:
     lines.append("")
     lines.append("ℹ️ Если хочешь — нажми «Матчи сегодня» → выбери матч → PRE/LIVE для деталей.")
 
-    return _truncate_tg("
-".join(lines))
+    return _truncate_tg("\n".join(lines))
 
 
 # ============================================================
