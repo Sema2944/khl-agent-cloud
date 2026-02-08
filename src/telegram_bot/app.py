@@ -1008,9 +1008,14 @@ async def daily_pro_job(request: Request):
     if ADMIN_TELEGRAM_ID <= 0:
         raise HTTPException(status_code=503, detail="ADMIN_TELEGRAM_ID missing")
 
-    try:
+        try:
+        logger.info("daily_pro_job: sending to chat_id=%s", ADMIN_TELEGRAM_ID)
+
         text = await build_daily_pro_hockey_text(ADMIN_TELEGRAM_ID)
+        text = f"✅ DAILY PRO TEST {datetime.now(MSK).strftime('%H:%M:%S')} МСК\n\n" + text
+
         await _telegram_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=_truncate_tg(text))
+
     except Exception:
         logger.exception("daily_pro_job failed")
         raise HTTPException(status_code=500, detail="job failed")
