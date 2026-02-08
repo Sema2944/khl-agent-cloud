@@ -23,6 +23,94 @@ from .pro_db import is_pro
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# Product MVP-logic helpers (match_type / risk / focus)
+# ============================================================
+
+def _extract_teams_from_title(title: str) -> Tuple[str, str]:
+    t = (title or "").strip()
+    if not t:
+        return "", ""
+    # Common separators: "—", "-", "vs"
+    for sep in ["—", "–", "-", " vs ", " VS ", "Vs", "VS", "v"]:
+        if sep.strip().lower() == "v":
+            continue
+    # Prefer long dash
+    for sep in ["—", "–"]:
+        if sep in t:
+            a, b = t.split(sep, 1)
+            return a.strip(), b.strip()
+    # Hyphen with spaces
+    if " - " in t:
+        a, b = t.split(" - ", 1)
+        return a.strip(), b.strip()
+    # vs
+    m = re.split(r"\s+vs\s+|\s+v\s+", t, flags=re.IGNORECASE)
+    if len(m) >= 2:
+        return m[0].strip(), m[1].strip()
+    return "", ""
+
+
+def _league_kind_from_name(league_name: str) -> str:
+    lg = (league_name or "").strip().upper()
+    if "KHL" in lg or "КХЛ" in lg:
+        return "KHL"
+    if "NHL" in lg or "НХЛ" in lg:
+        return "NHL"
+    return "OTHER"
+
+
+# Optional import: we keep parsing stable even if хоккейная логика не обновлена
+try:
+    from .hockey_logic import build_match_insights as _build_match_insights  # type: ignore
+except Exception:  # pragma: no cover
+    _build_match_insights = None  # type: ignore
+
+
+def _mvp_context_lines_for_match(title: str, league_name: str) -> List[str]:
+    """Deterministic lines to stabilize PRE/LIVE and Daily Pro texts."""
+    t1, t2 = _extract_teams_from_title(title)
+    if not t1 or not t2:
+        return []
+
+    kind = _league_kind_from_name(league_name)
+
+    if _build_match_insights is None:
+        # graceful fallback: only a minimal hint
+        return [f"Контекст: {kind}. Матч: {t1} — {t2}."]
+
+    try:
+        ins = _build_match_insights(t1, t2, league=kind)  # type: ignore
+        lines: List[str] = []
+        # ins may be a dataclass-like object
+        mt = getattr(ins, "match_type", "") or ""
+        rk = getattr(ins, "risk", "") or ""
+        fc = getattr(ins, "focus", "") or ""
+        cf = getattr(ins, "confidence", "") or ""
+        if mt or rk or fc:
+            parts = []
+            if mt:
+                parts.append(f"тип: {mt}")
+            if rk:
+                parts.append(f"риск: {rk}")
+            if fc:
+                parts.append(f"фокус: {fc}")
+            if cf:
+                parts.append(f"уверенность: {cf}")
+            lines.append("MVP-оценка (" + ", ".join(parts) + ")")
+        notes = getattr(ins, "notes", None)
+        if isinstance(notes, list):
+            for s in notes[:4]:
+                s = str(s or "").strip()
+                if s:
+                    lines.append(s)
+        return [x for x in lines if x]
+    except Exception:
+        logger.exception("mvp context build failed")
+        return []
+
+
 # --- LLM cooldown (anti-spam on 429 / insufficient_quota) ---
 _LLM_DISABLED_UNTIL_TS = 0
 _LLM_DISABLED_REASON = ""
@@ -857,7 +945,7 @@ def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, prev_sn
         LLM_PROMPT_PREFIX,
         "",
         "Ограничения: без прогнозов/советов; не использовать слова: ставь/бери/выгодно/лучше/проход/гарантия/100%.",
-        "Тон: кратко, списками, без воды.",
+        "Тон: очень просто, коротко, списками. Для широкой аудитории.",
         "",
     ]
 
@@ -870,6 +958,10 @@ def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, prev_sn
         f"id: {match_id}",
     ]
     ctx = [x for x in ctx if x]
+
+    # Deterministic MVP-context (stabilizes outputs for hockey)
+    if str(sport).strip().lower() in {"ice-hockey", "hockey"}:
+        ctx += _mvp_context_lines_for_match(title, league)
 
     meta = [
         "",
@@ -884,7 +976,6 @@ def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, prev_sn
 
     schema_hint = _schema_prompt(mode, action)
     return "\n".join(head + ctx + meta + ["", schema_hint])
-
 
 _SCHEMA_UI_PRE = """
 {
@@ -1079,6 +1170,115 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 # ============================================================
 # Telegram / HTTP entrypoint
 # ============================================================
+
+async def _run_daily_pro(user_id: int, sport_slug: str = "ice-hockey", *, leagues_hint: Optional[str] = None) -> str:
+    """Daily Pro (Охотник): simple, stable, for wide audience."""
+    from .integrations.sport_api import SportAPIClient, SportAPIError
+
+    today = _msk_today_date()
+    sport_slug = (sport_slug or "ice-hockey").strip().lower()
+
+    try:
+        api = SportAPIClient()
+        matches = await api.matches_by_date(sport_slug, today)
+    except SportAPIError as e:
+        return f"⚠️ DAILY PRO: не удалось получить матчи ({str(e)[:200]})"
+
+    items: List[Dict[str, Any]] = []
+    leagues_hint_u = (leagues_hint or "").upper()
+
+    for m in matches or []:
+        title = str(getattr(m, "title", "") or "").strip()
+        league = str(getattr(m, "league", "") or "").strip()
+        if not title:
+            continue
+
+        # Optional league filter for hockey (e.g. 'KHL + NHL')
+        if leagues_hint_u:
+            want_khl = ("KHL" in leagues_hint_u) or ("КХЛ" in leagues_hint_u)
+            want_nhl = ("NHL" in leagues_hint_u) or ("НХЛ" in leagues_hint_u)
+            if want_khl or want_nhl:
+                in_khl = ("KHL" in league.upper()) or ("КХЛ" in league.upper())
+                in_nhl = ("NHL" in league.upper()) or ("НХЛ" in league.upper())
+                if (want_khl and in_khl) or (want_nhl and in_nhl):
+                    pass
+                else:
+                    continue
+
+        mvp_lines = _mvp_context_lines_for_match(title, league) if sport_slug in {"ice-hockey", "hockey"} else []
+        kind = _league_kind_from_name(league) if sport_slug in {"ice-hockey", "hockey"} else "OTHER"
+
+        # scoring (simple and deterministic)
+        score = 0
+        if kind == "KHL":
+            score += 30
+        if kind == "NHL":
+            score += 25
+        if mvp_lines:
+            s = " ".join(mvp_lines).lower()
+            if ("дерби" in s) or ("принцип" in s):
+                score += 20
+            if "равн" in s:
+                score += 12
+            if "риск: высокий" in s:
+                score -= 6
+
+        items.append(
+            {
+                "id": str(getattr(m, "id", "") or "").strip(),
+                "title": title,
+                "league": league,
+                "start_time": str(getattr(m, "start_time", "") or "").strip(),
+                "mvp": mvp_lines,
+                "score": score,
+            }
+        )
+
+    if not items:
+        return f"📌 DAILY PRO\n📅 {today.isoformat()}\n\nНа сегодня нет событий."
+
+    items.sort(key=lambda x: (x.get("score", 0), x.get("start_time") or ""), reverse=True)
+    top = items[:3]
+
+    header = f"📌 DAILY PRO\n📅 {today.isoformat()}"
+    lines = [header, "", "🔥 Топ-3 матча дня (что смотреть):", ""]
+
+    for i, it in enumerate(top, start=1):
+        title = it["title"]
+        league = it["league"]
+        st = it["start_time"]
+        lines.append(f"{i}) {title}")
+        if league:
+            lines.append(f"   🏆 {league}")
+        if st:
+            lines.append(f"   🕒 {st}")
+
+        focus = ""
+        for s in it.get("mvp") or []:
+            ss = str(s)
+            if ss.startswith("MVP-оценка"):
+                focus = ss
+                break
+        if focus:
+            lines.append(f"   {focus}")
+
+        bullets = [s for s in (it.get("mvp") or []) if s and not str(s).startswith("MVP-оценка")]
+        for b in bullets[:2]:
+            lines.append(f"   • {b}")
+
+        lines.append("")
+
+    lines += [
+        "⛔ Когда лучше пропустить:",
+        "• нет подтверждений по составам/вратарю (за 30–60 мин до старта)",
+        "• резкое движение линии без понятной причины",
+        "",
+        "ℹ️ Хочешь детали — открой «Матчи сегодня» → выбери матч → PRE/LIVE.",
+    ]
+
+    return "\n".join([x.rstrip() for x in lines]).strip()
+
+
 async def run_dialog_agent(user_id: int, text: str) -> str:
     user_id = int(user_id or 0)
     raw = (text or "").strip()
@@ -1086,6 +1286,33 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
 
     if norm in {"ping", "/ping", "ping!", "пинг"}:
         return "pong ✅"
+
+
+    # DAILY PRO / Охотник (автоматическая сводка дня)
+    if norm.startswith("daily pro") or norm.startswith("/daily") or "охотник" in norm:
+        # sport (optional)
+        sport_slug = _ACTIVE_SPORT_BY_USER.get(user_id) or "ice-hockey"
+        if "футбол" in norm or "football" in norm:
+            sport_slug = "football"
+        elif "баскет" in norm or "basketball" in norm:
+            sport_slug = "basketball"
+        elif "теннис" in norm and "table" not in norm:
+            sport_slug = "tennis"
+        elif "настоль" in norm or "table-tennis" in norm:
+            sport_slug = "table-tennis"
+        elif "кибер" in norm or "esports" in norm:
+            sport_slug = "esports"
+        else:
+            # хоккей по умолчанию
+            if "hockey" in norm or "хоккей" in norm:
+                sport_slug = "ice-hockey"
+
+        leagues_hint = None
+        if "кхл" in norm or "nhl" in norm or "нхл" in norm:
+            # preserve hints like "КХЛ + НХЛ"
+            leagues_hint = raw
+
+        return await _run_daily_pro(user_id, sport_slug, leagues_hint=leagues_hint)
 
     if norm.startswith("ui match "):
         parts = raw.split()
