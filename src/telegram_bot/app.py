@@ -556,121 +556,92 @@ def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 # ============================================================
 async def build_daily_pro_hockey_text(user_id: int) -> str:
     """
-    Генерация Daily Pro (КХЛ + НХЛ) одним вызовом агента.
+    Daily Pro: КХЛ + НХЛ.
+    Делается без "диалоговых" команд агента, чтобы не получать "Не понял команду".
     """
     try:
-        from ..integrations.sport_api import SportAPIClient
+        from ..integrations.sport_api import SportAPIClient, SportAPIError
     except Exception:
-        return "⚠️ SportAPIClient не найден (integrations.sport_api)."
+        # на случай, если импорт сломался — вернем читаемую ошибку
+        return "⚠️ Daily Pro: не удалось импортировать SportAPIClient."
 
-    today = datetime.now(MSK).date()
     try:
+        today = datetime.now(MSK).date()
         api = SportAPIClient()
         matches = await api.matches_by_date("ice-hockey", today)
+    except SportAPIError as e:
+        return f"⚠️ Daily Pro: не удалось получить матчи из API: {str(e)[:200]}"
     except Exception as e:
-        return f"⚠️ Не удалось получить матчи хоккея: {type(e).__name__}: {str(e)[:120]}"
+        logger.exception("Daily Pro: matches_by_date failed")
+        return f"⚠️ Daily Pro: ошибка получения матчей: {type(e).__name__}: {str(e)[:120]}"
 
-    khl: List[Tuple[str, str, str, str]] = []
-    nhl: List[Tuple[str, str, str, str]] = []
+    # фильтруем только КХЛ/НХЛ
+    wanted = ("khl", "nhl")
+    filtered = []
     for m in matches or []:
-        league = (getattr(m, "league", "") or "").strip()
-        title = (getattr(m, "title", "") or "").strip()
-        start_time = (getattr(m, "start_time", "") or "").strip()
-        status = (getattr(m, "status", "") or "").strip()
+        league = str(getattr(m, "league", "") or "")
+        lg = league.lower()
+        if any(k in lg for k in wanted):
+            filtered.append(m)
 
-        if not title:
-            continue
+    def _is_upcoming(m) -> bool:
+        st = str(getattr(m, "status", "") or "").lower()
+        return st in {"notstarted", "not_started", "scheduled", ""}
 
-        lg = (league or "").lower()
-        if "khl" in lg or "кхл" in lg:
-            khl.append((start_time, league, title, status))
-        elif "nhl" in lg:
-            nhl.append((start_time, league, title, status))
+    # сортируем по времени старта (если есть)
+    def _start_key(m) -> str:
+        return str(getattr(m, "start_time", "") or "")
 
-    khl.sort(key=lambda x: x[0] or "")
-    nhl.sort(key=lambda x: x[0] or "")
+    filtered.sort(key=_start_key)
 
-    cand = khl[:12] + nhl[:12]
-    if not cand:
-        return f"🏒 DAILY PRO | {today.isoformat()}\n\nСегодня нет матчей КХЛ/НХЛ по данным API."
+    upcoming = [m for m in filtered if _is_upcoming(m)]
+    pick_pool = upcoming or filtered
 
+    top3 = pick_pool[:3]
+
+    # Сборка текста
     lines = []
-    for st, league, title, status in cand:
-        st2 = st or "time?"
-        lg2 = league or "League?"
-        status2 = status or ""
-        lines.append(f"- {lg2} | {st2} | {title} {('(' + status2 + ')') if status2 else ''}".strip())
+    lines.append("🏒 Daily Pro: КХЛ + НХЛ")
+    lines.append(f"Дата: {today.isoformat()} (МСК)")
+    lines.append("")
+    lines.append("🔥 Топ‑3 события дня:")
 
-    prompt = (
-        "Ты спортивный аналитик. Сформируй ежедневный Daily Pro по хоккею (КХЛ + НХЛ) "
-        "на сегодня. Используй ТОЛЬКО список матчей ниже (не выдумывай другие матчи).\n\n"
-        "Формат строго:\n"
-        "🏒 DAILY PRO | ХОККЕЙ\n"
-        f"📅 {today.isoformat()}\n\n"
-        "🔥 Топ-3 события дня\n"
-        "1) <матч>\n"
-        "   → <идея/исход>\n"
-        "   Почему: 2-4 коротких причины\n"
-        "2) ...\n"
-        "3) ...\n\n"
-        "🎯 Экспресс дня\n"
-        "- <2-3 исхода через ×>\n"
-        "Оценка риска: низкий/средний/высокий\n\n"
-        "⛔ Риски/когда пропустить\n"
-        "- 3 пункта\n\n"
-        "Ограничения:\n"
-        "- Никаких слов: 'ставь', 'бери', 'гарантия', 'железно', 'точно зайдёт'.\n"
-        "- Коротко, структурировано, без воды.\n\n"
-        "Матчи на сегодня:\n"
-        + "\n".join(lines)
-    )
+    if not top3:
+        lines.append("— Нет матчей КХЛ/НХЛ на сегодня по данным API.")
+    else:
+        for i, m in enumerate(top3, 1):
+            title = str(getattr(m, "title", "") or "Матч")
+            league = str(getattr(m, "league", "") or "")
+            start = str(getattr(m, "start_time", "") or "")
+            score = str(getattr(m, "score", "") or "")
+            status = str(getattr(m, "status", "") or "")
+            extra = []
+            if start:
+                extra.append(start)
+            if status:
+                extra.append(status)
+            if score:
+                extra.append(score)
+            suffix = (" • " + " • ".join(extra)) if extra else ""
+            lines.append(f"{i}) {league}: {title}{suffix}")
 
-    text = await call_agent_local(int(user_id), prompt)
-    return _truncate_tg(text)
+    lines.append("")
+    lines.append("🧩 Экспресс дня (идея):")
+    if len(top3) >= 2:
+        exp = " + ".join([str(getattr(m, "title", "") or "Матч") for m in top3[:3]])
+        lines.append(f"— {exp}")
+    elif len(top3) == 1:
+        lines.append(f"— {str(getattr(top3[0], 'title', '') or 'Матч')}")
+    else:
+        lines.append("— Нет доступных событий для экспресса.")
 
+    lines.append("")
+    lines.append("⚠️ Риски:")
+    lines.append("• Ротации/травмы, особенно бэкап‑вратари")
+    lines.append("• Усталость из-за б2б (back‑to‑back)")
+    lines.append("• Линии могут сдвигаться ближе к старту")
 
-# ============================================================
-# Handlers
-# ============================================================
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Привет! Выбери раздел 👇"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb_main_menu())
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    text_raw = (update.message.text or "").strip()
-    norm = text_raw.lower().strip()
-
-    logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
-
-    # быстрый вход в матчи
-    if "матчи сегодня" in norm:
-        await update.message.reply_text("🏟 Выбери спорт:", reply_markup=kb_sports(user_id))
-        return
-
-    # premium / pro screen (когда кнопка прилетает как текст)
-    if (
-        "premium" in norm
-        or "премиум" in norm
-        or "pro" == norm
-        or "оформить pro" in norm
-        or "купить pro" in norm
-        or text_raw.strip() in {"⭐ Premium", "⭐ Премиум"}
-    ):
-        txt = _truncate_tg(_text_buy_pro(user_id))
-        await update.message.reply_text(txt, reply_markup=kb_buy_pro())
-        return
-
-    # остальное — в агента
-    reply = await call_agent_local(user_id, text_raw)
-    txt = _truncate_tg(reply)
-    await update.message.reply_text(txt, reply_markup=kb_main_menu())
-
+    return "\n".join(lines).strip()
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query:
