@@ -1,16 +1,24 @@
 name: Daily Pro Job
 
 on:
-  schedule:
-    - cron: "0 8 * * *"   # 08:00 UTC = 11:00 МСК
   workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
 
 jobs:
   daily-pro:
     runs-on: ubuntu-latest
+    environment: production   # ← ВОТ ЭТО КЛЮЧЕВО
     steps:
-      - name: Call Daily Pro endpoint
+      - name: Debug secret
         env:
           DAILY_PRO_JOB_KEY: ${{ secrets.DAILY_PRO_JOB_KEY }}
         run: |
-          curl -sS -X POST "https://khl-agent-api-9dw6.onrender.com/jobs/daily-pro?key=${DAILY_PRO_JOB_KEY}" --data ""
+          echo "Key length: ${#DAILY_PRO_JOB_KEY}"
+          test -n "$DAILY_PRO_JOB_KEY"
+
+      - name: Call Daily Pro
+        env:
+          DAILY_PRO_JOB_KEY: ${{ secrets.DAILY_PRO_JOB_KEY }}
+        run: |
+          curl -X POST "https://khl-agent-api-9dw6.onrender.com/jobs/daily-pro?key=$DAILY_PRO_JOB_KEY"
