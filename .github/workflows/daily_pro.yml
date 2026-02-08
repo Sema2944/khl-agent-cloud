@@ -8,22 +8,9 @@ on:
 jobs:
   daily-pro:
     runs-on: ubuntu-latest
-    environment: production
-
     steps:
-      - name: Debug key presence (no leak)
-        env:
-          DAILY_PRO_JOB_KEY: ${{ secrets.DAILY_PRO_JOB_KEY }}
+      - name: Call Daily Pro endpoint (direct)
         run: |
-          echo "KeyLen=${#DAILY_PRO_JOB_KEY}"
-          if [ -z "$DAILY_PRO_JOB_KEY" ]; then
-            echo "ERROR: secret DAILY_PRO_JOB_KEY is empty/not available"
-            exit 1
-          fi
+          curl -sS -X POST "https://khl-agent-api-9dw6.onrender.com/jobs/daily-pro?key=m7Qp9F3LxA2ZK8rD5WvC4HnS6TYeJUBG" --data ""
 
-      - name: Call Daily Pro endpoint
-        env:
-          DAILY_PRO_JOB_KEY: ${{ secrets.DAILY_PRO_JOB_KEY }}
-        run: |
-          curl -sS -X POST "https://khl-agent-api-9dw6.onrender.com/jobs/daily-pro?key=$DAILY_PRO_JOB_KEY" --data ""
 
