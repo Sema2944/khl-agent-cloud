@@ -1,22 +1,20 @@
-"""src/parsing.py
+"""src.parsing
 
-Rule-based text generator ("agent") used by the Telegram bot.
+Устойчивый генератор ответов для кнопок PRE / LIVE / DAILY PRO.
 
-The bot imports this module dynamically and expects:
+Принципы:
+- Без обещаний/гарантий.
+- Без агрессивных слов "ставь/бери/железо/пушка/100%".
+- Максимально стабильный: любой входной текст не должен ломать модуль.
 
-    async def run_dialog_agent(user_id: int, text: str) -> str
+Интеграция:
+- src.telegram_bot.app импортирует модуль как "src.parsing" и вызывает
+  async def run_dialog_agent(user_id: int, text: str) -> str
 
-Supported commands (RU):
-- ping
-- матчи сегодня [ice-hockey|football]
-- матч <match_id>
-- ui match <match_id> <pre|live|livepro> <show|refresh>
-
-Also supports internal Daily PRO prompt (contains "охотник дня"):
-- Produces a Daily Pro bulletin for ICE-HOCKEY + FOOTBALL.
-
-This file is deliberately self-contained and defensive to avoid crashes
-on malformed API responses.
+Примечание:
+Этот модуль не знает, как именно вы получаете матчи/статы.
+Он умеет "вытащить" из входного текста команды/контекст и собрать
+человеческий, структурированный ответ.
 """
 
 from __future__ import annotations
@@ -24,516 +22,356 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    # Python 3.9+
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+from typing import List, Optional, Tuple
 
 
-# --- Optional integration (present in the project) ---------------------------
+# -----------------------------
+# Safety helpers
+# -----------------------------
 
-try:
-    from src.integrations.sport_api import SportAPIClient, SportAPIError  # type: ignore
-except Exception:  # pragma: no cover
-    SportAPIClient = None  # type: ignore
-
-    class SportAPIError(Exception):
-        pass
-
-
-# --- Cache (in-memory; good enough for Render single instance) --------------
-
-# Key: (sport, date_iso) -> dict(match_id -> match)
-_MATCH_CACHE: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+def _safe_str(s: object) -> str:
+    try:
+        return str(s)
+    except Exception:
+        return ""
 
 
-# --- Helpers ----------------------------------------------------------------
+def _truncate(text: str, limit: int = 3800) -> str:
+    text = _safe_str(text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
-SUPPORTED_SPORTS = {
-    "ice-hockey": "🏒 Хоккей",
-    "football": "⚽ Футбол",
+
+# -----------------------------
+# Domain parsing
+# -----------------------------
+
+SPORT_ALIASES = {
+    "ice-hockey": ["ice-hockey", "хоккей", "кхл", "nhl", "нхл"],
+    "football": ["football", "футбол", "uefa", "fifa", "epl", "premier league", "la liga"],
 }
 
 
-def _now_msk() -> datetime:
-    if ZoneInfo is None:
-        return datetime.now()
-    try:
-        return datetime.now(ZoneInfo("Europe/Moscow"))
-    except Exception:
-        return datetime.now()
+@dataclass
+class MatchLine:
+    sport: Optional[str]
+    a: str
+    b: str
+    league: Optional[str] = None
+    country: Optional[str] = None
+    when: Optional[str] = None
+    match_id: Optional[str] = None
+    status: Optional[str] = None
+    score: Optional[str] = None
 
 
-def _today_iso() -> str:
-    return _now_msk().date().isoformat()
-
-
-def _safe_str(x: Any, default: str = "") -> str:
-    if x is None:
-        return default
-    try:
-        return str(x)
-    except Exception:
-        return default
-
-
-def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    """Get first present key from dict."""
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
-
-
-def _truncate(s: str, n: int = 3800) -> str:
-    s = s.strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
-def _normalize_match(sport: str, raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize API match payload to a stable internal shape."""
-
-    # IDs come in different shapes; keep as string.
-    match_id = _safe_str(_get(raw, "id", "match_id", "matchId", default=""))
-
-    country = _safe_str(
-        _get(raw, "country", default=_get(raw, "country_name", "countryName", default=""))
-    )
-
-    league = _safe_str(
-        _get(raw, "league", default=_get(raw, "league_name", "leagueName", default=""))
-    )
-
-    # Teams
-    team_a = _safe_str(
-        _get(raw, "team_a", "home", "home_team", "homeTeam", "teamHome", default="")
-    )
-    team_b = _safe_str(
-        _get(raw, "team_b", "away", "away_team", "awayTeam", "teamAway", default="")
-    )
-
-    # Some APIs nest teams in 'teams'
-    teams = raw.get("teams") if isinstance(raw.get("teams"), dict) else None
-    if teams:
-        team_a = team_a or _safe_str(_get(teams, "home", "a", "team_a", default=""))
-        team_b = team_b or _safe_str(_get(teams, "away", "b", "team_b", default=""))
-
-    # Date/time
-    start_at = _safe_str(
-        _get(raw, "date", "start_at", "startAt", "start_time", "startTime", default="")
-    )
-
-    # Score / status
-    status = _safe_str(_get(raw, "status", "state", "match_status", default=""))
-
-    score_home = _get(raw, "score_home", "home_score", "scoreHome", default=None)
-    score_away = _get(raw, "score_away", "away_score", "scoreAway", default=None)
-
-    # Some APIs nest score in 'score'
-    score = raw.get("score") if isinstance(raw.get("score"), dict) else None
-    if score:
-        score_home = score_home if score_home is not None else _get(score, "home", "a")
-        score_away = score_away if score_away is not None else _get(score, "away", "b")
-
-    return {
-        "id": match_id,
-        "sport": sport,
-        "country": country,
-        "league": league,
-        "team_a": team_a,
-        "team_b": team_b,
-        "start_at": start_at,
-        "status": status,
-        "score_home": score_home,
-        "score_away": score_away,
-        "raw": raw,
-    }
-
-
-def _fmt_score(m: Dict[str, Any]) -> str:
-    sh = m.get("score_home")
-    sa = m.get("score_away")
-    if sh is None or sa is None:
-        return ""
-    return f"{sh}:{sa}"
-
-
-def _fmt_dt(m: Dict[str, Any]) -> str:
-    s = _safe_str(m.get("start_at", ""))
-    if not s:
-        return ""
-    # Keep as-is; API may include date only or ISO datetime.
-    return s
-
-
-def _is_finished(status: str) -> bool:
-    st = status.strip().lower()
-    return any(k in st for k in ("finished", "ft", "ended", "final", "over", "заверш"))
-
-
-def _is_live(status: str) -> bool:
-    st = status.strip().lower()
-    return any(k in st for k in ("live", "inplay", "in play", "1st", "2nd", "3rd", "ot", "pk"))
-
-
-def _priority_bucket(sport: str, league: str) -> int:
-    l = (league or "").lower()
-    if sport == "ice-hockey":
-        if "nhl" in l:
-            return 0
-        if "khl" in l or "кхл" in l:
-            return 1
-        if "ahl" in l:
-            return 2
-        if "mhl" in l or "мхл" in l:
-            return 3
-        return 9
-
-    if sport == "football":
-        # Top competitions first
-        if "champions" in l or "лига чемпион" in l:
-            return 0
-        if "europa" in l or "лига европ" in l:
-            return 1
-        if "premier" in l and "league" in l:
-            return 2
-        if "la liga" in l or "primera" in l:
-            return 3
-        if "serie a" in l:
-            return 4
-        if "bundesliga" in l:
-            return 5
-        if "ligue 1" in l:
-            return 6
-        if "rpl" in l or "премьер-лига" in l or "росс" in l:
-            return 7
-        return 9
-
-    return 9
-
-
-async def _fetch_matches_today(sport: str) -> List[Dict[str, Any]]:
-    if SportAPIClient is None:
-        return []
-
-    date_iso = _today_iso()
-    cache_key = (sport, date_iso)
-    cached = _MATCH_CACHE.get(cache_key)
-    if cached:
-        return list(cached.values())
-
-    api = SportAPIClient()
-    try:
-        raw_list = await api.matches_by_date(sport=sport, date=date_iso)  # type: ignore
-    except TypeError:
-        # Older client signature (positional)
-        raw_list = await api.matches_by_date(sport, date_iso)  # type: ignore
-    except Exception as e:
-        raise SportAPIError(str(e))
-
-    matches: Dict[str, Dict[str, Any]] = {}
-    if isinstance(raw_list, list):
-        for r in raw_list:
-            if isinstance(r, dict):
-                m = _normalize_match(sport, r)
-                if m["id"]:
-                    matches[m["id"]] = m
-
-    _MATCH_CACHE[cache_key] = matches
-    return list(matches.values())
-
-
-def _find_match(match_id: str) -> Optional[Dict[str, Any]]:
-    match_id = match_id.strip()
-    if not match_id:
-        return None
-    for (_, _), matches in _MATCH_CACHE.items():
-        m = matches.get(match_id)
-        if m:
-            return m
+def _guess_sport(text: str) -> Optional[str]:
+    low = text.lower()
+    for sport, keys in SPORT_ALIASES.items():
+        for k in keys:
+            if k in low:
+                return sport
     return None
 
 
-def _format_match_card(m: Dict[str, Any]) -> str:
-    title = f"{m.get('team_a','?')} — {m.get('team_b','?')}"
-    league = m.get("league", "")
-    country = m.get("country", "")
-    dt = _fmt_dt(m)
-    status = _safe_str(m.get("status", ""))
-    score = _fmt_score(m)
-
-    lines = [title]
-    if league:
-        lines.append(f"🏆 {league}")
-    if country:
-        lines.append(f"🌍 {country}")
-    if dt:
-        lines.append(f"🕒 {dt}")
-    if status or score:
-        if score:
-            lines.append(f"📊 {score} ({status or 'status'})")
-        else:
-            lines.append(f"📊 {status}")
-    lines.append("")
-    lines.append("Кнопки: PRE / LIVE / LIVE PRO / Обновить LIVE")
-    return "\n".join(lines).strip()
+def _extract_date(text: str) -> Optional[str]:
+    # 2026-02-09
+    m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", text)
+    if m:
+        return m.group(1)
+    # 09.02.2026
+    m = re.search(r"\b(\d{2})\.(\d{2})\.(20\d{2})\b", text)
+    if m:
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm}-{dd}"
+    return None
 
 
-def _pre_text(m: Dict[str, Any]) -> str:
-    title = f"🧠 PRE-обзор (коротко)\n{m.get('team_a','?')} — {m.get('team_b','?')}"
-    lines = [title]
-    league = m.get("league")
-    if league:
-        lines.append(f"🏆 {league}")
-    dt = _fmt_dt(m)
-    if dt:
-        lines.append(f"🕒 {dt}")
+def _extract_match_lines(text: str, default_sport: Optional[str] = None, limit: int = 60) -> List[MatchLine]:
+    """Достаёт "похожие на матч" строки из текста.
 
-    # Generic, sport-tailored checklist
-    sport = m.get("sport")
-    lines.append("")
-    lines.append("Что проверить за 30–60 минут до начала:")
-    lines.append("• составы / стартовые игроки")
-    lines.append("• кто в воротах / кто в старте")
-    lines.append("• новости: травмы, ротация, мотивация")
+    Поддерживает входы вида:
+    - "KHL: Team A — Team B"
+    - "Team A - Team B"
+    - "match_id=12345 Team A — Team B"
+    - карточные форматы (частично)
 
-    if sport == "ice-hockey":
-        lines.append("• спецбригады большинства/меньшинства (по ощущениям в 1-м периоде)")
-        lines.append("• темп + удаления в начале (намёк на характер матча)")
-    elif sport == "football":
-        lines.append("• схема/роль лидеров, кто на стандартах")
-        lines.append("• погодные условия и поле (если есть)" )
+    Это эвристика: не обязана вытащить 100%, зато не ломается.
+    """
 
-    lines.append("")
-    lines.append("⚠️ Это справка, не рекомендация. Если данных мало — лучше наблюдать.")
-    return "\n".join(lines).strip()
+    lines = [ln.strip() for ln in _safe_str(text).splitlines() if ln.strip()]
+    out: List[MatchLine] = []
 
+    # Паттерн для "A — B" / "A - B" / "A vs B"
+    sep = r"(?:\s+[—\-–]\s+|\s+vs\.?\s+|\s+VS\s+)"
+    pat = re.compile(rf"^(?:(?P<league>[^|]{2,40})\s*[|:]\s*)?(?P<a>[^\n]{{2,80}}?){sep}(?P<b>[^\n]{{2,80}}?)(?:\s+\((?P<status>[^)]+)\))?$")
 
-def _live_text(m: Dict[str, Any]) -> str:
-    title = f"📡 LIVE-обзор\n{m.get('team_a','?')} — {m.get('team_b','?')}"
-    lines = [title]
-    score = _fmt_score(m)
-    status = _safe_str(m.get("status", ""))
-    if score:
-        lines.append(f"📊 Счёт: {score}")
-    if status:
-        lines.append(f"⏱ Статус: {status}")
+    # match_id внутри строки
+    id_pat = re.compile(r"\b(?:match[_\s]?id|id)\s*[:=]\s*(\d{4,})\b", re.I)
 
-    lines.append("")
-    if _is_finished(status):
-        lines.append("Матч завершён. Можно разобрать итоги:")
-        lines.append("• как менялся темп по периодам/таймам")
-        lines.append("• ключевые моменты (удаления, голы, красные/травмы)")
-    else:
-        lines.append("Что смотреть прямо сейчас:")
-        if m.get("sport") == "ice-hockey":
-            lines.append("• темп и броски (высокий темп → больше моментов)")
-            lines.append("• удаления подряд (часто ломают рисунок)")
-            lines.append("• 5–7 минут после гола: команда реагирует или «плывёт»")
-        else:
-            lines.append("• давление: владение/опасные атаки (по ощущению просмотра)")
-            lines.append("• стандарты и быстрые переходы")
-            lines.append("• поведение после гола: садятся ли глубже")
-
-    lines.append("")
-    lines.append("⚠️ Это аналитическая заметка, без призывов к ставкам.")
-    return "\n".join(lines).strip()
-
-
-def _live_pro_text(m: Dict[str, Any]) -> str:
-    title = f"🟢 LIVE PRO (структурно)\n{m.get('team_a','?')} — {m.get('team_b','?')}"
-    lines = [title]
-    score = _fmt_score(m)
-    status = _safe_str(m.get("status", ""))
-    if score:
-        lines.append(f"📊 {score}")
-    if status:
-        lines.append(f"⏱ {status}")
-
-    lines.append("")
-    lines.append("Сценарии на матч (как читать игру):")
-    if m.get("sport") == "ice-hockey":
-        lines.append("1) Если много удалений → матч часто уходит в «качели» по моментам")
-        lines.append("2) Если фаворит «висит» в зоне, но не забивает → следи за контратаками")
-        lines.append("3) В конце периодов темп часто растёт — увеличивается риск ошибок")
-    else:
-        lines.append("1) Если одна команда высоко прессингует → следи за провалами за спиной")
-        lines.append("2) Быстрый гол меняет план: у ведущей команды падает темп")
-        lines.append("3) Стандарты решают много: угловые/штрафные — отдельный сюжет")
-
-    lines.append("")
-    lines.append("Риски / когда лучше просто наблюдать:")
-    lines.append("• нет понимания составов/ролей — любой вывод будет слабым")
-    lines.append("• линия/темп резко меняются без видимой причины")
-    lines.append("• матч уже «закрыт» по рисунку (низкий темп, мало моментов)")
-
-    lines.append("")
-    lines.append("⚠️ Справка для понимания игры, не финансовый совет.")
-    return "\n".join(lines).strip()
-
-
-def _pick_top_events(matches: List[Dict[str, Any]], sport: str, n: int = 3) -> List[Dict[str, Any]]:
-    # Prefer non-finished matches, then by league priority.
-    def key(m: Dict[str, Any]) -> Tuple[int, int, str]:
-        status = _safe_str(m.get("status", ""))
-        finished = 1 if _is_finished(status) else 0
-        pr = _priority_bucket(sport, _safe_str(m.get("league", "")))
-        dt = _fmt_dt(m)
-        return (finished, pr, dt)
-
-    ms = sorted(matches, key=key)
-    out: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for m in ms:
-        mid = _safe_str(m.get("id", ""))
-        if not mid or mid in seen:
-            continue
-        out.append(m)
-        seen.add(mid)
-        if len(out) >= n:
+    for ln in lines:
+        if len(out) >= limit:
             break
+
+        # слишком длинные/мусорные строки пропускаем
+        if len(ln) > 200:
+            continue
+
+        match_id = None
+        m_id = id_pat.search(ln)
+        if m_id:
+            match_id = m_id.group(1)
+
+        m = pat.match(ln)
+        if not m:
+            continue
+
+        a = (m.group("a") or "").strip(" •-–—")
+        b = (m.group("b") or "").strip(" •-–—")
+        league = (m.group("league") or "").strip() or None
+        status = (m.group("status") or "").strip() or None
+
+        if len(a) < 2 or len(b) < 2:
+            continue
+
+        out.append(
+            MatchLine(
+                sport=default_sport,
+                a=a,
+                b=b,
+                league=league,
+                match_id=match_id,
+                status=status,
+            )
+        )
+
     return out
 
 
-async def _daily_pro_combo_text() -> str:
-    date_iso = _today_iso()
+def _extract_score_and_status(text: str) -> Tuple[Optional[str], Optional[str]]:
+    # например: FINISHED 2:1 (FT) / LIVE 1:0 / 2-1
+    score = None
+    status = None
 
-    sections: List[str] = []
-    for sport in ("ice-hockey", "football"):
-        try:
-            matches = await _fetch_matches_today(sport)
-        except Exception:
-            matches = []
+    m = re.search(r"\b(FINISHED|LIVE|SCHEDULED|CANCELLED|POSTPONED|FT|HT)\b", text, re.I)
+    if m:
+        status = m.group(1).upper()
 
-        top = _pick_top_events(matches, sport, n=3)
+    m = re.search(r"\b(\d{1,2})\s*[:\-]\s*(\d{1,2})\b", text)
+    if m:
+        score = f"{m.group(1)}:{m.group(2)}"
 
-        header = f"{SUPPORTED_SPORTS.get(sport, sport)} | DAILY PRO\n📅 {date_iso}"
-        lines = [header, "", "🔥 Топ-3 события дня (для наблюдения)", ""]
+    return score, status
 
+
+# -----------------------------
+# Text builders
+# -----------------------------
+
+def _simple_disclaimer() -> str:
+    return "\n\nℹ️ Это аналитическая справка, не рекомендация."
+
+
+def _build_pre(match: MatchLine, raw: str) -> str:
+    date = _extract_date(raw)
+    title = f"🧠 PRE-обзор\n{match.a} — {match.b}"
+    if match.league:
+        title += f"\n🏆 {match.league}"
+    if date:
+        title += f"\n📅 {date}"
+
+    blocks = [
+        title,
+        "\nЧто проверить перед стартом:",
+        "• составы/травмы и кто в воротах (для хоккея)",
+        "• мотивация: турнирная ситуация, серия игр, дерби/кубок",
+        "• календарь: 2-я игра за 2–3 дня, перелёты",
+        "• рынок: были ли резкие движения линии без новостей",
+        "\nНа что смотреть по ходу матча:",
+        "• темп в первые 10–15 минут: броски/владение/угрозы",
+        "• удаления/карточки и качество большинства (для хоккея)",
+        "• стандарты и опасные моменты (для футбола)",
+        "\nИдеи (без навязывания):",
+        "• выбрать один сценарий: быстрый темп → больше событий; низкий темп → меньше событий",
+        "• если фаворит выглядит "
+        "свежо, а аутсайдер глубоко садится — оценить, хватит ли моментов для гола/шайбы",
+        _simple_disclaimer(),
+    ]
+
+    return "\n".join(blocks)
+
+
+def _build_live(match: MatchLine, raw: str) -> str:
+    score, status = _extract_score_and_status(raw)
+
+    title = f"🟢 LIVE-обзор\n{match.a} — {match.b}"
+    if match.league:
+        title += f"\n🏆 {match.league}"
+    if score:
+        title += f"\n📊 Счёт: {score}"
+    if status:
+        title += f"\n⏱ Статус: {status}"
+
+    blocks = [
+        title,
+        "\nЧто важно прямо сейчас:",
+        "• кто создаёт моменты: реальные угрозы vs владение ради владения",
+        "• дисциплина: удаления/карточки могут резко менять рисунок",
+        "• замены/перестройки: после гола часто меняется темп",
+        "\nБыстрая логика (простыми словами):",
+        "• много моментов и высокий темп → вероятность событий выше",
+        "• мало моментов, команды осторожны → событий обычно меньше",
+        "\nЕсли сомневаешься — лучше наблюдать ещё 5–10 минут и собрать больше фактов.",
+        _simple_disclaimer(),
+    ]
+
+    return "\n".join(blocks)
+
+
+def _pick_top(matches: List[MatchLine], n: int = 3) -> List[MatchLine]:
+    """Простой отбор "топ" без внешних данных.
+
+    Эвристика: сначала по "популярным" лигам, затем по порядку.
+    """
+    if not matches:
+        return []
+
+    popular = [
+        "khl",
+        "nhl",
+        "all star",
+        "premier league",
+        "epl",
+        "la liga",
+        "serie a",
+        "bundesliga",
+        "champions league",
+        "europa",
+        "world cup",
+        "euro",
+    ]
+
+    def score(m: MatchLine) -> int:
+        base = 0
+        txt = (m.league or "").lower()
+        for i, key in enumerate(popular):
+            if key in txt:
+                base += 100 - i
+        # чуть-чуть поднимаем матчи с известными командами (по длине/наличию заглавных)
+        base += 5 if (m.a[:1].isupper() and m.b[:1].isupper()) else 0
+        return base
+
+    sorted_matches = sorted(matches, key=score, reverse=True)
+    return sorted_matches[:n]
+
+
+def _build_daily_pro(raw: str) -> str:
+    detected_date = _extract_date(raw) or datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Попробуем вытащить матчи из текста.
+    base_sport = _guess_sport(raw)
+    matches = _extract_match_lines(raw, default_sport=base_sport)
+
+    # Если в одном промпте упоминаются 2 спорта — разделим по ключам.
+    # Иначе: если ничего не распарсили — дадим универсальную справку.
+
+    # Пробуем отдельно вытащить хоккей/футбол из общего текста
+    hockey = _extract_match_lines(raw, default_sport="ice-hockey") if "хок" in raw.lower() or "ice-hockey" in raw.lower() else []
+    football = _extract_match_lines(raw, default_sport="football") if "фут" in raw.lower() or "football" in raw.lower() else []
+
+    # Если отдельные списки пустые, используем общий
+    if not hockey and not football:
+        if base_sport == "ice-hockey":
+            hockey = matches
+        elif base_sport == "football":
+            football = matches
+
+    # Если всё равно пусто — общий совет
+    if not hockey and not football:
+        return _truncate(
+            "🏒⚽ DAILY PRO\n"
+            f"📅 {detected_date}\n\n"
+            "Сегодня у меня нет списка матчей в сообщении.\n"
+            "Открой «Матчи сегодня» и выбери матч — я дам PRE/LIVE обзор."
+            + _simple_disclaimer()
+        )
+
+    out: List[str] = [f"🏒⚽ DAILY PRO\n📅 {detected_date}"]
+
+    def section(title: str, ms: List[MatchLine]) -> None:
+        top = _pick_top(ms, 3)
         if not top:
-            lines.append("Нет данных по матчам на сегодня (или API временно недоступен).")
-        else:
-            for i, m in enumerate(top, start=1):
-                title = f"{m.get('team_a','?')} — {m.get('team_b','?')}"
-                league = _safe_str(m.get("league", ""))
-                dt = _fmt_dt(m)
-                lines.append(f"{i}) {title}")
-                if league:
-                    lines.append(f"   🏆 {league}")
-                if dt:
-                    lines.append(f"   🕒 {dt}")
-                lines.append("   Что смотреть:")
-                lines.append("   • составы/стартовые (за 30–60 мин)")
-                lines.append("   • темп в начале и дисциплина")
-                lines.append("   • как команда реагирует после пропущенного")
-                lines.append("")
+            return
+        out.append(f"\n🔥 {title}: 3 события дня (для наблюдения)")
+        for i, m in enumerate(top, 1):
+            line = f"{i}) {m.a} — {m.b}"
+            if m.league:
+                line += f"\n   🏆 {m.league}"
+            out.append(line)
+        out.append("\nЧто смотреть (просто):")
+        out.append("• новости по составам/травмам перед стартом")
+        out.append("• изменения темпа в первые минуты")
+        out.append("• резкие движения линии без видимых причин (может быть инфо)")
 
-        lines.append("🎯 Экспресс-конструктор (без навязывания)")
-        lines.append("• Выбери 2 события из топ-3 и собери аккуратный «план просмотра».")
-        lines.append("• Если нет подтверждений по составам — лучше просто наблюдать.")
-        lines.append("")
-        lines.append("⛔ Риски / когда пропустить")
-        lines.append("• неожиданная ротация / резервный состав")
-        lines.append("• резкая смена рисунка без видимых причин")
-        lines.append("• мало данных — выводы будут шумными")
+    section("Хоккей", hockey)
+    section("Футбол", football)
 
-        sections.append("\n".join(lines).strip())
+    out += [
+        "\n🧩 Как использовать (без навязывания):",
+        "• выбери 1–2 матча, дождись составов и первых минут игры",
+        "• если картинка не подтверждается — просто пропусти",
+        "\n⛔ Когда лучше не лезть:",
+        "• нет инфы по составам / много ротации",
+        "• слишком хаотичная игра (сложно читать)",
+        "• линия сильно "
+        "скачет без новостей",
+        _simple_disclaimer(),
+    ]
 
-    final = "\n\n".join(sections)
-    return _truncate(final)
+    return _truncate("\n".join(out))
 
 
-def _help_text() -> str:
-    return (
-        "Не понял команду.\n\n"
-        "Доступно:\n"
-        "• ping\n"
-        "• матчи сегодня [ice-hockey|football]\n"
-        "• матч <match_id>\n"
-        "• ui match <match_id> <pre|live|livepro> <show|refresh>\n"
-    ).strip()
+def _detect_intent(raw: str) -> str:
+    low = raw.lower()
+    if "daily" in low or "охотник дня" in low or "топ-3" in low:
+        return "daily"
+    if "live" in low or "лайв" in low or "inplay" in low:
+        return "live"
+    if "pre" in low or "пре" in low or "прематч" in low:
+        return "pre"
+    # иногда кнопка PRE/LIVE передаёт маркер вида "MODE:PRE" или "MODE:LIVE"
+    if "mode:live" in low:
+        return "live"
+    if "mode:pre" in low:
+        return "pre"
+    return "daily"  # безопасный дефолт
 
 
-# --- Public entrypoint ------------------------------------------------------
+# -----------------------------
+# Public API
+# -----------------------------
 
 async def run_dialog_agent(user_id: int, text: str) -> str:
-    """Main router called by the bot.
+    """Единая точка входа для "AI".
 
-    Parameters
-    ----------
-    user_id: telegram user id
-    text: user's message (or internal command)
+    На вход приходит произвольный текст (промпт), уже собранный приложением.
+    Мы определяем режим и возвращаем готовый ответ.
     """
 
-    t = (text or "").strip()
-    t_low = t.lower()
+    raw = _safe_str(text)
+    intent = _detect_intent(raw)
 
-    # Internal Daily PRO prompt from /jobs/daily-pro
-    if "охотник дня" in t_low or "daily pro" in t_low:
-        return await _daily_pro_combo_text()
+    # Постараемся извлечь хотя бы один матч из текста.
+    sport = _guess_sport(raw)
+    matches = _extract_match_lines(raw, default_sport=sport, limit=10)
+    match = matches[0] if matches else MatchLine(sport=sport, a="Матч", b="—", league=None)
 
-    if t_low == "ping":
-        return "pong"
+    if intent == "pre":
+        return _truncate(_build_pre(match, raw))
+    if intent == "live":
+        return _truncate(_build_live(match, raw))
 
-    # Matches today
-    m = re.match(r"^матчи\s+сегодня(?:\s+([a-z\-]+))?$", t_low)
-    if m:
-        sport = (m.group(1) or "").strip() or "ice-hockey"
-        if sport not in SUPPORTED_SPORTS:
-            return "Выбери спорт: ice-hockey или football"
+    # daily
+    return _truncate(_build_daily_pro(raw))
 
-        try:
-            matches = await _fetch_matches_today(sport)
-        except Exception:
-            return "⚠️ Не удалось получить матчи (API временно недоступен)."
 
-        # Compact list for CLI usage; UI navigation is handled in app.py
-        top = _pick_top_events(matches, sport, n=15)
-        lines = [f"{SUPPORTED_SPORTS[sport]} | Матчи сегодня ({_today_iso()})", ""]
-        if not top:
-            lines.append("Нет матчей или нет данных.")
-            return "\n".join(lines)
-
-        for i, mm in enumerate(top, start=1):
-            title = f"{mm.get('team_a','?')} — {mm.get('team_b','?')}"
-            league = _safe_str(mm.get("league", ""))
-            dt = _fmt_dt(mm)
-            mid = _safe_str(mm.get("id", ""))
-            piece = f"{i}) {title}"
-            if league:
-                piece += f" | {league}"
-            if dt:
-                piece += f" | {dt}"
-            if mid:
-                piece += f" | id={mid}"
-            lines.append(piece)
-        lines.append("\nЧтобы открыть карточку: матч <match_id>")
-        return _truncate("\n".join(lines))
-
-    # Single match card
-    m2 = re.match(r"^матч\s+(\d+)$", t_low)
-    if m2:
-        match_id = m2.group(1)
-        mm = _find_match(match_id)
-        if not mm:
-            return "Матч не найден в кеше. Сначала: матчи сегодня ice-hockey или matчи сегодня football"
-        return _truncate(_format_match_card(mm))
-
-    # UI command from callback router
-    m3 = re.match(r"^ui\s+match\s+(\d+)\s+(pre|live|livepro)\s+(show|refresh)$", t_low)
-    if m3:
-        match_id, mode, _action = m3.group(1), m3.group(2), m3.group(3)
-        mm = _find_match(match_id)
-        if not mm:
-            return "Матч не найден в кеше. Открой его через «Матчи сегодня» ещё раз."
-
-        if mode == "pre":
-            return _truncate(_pre_text(mm))
-        if mode == "live":
-            return _truncate(_live_text(mm))
-        return _truncate(_live_pro_text(mm))
-
-    return _help_text()
+__all__ = ["run_dialog_agent"]
