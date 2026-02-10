@@ -662,21 +662,45 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
 
 
 def _format_status_and_score(status: str, score: str) -> Tuple[str, str]:
+    """Return (status_label, score_label) in Russian-friendly form.
+
+    We keep it short for Telegram cards:
+      - ✅ Завершён
+      - 🟢 Идёт
+      - ⏳ Скоро
+      - ⏸ Перенесён / Отменён
+    """
     s = (status or "").strip().lower()
     sc = (score or "").strip()
 
-    is_live = s in {"live", "inprogress", "in_progress"}
-    is_done = s in {"finished", "ended"}
-    is_not_started = s in {"notstarted", "not_started", "scheduled", "fixture", "pending"}
+    # Normalize a few common vendor statuses
+    is_live = any(x in s for x in ("live", "1h", "2h", "3h", "ot", "so", "in progress", "playing"))
+    is_finished = any(x in s for x in ("finished", "ft", "ended", "closed", "final"))
+    is_postponed = any(x in s for x in ("postponed", "delayed", "suspended"))
+    is_canceled = any(x in s for x in ("canceled", "cancelled"))
+    is_scheduled = any(x in s for x in ("not started", "ns", "scheduled", "upcoming", "tbd"))
 
     if is_live:
-        return "LIVE", sc or "—"
-    if is_done:
-        return "FINISHED", f"{sc} (FT)" if sc else "—"
-    if is_not_started or not s:
-        return "NOT STARTED", "—"
-    return s.upper(), sc or "—"
+        status_label = "🟢 Идёт"
+    elif is_finished:
+        status_label = "✅ Завершён"
+    elif is_postponed:
+        status_label = "⏸ Перенесён"
+    elif is_canceled:
+        status_label = "⛔ Отменён"
+    elif is_scheduled or not s:
+        status_label = "⏳ Скоро"
+    else:
+        # Fallback: show original status (uppercased) but without noise
+        status_label = status.strip().upper()[:32] if status else ""
 
+    # Score label
+    score_label = sc
+    if score_label and is_finished:
+        # If provider doesn't include FT marker, add a short Russian one
+        if "ft" not in score_label.lower() and "ф" not in score_label.lower():
+            score_label = f"{score_label} (ФТ)"
+    return status_label, score_label
 
 def _live_no_change_text(match_meta: Dict[str, Any], action: str) -> str:
     title = str(match_meta.get("title") or "Матч").strip()
@@ -1172,7 +1196,6 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 lines.append(f"{st} {sc}".strip())
 
             lines.append("")
-            lines.append("Кнопки: PRE / LIVE / LIVE PRO / Обновить LIVE")
             return "\n".join(lines).strip()
 
         except Exception as e:
