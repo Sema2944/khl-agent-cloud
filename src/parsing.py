@@ -662,45 +662,34 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
 
 
 def _format_status_and_score(status: str, score: str) -> Tuple[str, str]:
-    """Return (status_label, score_label) in Russian-friendly form.
-
-    We keep it short for Telegram cards:
-      - ✅ Завершён
-      - 🟢 Идёт
-      - ⏳ Скоро
-      - ⏸ Перенесён / Отменён
-    """
+    """Normalize API status + score to user-friendly RU labels."""
     s = (status or "").strip().lower()
     sc = (score or "").strip()
 
-    # Normalize a few common vendor statuses
-    is_live = any(x in s for x in ("live", "1h", "2h", "3h", "ot", "so", "in progress", "playing"))
-    is_finished = any(x in s for x in ("finished", "ft", "ended", "closed", "final"))
-    is_postponed = any(x in s for x in ("postponed", "delayed", "suspended"))
-    is_canceled = any(x in s for x in ("canceled", "cancelled"))
-    is_scheduled = any(x in s for x in ("not started", "ns", "scheduled", "upcoming", "tbd"))
+    # Common statuses from different providers
+    is_live = s in {"live", "inprogress", "in_progress", "playing", "1st", "2nd", "3rd"}
+    is_done = s in {"finished", "ended", "ft", "fulltime", "final"}
+    is_not_started = s in {"notstarted", "not_started", "scheduled", "fixture", "pending", "ns"}
+    is_postponed = s in {"postponed", "pst"}
+    is_cancelled = s in {"canceled", "cancelled", "canc"}
+    is_interrupted = s in {"interrupted", "suspended", "abandoned"}
 
     if is_live:
-        status_label = "🟢 Идёт"
-    elif is_finished:
-        status_label = "✅ Завершён"
-    elif is_postponed:
-        status_label = "⏸ Перенесён"
-    elif is_canceled:
-        status_label = "⛔ Отменён"
-    elif is_scheduled or not s:
-        status_label = "⏳ Скоро"
-    else:
-        # Fallback: show original status (uppercased) but without noise
-        status_label = status.strip().upper()[:32] if status else ""
+        return "Идёт", sc or "—"
+    if is_done:
+        # Do not add (FT) — users want plain Russian output
+        return "Завершён", sc or "—"
+    if is_not_started or not s:
+        return "Не начался", "—"
+    if is_postponed:
+        return "Перенесён", "—"
+    if is_cancelled:
+        return "Отменён", "—"
+    if is_interrupted:
+        return "Прерван", sc or "—"
 
-    # Score label
-    score_label = sc
-    if score_label and is_finished:
-        # If provider doesn't include FT marker, add a short Russian one
-        if "ft" not in score_label.lower() and "ф" not in score_label.lower():
-            score_label = f"{score_label} (ФТ)"
-    return status_label, score_label
+    # Fallback: show raw status, but in RU-friendly form
+    return (status or "Статус").strip()[:32], sc or "—"
 
 def _live_no_change_text(match_meta: Dict[str, Any], action: str) -> str:
     title = str(match_meta.get("title") or "Матч").strip()
@@ -1196,6 +1185,7 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 lines.append(f"{st} {sc}".strip())
 
             lines.append("")
+            lines.append("Кнопки: PRE / LIVE / LIVE PRO / Обновить LIVE")
             return "\n".join(lines).strip()
 
         except Exception as e:
