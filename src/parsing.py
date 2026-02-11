@@ -149,8 +149,12 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
     """
     global _LLM_DISABLED_UNTIL_TS, _LLM_DISABLED_REASON
 
-    mode = kwargs.get("mode")
-    snapshot = kwargs.get("snapshot")
+    # Эти параметры нужны нам только для fallback-текста,
+    # но не все реализации analyze_with_llm_cached() их принимают.
+    # Поэтому извлекаем их из kwargs, чтобы не ловить
+    # TypeError: unexpected keyword argument.
+    mode = kwargs.pop("mode", None)
+    snapshot = kwargs.pop("snapshot", None)
 
     now = int(time.time())
     if now < _LLM_DISABLED_UNTIL_TS:
