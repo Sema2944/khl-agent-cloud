@@ -140,96 +140,64 @@ def _fallback_analysis(
     }
 
 async def analyze_with_llm_cached_safe(*args, **kwargs):
-    """
-    Обертка над analyze_with_llm_cached:
-    - если недавно был quota/429 -> не зовем OpenAI
-    - если получили quota/429 -> ставим блок на N минут и возвращаем fallback
+    """Safe wrapper around analyze_with_llm_cached().
 
-    Дополнительно: kwargs могут содержать mode/snapshot для качественного fallback.
+    - Accepts extra UI kwargs (mode/action/snapshot/etc.) and strips them before calling.
+    - Any exception falls back to a deterministic Russian 'умный' ответ, so bot doesn't выглядеть сломанным.
     """
-    global _LLM_DISABLED_UNTIL_TS, _LLM_DISABLED_REASON
-
-    # Эти параметры нужны нам только для fallback-текста,
-    # но не все реализации analyze_with_llm_cached() их принимают.
-    # Поэтому извлекаем их из kwargs, чтобы не ловить
-    # TypeError: unexpected keyword argument.
+    # UI / meta (may be passed by higher-level handlers)
     mode = kwargs.pop("mode", None)
-    snapshot = kwargs.pop("snapshot", None)
+    action = kwargs.pop("action", None)
 
-    now = int(time.time())
-    if now < _LLM_DISABLED_UNTIL_TS:
-        reason = _LLM_DISABLED_REASON or "llm_cooldown_active"
-        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
-            "llm_disabled": True,
-            "reason": reason,
-        }
+    # Snapshot variants (older/newer call sites)
+    snapshot = kwargs.pop("snapshot", None)
+    prev_snapshot = kwargs.pop("prev_snapshot", None)
+    cur_snapshot = kwargs.pop("cur_snapshot", None)
+    prev_snap = kwargs.pop("prev_snap", None)
+    cur_snap = kwargs.pop("cur_snap", None)
+
+    match_meta = kwargs.pop("match_meta", None)
+    match_id = kwargs.pop("match_id", None)
+
+    # Prefer the most informative snapshot for fallback
+    if cur_snap is None:
+        cur_snap = cur_snapshot
+    if cur_snap is None:
+        cur_snap = snapshot
+    if prev_snap is None:
+        prev_snap = prev_snapshot
 
     try:
+        # Important: analyze_with_llm_cached MUST NOT receive UI-only kwargs
         return await analyze_with_llm_cached(*args, **kwargs)
     except Exception as e:
-        if _is_quota_error(e):
-            _LLM_DISABLED_REASON = f"quota/429: {str(e)[:180]}"
-            _LLM_DISABLED_UNTIL_TS = int(time.time()) + 20 * 60
-            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=snapshot), {
-                "llm_disabled": True,
-                "reason": _LLM_DISABLED_REASON,
-            }
-        # прочие ошибки — тоже даём fallback, чтобы UI не «падал»
-        reason = f"{type(e).__name__}: {str(e)[:180]}"
-        logger.warning("LLM failed (non-quota), using fallback: %s", reason)
-        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
-            "llm_disabled": True,
+        # Quota / rate-limit / transient errors should not break UX
+        reason = f"{type(e).__name__}: {str(e)[:200]}"
+        logger.warning("LLM failed (safe wrapper), using fallback: %s", reason)
+        try:
+            text = _fallback_analysis(reason, mode=mode, snapshot=cur_snap)
+        except Exception:
+            # last-resort
+            text = (
+                "• AI временно недоступен — показываю базовую справку.
+
+"
+                "Риски
+"
+                "• Недостаточно данных для детального разбора.
+
+"
+                "Аналитический материал, не является рекомендацией."
+            )
+        meta = {
+            "ok": False,
             "reason": reason,
+            "mode": mode,
+            "action": action,
+            "match_id": match_id,
+            "has_snapshot": bool(cur_snap),
         }
-
-
-ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
-
-EXPERT_STRATEGY_TEXT = (os.getenv("EXPERT_STRATEGY_TEXT") or "").strip()
-EXPERT_STRATEGY_DATE = (os.getenv("EXPERT_STRATEGY_DATE") or "").strip()
-
-MSK = ZoneInfo("Europe/Moscow")
-
-LLM_PROMPT_PREFIX = (os.getenv("LLM_PROMPT_PREFIX") or "").strip()
-if not LLM_PROMPT_PREFIX:
-    LLM_PROMPT_PREFIX = (
-        "Ты дружелюбный, структурированный и безопасный спортивный аналитик.\n"
-        "Объясняй логику движения линии.\n"
-        "НЕ предсказывай исход и НЕ давай советов.\n"
-        "Пиши коротко, списками."
-    )
-
-# -----------------------------
-# TTL policy for LLM caching
-# -----------------------------
-TTL_PRE_S = int((os.getenv("LLM_CACHE_TTL_S") or "900").strip())
-TTL_LIVE_S = int((os.getenv("LLM_CACHE_TTL_LIVE_S") or "75").strip())
-TTL_LIVE_PRO_S = int((os.getenv("LLM_CACHE_TTL_LIVE_PRO_S") or "75").strip())
-
-_ACTIVE_MATCH_BY_USER: Dict[int, str] = {}
-_ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
-_LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
-
-_LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
-_LIVE_RENDER_BY_MATCH: Dict[Tuple[str, str], str] = {}
-
-_MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
-
-_ACTIVE_COUNTRY_BY_USER: Dict[int, str] = {}
-_ACTIVE_LEAGUE_BY_USER: Dict[int, str] = {}
-_ACTIVE_PAGE_BY_USER: Dict[int, int] = {}
-
-API_SPORTS_LABELS = {
-    "football": "⚽ Футбол",
-    "ice-hockey": "🏒 Хоккей",
-    "basketball": "🏀 Баскетбол",
-    "tennis": "🎾 Теннис",
-    "table-tennis": "🏓 Настольный теннис",
-    "esports": "🎮 Киберспорт",
-}
-
-TELEGRAM_MAX_CHARS = 3800
-
+        return text, meta
 
 def _msk_today_date() -> date:
     return datetime.now(MSK).date()
