@@ -957,50 +957,68 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
 # -----------------------------
 # UI prompt + render
 # -----------------------------
-def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, prev_snap: Optional[Dict[str, Any]], cur_snap: Dict[str, Any]) -> str:
-    mode = (mode or "pre").lower()
-    action = (action or "overview").lower()
+def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, snapshot: Dict[str, Any]) -> str:
+    # IMPORTANT:
+    # - Return ONLY JSON (no markdown, no extra text).
+    # - Write in Russian.
+    # - Do NOT give direct betting commands (no "ставь", "бет", "точно зайдёт"). Only аналитика/сценарии.
+    # - If данных мало, честно скажи и заполни поля коротко.
+    schema = _ui_json_schema(mode=mode, action=action)
 
-    title = str(match_meta.get("title") or "Матч").strip()
-    league = str(match_meta.get("league") or "").strip()
-    sport = str(match_meta.get("sport") or "").strip()
-    match_id = str(match_meta.get("id") or "").strip()
-    status = str(match_meta.get("status") or "").strip()
-    score = str(match_meta.get("score") or "").strip()
+    guard = (
+        "Ты — спортивный аналитик (хоккей/футбол и др.). "
+        "Твоя задача: дать краткий, структурированный разбор матча на основе переданных данных. "
+        "Не выдумывай факты (составы/травмы/коэффициенты), если их нет во входе. "
+        "Пиши по-русски, деловой стиль, без воды. "
+        "Верни только JSON по схеме ниже."
+    )
 
-    head = [
-        LLM_PROMPT_PREFIX,
-        "",
-        "Ограничения: без прогнозов/советов; не использовать слова: ставь/бери/выгодно/лучше/проход/гарантия/100%.",
-        "Тон: кратко, списками, без воды.",
-        "",
-    ]
+    # Mode hints
+    if mode == "pre":
+        focus = (
+            "Фокус PRE: что важно проверить ДО матча и какие сценарии возможны. "
+            "Если есть стартовое время — упомяни окно 60–120 минут до начала для проверки составов/вратарей. "
+            "Если матч уже идёт/завершён — честно укажи это в summary."
+        )
+    else:
+        focus = (
+            "Фокус LIVE: опиши текущую ситуацию и импульс (momentum), "
+            "что мониторить в ближайшие 5–10 минут/следующий период, "
+            "и ключевые риски. "
+            "Если статус/счёт есть во входе — отрази их."
+        )
 
-    ctx = [
-        f"Матч: {title}",
-        f"Лига: {league}" if league else "",
-        f"Вид спорта: {sport}" if sport else "",
-        f"Статус: {status}" if status else "",
-        f"Счет: {score}" if score else "",
-        f"id: {match_id}",
-    ]
-    ctx = [x for x in ctx if x]
+    if action == "pro":
+        depth = (
+            "Глубже (PRO): добавь 3–6 пунктов 'pro_angles' — конкретные наблюдаемые триггеры/сигналы "
+            "(темп, удаления, броски, вратари, серия, усталость, тренды по периодам). "
+            "В поле 'bets' пиши как 'сценарии/варианты' без призывов и без уверенных обещаний."
+        )
+    else:
+        depth = (
+            "Коротко (overview): 5–10 строк суммарно, упор на практический чек-лист и риски."
+        )
 
-    meta = [
-        "",
-        f"Режим: {mode}",
-        f"Действие: {action}",
-        "",
-        "Текущий снапшот (cur):",
-        json.dumps(cur_snap, ensure_ascii=False),
-    ]
-    if prev_snap is not None:
-        meta += ["", "Предыдущий снапшот (prev):", json.dumps(prev_snap, ensure_ascii=False)]
+    payload = {
+        "match": match_meta,
+        "snapshot": snapshot,
+        "mode": mode,
+        "action": action,
+    }
 
-    schema_hint = _schema_prompt(mode, action)
-    return "\n".join(head + ctx + meta + ["", schema_hint])
-
-
+    return (
+        guard
+        + "\n\n"
+        + focus
+        + "\n"
+        + depth
+        + "\n\n"
+        + "JSON-схема (верни объект строго по ней):\n"
+        + schema
+        + "\n\n"
+        + "Входные данные (JSON):\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
 _SCHEMA_UI_PRE = """
 {
   "title": "string",
@@ -1338,5 +1356,4 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
         "• лига: <страна> | <лига> | <страница>\n"
         "• матч <match_id>\n"
     )
-
 
