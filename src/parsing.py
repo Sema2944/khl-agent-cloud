@@ -1198,6 +1198,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 # ============================================================
 # Telegram / HTTP entrypoint
 # ============================================================
+# ============================================================
+# Telegram / HTTP entrypoint
+# ============================================================
 async def run_dialog_agent(user_id: int, text: str) -> str:
     user_id = int(user_id or 0)
     raw = (text or "").strip()
@@ -1206,6 +1209,21 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
     if norm in {"ping", "/ping", "ping!", "пинг"}:
         return "pong ✅"
 
+    # UI callbacks from Telegram come like: UI:<match_id>:<pre|live>:<overview|pro|refresh|markets>
+    if norm.startswith("ui:"):
+        parts = raw.split(":")
+        if len(parts) >= 4:
+            match_id = parts[1].strip()
+            mode = parts[2].strip().lower()
+            action = parts[3].strip().lower()
+            try:
+                return await _run_ui_llm(user_id, match_id, mode, action)
+            except Exception as e:
+                logger.exception("ui command failed")
+                return f"⚠️ Ошибка UI: {type(e).__name__}: {str(e)[:160]}"
+        return "⚠️ Формат: UI:<match_id>:<pre|live>:<overview|pro|refresh|markets>"
+
+    # Debug/manual CLI format
     if norm.startswith("ui match "):
         parts = raw.split()
         if len(parts) >= 5:
@@ -1217,7 +1235,7 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
             except Exception as e:
                 logger.exception("ui command failed")
                 return f"⚠️ Ошибка UI: {type(e).__name__}: {str(e)[:160]}"
-        return "⚠️ Формат: ui match <match_id> <pre|live> <overview|pro|refresh>"
+        return "⚠️ Формат: ui match <match_id> <pre|live> <overview|pro|refresh|markets>"
 
     if "матчи сегодня" in norm:
         sport_slug = "ice-hockey"
@@ -1291,7 +1309,8 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 lines.append(f"{st} {sc}".strip())
 
             lines.append("")
-            return "\n".join(lines).strip()
+            return "
+".join(lines).strip()
 
         except Exception as e:
             logger.exception("match details failed")
@@ -1312,11 +1331,21 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
         pass
 
     return (
-        "Не понял команду.\n\n"
-        "Доступно:\n"
-        "• ping\n"
-        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]\n"
-        "• страна: <название>\n"
-        "• лига: <страна> | <лига> | <страница>\n"
-        "• матч <match_id>\n"
+        "Не понял команду.
+
+"
+        "Доступно:
+"
+        "• ping
+"
+        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]
+"
+        "• страна: <название>
+"
+        "• лига: <страна> | <лига> | <страница>
+"
+        "• матч <match_id>
+"
     )
+
+
