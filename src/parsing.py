@@ -52,28 +52,113 @@ def _llm_trip_disable(minutes: int = 20, reason: str = "quota/429") -> None:
     _LLM_DISABLED_UNTIL_TS = _now_ts() + int(minutes) * 60
 
 
-def _fallback_analysis(reason: str) -> dict:
-    return {
-        "title": "📊 Обзор рынков",
-        "summary": "AI временно недоступен — показываю базовую справку.",
-        "risks": ["Недостаточно данных для детального разбора."],
-        "disclaimer": "Аналитический материал, не является рекомендацией.",
-        "debug": {"llm_reason": reason},
-    }
+def _fallback_analysis(
+    reason: str,
+    *,
+    mode: str | None = None,
+    snapshot: dict | None = None,
+) -> dict:
+    """Fallback analysis dict (used when LLM is unavailable).
 
+    Важно: не пишем пользователю «AI недоступен». Возвращаем полезную «быструю аналитику»
+    на основе доступных данных (команды/счёт/статус/лига), чтобы бот выглядел стабильно.
+    """
+    mode = (mode or "").strip().lower()
+    snapshot = snapshot or {}
+
+    def _g(key: str, default: str = "") -> str:
+        v = snapshot.get(key)
+        return str(v).strip() if v is not None else default
+
+    home = _g("home") or _g("team_a") or "Хозяева"
+    away = _g("away") or _g("team_b") or "Гости"
+    league = _g("league")
+    country = _g("country")
+    date = _g("date")
+    status = _g("status")
+    score = _g("score")
+
+    title_prefix = "📌 Быстрый разбор"
+    if mode.startswith("pre"):
+        title_prefix = "📌 Быстрый PRE-разбор"
+    elif mode.startswith("live"):
+        title_prefix = "🟢 Быстрый LIVE-разбор"
+    elif "daily" in mode:
+        title_prefix = "🗓 Быстрый обзор дня"
+
+    title = f"{title_prefix}: {home} — {away}".strip()
+
+    meta_bits = [b for b in [league, country] if b]
+    meta = " • ".join(meta_bits)
+
+    lines = []
+    if meta:
+        lines.append(meta)
+    if date:
+        lines.append(f"🕒 {date}")
+    if score:
+        lines.append(f"Счёт: {score}")
+    if status and not score:
+        lines.append(f"Статус: {status}")
+
+    # «Псевдо-AI» советы (универсально и безопасно)
+    if mode.startswith("pre"):
+        lines += [
+            "",
+            "Что проверить перед стартом:",
+            "• составы/травмы/вратари (для хоккея — критично)",
+            "• мотивацию (турнирная ситуация, серия, дерби)",
+            "• движение линии за 60–120 минут до матча",
+            "",
+            "Риск-стоп:",
+            "• резкое падение коэффициентов без новостей — лучше пропустить",
+        ]
+    else:
+        lines += [
+            "",
+            "На что смотреть в LIVE:",
+            "• темп и моменты (счёт может не отражать игру)",
+            "• удаления/карточки и кто доминирует",
+            "• реакция коэффициентов на ключевые события",
+            "",
+            "Риск-стоп:",
+            "• не «догонять» после серии минусов",
+            "• если данных мало — дождаться паузы/следующего отрезка",
+        ]
+
+    return {
+        "title": title,
+        "summary": "\n".join(lines).strip(),
+        "risks": [
+            "Не ставьте на эмоциях и не увеличивайте сумму после неудач.",
+            "Если информации мало или линия ведёт себя странно — пропускайте матч.",
+        ],
+        "cta": "Хочешь — нажми «Обновить LIVE» через пару минут, данные могут подтянуться.",
+        "disclaimer": "Аналитический материал, не является рекомендацией.",
+        "_fallback": True,
+        "_reason": reason,
+    }
 
 async def analyze_with_llm_cached_safe(*args, **kwargs):
     """
     Обертка над analyze_with_llm_cached:
     - если недавно был quota/429 -> не зовем OpenAI
     - если получили quota/429 -> ставим блок на N минут и возвращаем fallback
+
+    Дополнительно: kwargs могут содержать mode/snapshot для качественного fallback.
     """
     global _LLM_DISABLED_UNTIL_TS, _LLM_DISABLED_REASON
+
+    mode = kwargs.get("mode")
+    snapshot = kwargs.get("snapshot")
 
     now = int(time.time())
     if now < _LLM_DISABLED_UNTIL_TS:
         reason = _LLM_DISABLED_REASON or "llm_cooldown_active"
-        return _fallback_analysis(reason), {"llm_disabled": True, "reason": reason}
+        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
+            "llm_disabled": True,
+            "reason": reason,
+        }
 
     try:
         return await analyze_with_llm_cached(*args, **kwargs)
@@ -81,11 +166,17 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
         if _is_quota_error(e):
             _LLM_DISABLED_REASON = f"quota/429: {str(e)[:180]}"
             _LLM_DISABLED_UNTIL_TS = int(time.time()) + 20 * 60
-            return _fallback_analysis(_LLM_DISABLED_REASON), {
+            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=snapshot), {
                 "llm_disabled": True,
                 "reason": _LLM_DISABLED_REASON,
             }
-        raise
+        # прочие ошибки — тоже даём fallback, чтобы UI не «падал»
+        reason = f"{type(e).__name__}: {str(e)[:180]}"
+        logger.warning("LLM failed (non-quota), using fallback: %s", reason)
+        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
+            "llm_disabled": True,
+            "reason": reason,
+        }
 
 
 ADMIN_TELEGRAM_ID = int((os.getenv("ADMIN_TELEGRAM_ID") or "0").strip() or 0)
@@ -661,42 +752,46 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
     return None
 
 
-
-
 def _format_status_and_score(status: str, score: str) -> Tuple[str, str]:
-    """Convert raw API status/score to simple Russian labels.
+    """Return (status_label, score_label) in Russian-friendly form.
 
-    Used across cards, lists, PRE/LIVE texts.
+    We keep it short for Telegram cards:
+      - ✅ Завершён
+      - 🟢 Идёт
+      - ⏳ Скоро
+      - ⏸ Перенесён / Отменён
     """
-    s = (status or "").strip()
-    s_norm = s.lower().replace(" ", "").replace("-", "").replace("_", "")
-
+    s = (status or "").strip().lower()
     sc = (score or "").strip()
-    # remove common suffixes like "(FT)", "FT", etc.
-    sc = sc.replace("(FT)", "").replace("FT", "").strip()
 
-    # status buckets
-    finished = {"finished", "ended", "final", "completed", "ft", "afterextratime", "afterpenalties"}
-    live = {"inprogress", "live", "playing", "1st", "2nd", "3rd", "ot", "overtime", "pen", "penalties", "period1", "period2", "period3"}
-    not_started = {"notstarted", "scheduled", "upcoming", "ns", "fixture", "pending"}
-    postponed = {"postponed", "delayed", "suspended", "interrupted", "paused"}
-    canceled = {"canceled", "cancelled", "abandoned"}
+    # Normalize a few common vendor statuses
+    is_live = any(x in s for x in ("live", "1h", "2h", "3h", "ot", "so", "in progress", "playing"))
+    is_finished = any(x in s for x in ("finished", "ft", "ended", "closed", "final"))
+    is_postponed = any(x in s for x in ("postponed", "delayed", "suspended"))
+    is_canceled = any(x in s for x in ("canceled", "cancelled"))
+    is_scheduled = any(x in s for x in ("not started", "ns", "scheduled", "upcoming", "tbd"))
 
-    if s_norm in finished:
-        return "✅ Завершён", sc
-    if s_norm in live:
-        return "🟢 Идёт", sc
-    if s_norm in postponed:
-        return "⏸ Перерыв/пауза", sc
-    if s_norm in canceled:
-        return "⛔ Отменён", sc
-    if s_norm in not_started or not s_norm:
-        # for empty status we treat as scheduled
-        return "⏳ Скоро", sc
+    if is_live:
+        status_label = "🟢 Идёт"
+    elif is_finished:
+        status_label = "✅ Завершён"
+    elif is_postponed:
+        status_label = "⏸ Перенесён"
+    elif is_canceled:
+        status_label = "⛔ Отменён"
+    elif is_scheduled or not s:
+        status_label = "⏳ Скоро"
+    else:
+        # Fallback: show original status (uppercased) but without noise
+        status_label = status.strip().upper()[:32] if status else ""
 
-    # fallback: keep original but in RU-friendly form
-    return f"ℹ️ {s}", sc
-
+    # Score label
+    score_label = sc
+    if score_label and is_finished:
+        # If provider doesn't include FT marker, add a short Russian one
+        if "ft" not in score_label.lower() and "ф" not in score_label.lower():
+            score_label = f"{score_label} (ФТ)"
+    return status_label, score_label
 
 def _live_no_change_text(match_meta: Dict[str, Any], action: str) -> str:
     title = str(match_meta.get("title") or "Матч").strip()
@@ -1051,6 +1146,8 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 schema=schema,
                 ttl_s=int(ttl_s),
                 user_id=user_id,
+                mode=mode,
+                snapshot=snapshot,
             )
             _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
@@ -1081,6 +1178,8 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         schema=schema,
         ttl_s=int(ttl_s),
         user_id=user_id,
+        mode=mode,
+        snapshot=snapshot,
     )
 
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
@@ -1191,6 +1290,7 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
             if st or sc:
                 lines.append(f"{st} {sc}".strip())
 
+            lines.append("")
             return "\n".join(lines).strip()
 
         except Exception as e:
