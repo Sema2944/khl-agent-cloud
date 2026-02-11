@@ -957,6 +957,29 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
 # -----------------------------
 # UI prompt + render
 # -----------------------------
+
+def _ui_json_schema(*, mode: str, action: str) -> str:
+    """Return the JSON schema (as a string) used by the UI LLM response.
+
+    We keep schemas as triple-quoted strings so we can embed them directly into
+    prompts. This helper centralizes the routing logic and prevents NameError
+    regressions when prompt builders change.
+    """
+    m = (mode or "").strip().lower()
+    a = (action or "").strip().lower()
+
+    # LIVE PRO is a special richer schema.
+    if m == "live" and a in {"pro", "live_pro", "livepro"}:
+        return _SCHEMA_UI_LIVE_PRO
+
+    # Default LIVE schema for live/refresh/overview.
+    if m == "live":
+        return _SCHEMA_UI_LIVE
+
+    # PRE schema for everything else.
+    return _SCHEMA_UI_PRE
+
+
 def _build_ui_prompt(
     match_meta: Dict[str, Any],
     mode: str,
