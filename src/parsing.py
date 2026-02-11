@@ -155,7 +155,7 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
     now = int(time.time())
     if now < _LLM_DISABLED_UNTIL_TS:
         reason = _LLM_DISABLED_REASON or "llm_cooldown_active"
-        return _fallback_analysis(reason, mode=mode, snapshot=cur_snap), {
+        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
             "llm_disabled": True,
             "reason": reason,
         }
@@ -166,14 +166,14 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
         if _is_quota_error(e):
             _LLM_DISABLED_REASON = f"quota/429: {str(e)[:180]}"
             _LLM_DISABLED_UNTIL_TS = int(time.time()) + 20 * 60
-            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=cur_snap), {
+            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=snapshot), {
                 "llm_disabled": True,
                 "reason": _LLM_DISABLED_REASON,
             }
         # прочие ошибки — тоже даём fallback, чтобы UI не «падал»
         reason = f"{type(e).__name__}: {str(e)[:180]}"
         logger.warning("LLM failed (non-quota), using fallback: %s", reason)
-        return _fallback_analysis(reason, mode=mode, snapshot=cur_snap), {
+        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
             "llm_disabled": True,
             "reason": reason,
         }
