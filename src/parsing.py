@@ -1309,8 +1309,7 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 lines.append(f"{st} {sc}".strip())
 
             lines.append("")
-            return "
-".join(lines).strip()
+            return "\n".join(lines).strip()
 
         except Exception as e:
             logger.exception("match details failed")
@@ -1331,21 +1330,13 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
         pass
 
     return (
-        "Не понял команду.
-
-"
-        "Доступно:
-"
-        "• ping
-"
-        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]
-"
-        "• страна: <название>
-"
-        "• лига: <страна> | <лига> | <страница>
-"
-        "• матч <match_id>
-"
+        "Не понял команду.\n\n"
+        "Доступно:\n"
+        "• ping\n"
+        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]\n"
+        "• страна: <название>\n"
+        "• лига: <страна> | <лига> | <страница>\n"
+        "• матч <match_id>\n"
     )
 
 
