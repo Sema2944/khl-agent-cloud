@@ -155,7 +155,7 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
     now = int(time.time())
     if now < _LLM_DISABLED_UNTIL_TS:
         reason = _LLM_DISABLED_REASON or "llm_cooldown_active"
-        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
+        return _fallback_analysis(reason, mode=mode, snapshot=cur_snap), {
             "llm_disabled": True,
             "reason": reason,
         }
@@ -166,14 +166,14 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
         if _is_quota_error(e):
             _LLM_DISABLED_REASON = f"quota/429: {str(e)[:180]}"
             _LLM_DISABLED_UNTIL_TS = int(time.time()) + 20 * 60
-            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=snapshot), {
+            return _fallback_analysis(_LLM_DISABLED_REASON, mode=mode, snapshot=cur_snap), {
                 "llm_disabled": True,
                 "reason": _LLM_DISABLED_REASON,
             }
         # прочие ошибки — тоже даём fallback, чтобы UI не «падал»
         reason = f"{type(e).__name__}: {str(e)[:180]}"
         logger.warning("LLM failed (non-quota), using fallback: %s", reason)
-        return _fallback_analysis(reason, mode=mode, snapshot=snapshot), {
+        return _fallback_analysis(reason, mode=mode, snapshot=cur_snap), {
             "llm_disabled": True,
             "reason": reason,
         }
@@ -1147,7 +1147,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 ttl_s=int(ttl_s),
                 user_id=user_id,
                 mode=mode,
-                snapshot=snapshot,
+                snapshot=cur_snap,
             )
             _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
             base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
@@ -1179,7 +1179,7 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         ttl_s=int(ttl_s),
         user_id=user_id,
         mode=mode,
-        snapshot=snapshot,
+        snapshot=cur_snap,
     )
 
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
