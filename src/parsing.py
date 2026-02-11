@@ -957,13 +957,21 @@ def _oddsbase_snapshot(match_meta: Dict[str, Any], mode: str) -> Dict[str, Any]:
 # -----------------------------
 # UI prompt + render
 # -----------------------------
-def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, snapshot: Dict[str, Any]) -> str:
+def _build_ui_prompt(
+    match_meta: Dict[str, Any],
+    mode: str,
+    action: str,
+    prev_snapshot: Optional[Dict[str, Any]],
+    cur_snapshot: Optional[Dict[str, Any]],
+) -> str:
     # IMPORTANT:
     # - Return ONLY JSON (no markdown, no extra text).
     # - Write in Russian.
     # - Do NOT give direct betting commands (no "ставь", "бет", "точно зайдёт"). Only аналитика/сценарии.
     # - If данных мало, честно скажи и заполни поля коротко.
     schema = _ui_json_schema(mode=mode, action=action)
+    cur = cur_snapshot or {}
+    prev = prev_snapshot or {}
 
     guard = (
         "Ты — спортивный аналитик (хоккей/футбол и др.). "
@@ -1001,7 +1009,8 @@ def _build_ui_prompt(match_meta: Dict[str, Any], mode: str, action: str, snapsho
 
     payload = {
         "match": match_meta,
-        "snapshot": snapshot,
+        "snapshot": cur,
+        "prev_snapshot": prev,
         "mode": mode,
         "action": action,
     }
