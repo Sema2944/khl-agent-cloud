@@ -23,6 +23,14 @@ from .pro_db import is_pro
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# Telegram limits
+# ============================================================
+# Telegram API hard limit is 4096 UTF-8 chars for message text.
+# Keep some headroom for markdown/markup and service text.
+TELEGRAM_MAX_CHARS: int = int(os.getenv('TELEGRAM_MAX_CHARS', '3900'))
+
+
 # --- LLM cooldown (anti-spam on 429 / insufficient_quota) ---
 _LLM_DISABLED_UNTIL_TS = 0
 _LLM_DISABLED_REASON = ""
