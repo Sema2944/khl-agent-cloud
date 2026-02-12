@@ -51,6 +51,10 @@ _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 # Stores last LLM meta for UI debug / consistency (per user).
 _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
 
+# Stores last LIVE snapshot per match_id to detect changes (used in LIVE mode).
+# Structure: {match_id: {snapshot fields...}}
+_LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
+
 # Human-friendly sport labels used in UI texts (expand freely).
 API_SPORTS_LABELS: Dict[str, str] = {
     'ice-hockey': '🏒 Хоккей',
