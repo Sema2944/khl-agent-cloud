@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # Keep some headroom for markdown/markup and service text.
 TELEGRAM_MAX_CHARS: int = int(os.getenv('TELEGRAM_MAX_CHARS', '3900'))
 
+# LLM cache TTLs (seconds). Keep short for LIVE, longer for PRE.
+TTL_PRE_S: int = int(os.getenv('TTL_PRE_S', '600'))
+TTL_LIVE_S: int = int(os.getenv('TTL_LIVE_S', '45'))
+TTL_LIVE_PRO_S: int = int(os.getenv('TTL_LIVE_PRO_S', '30'))
+
 
 # --- LLM cooldown (anti-spam on 429 / insufficient_quota) ---
 _LLM_DISABLED_UNTIL_TS = 0
