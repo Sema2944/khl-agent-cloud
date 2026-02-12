@@ -34,6 +34,16 @@ TELEGRAM_MAX_CHARS: int = int(os.getenv('TELEGRAM_MAX_CHARS', '3900'))
 # --- LLM cooldown (anti-spam on 429 / insufficient_quota) ---
 _LLM_DISABLED_UNTIL_TS = 0
 _LLM_DISABLED_REASON = ""
+# ============================================================
+# In-memory per-user caches (no DB required)
+# ============================================================
+# Used to remember last selected sport and last match snapshot for UI actions.
+# Structure: {user_id: {match_id: match_meta_dict}}
+_MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
+# Structure: {user_id: sport_slug}
+_ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
+
+
 
 
 def _now_ts() -> int:
