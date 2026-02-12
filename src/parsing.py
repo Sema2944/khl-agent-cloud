@@ -55,6 +55,10 @@ _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
 # Structure: {match_id: {snapshot fields...}}
 _LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
 
+# Cache: last rendered LIVE text per (match_id, action).
+# Used to avoid re-sending identical text when provider data didn't change.
+_LIVE_RENDER_BY_MATCH: Dict[tuple, str] = {}
+
 # Human-friendly sport labels used in UI texts (expand freely).
 API_SPORTS_LABELS: Dict[str, str] = {
     'ice-hockey': '🏒 Хоккей',
