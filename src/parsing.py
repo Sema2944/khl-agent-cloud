@@ -48,6 +48,24 @@ _MATCH_CACHE_BY_USER: Dict[int, Dict[str, Dict[str, Any]]] = {}
 # Structure: {user_id: sport_slug}
 _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 
+# Stores last LLM meta for UI debug / consistency (per user).
+_LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
+
+# Human-friendly sport labels used in UI texts (expand freely).
+API_SPORTS_LABELS: Dict[str, str] = {
+    'ice-hockey': '🏒 Хоккей',
+    'football': '⚽ Футбол',
+    'basketball': '🏀 Баскетбол',
+    'tennis': '🎾 Теннис',
+    'volleyball': '🏐 Волейбол',
+    'handball': '🤾 Гандбол',
+    'baseball': '⚾ Бейсбол',
+    'mma': '🥊 MMA',
+    'boxing': '🥊 Бокс',
+    'esports': '🎮 Киберспорт',
+}
+
+
 
 
 
