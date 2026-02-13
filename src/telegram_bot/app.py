@@ -15,7 +15,6 @@ from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,6 +30,9 @@ from ..ui_text import MAIN_MENU_TEXT
 from ..user_access import allowed_sports_for_user
 
 logger = logging.getLogger(__name__)
+
+# Telegram hard limit for message text length
+TG_TEXT_LIMIT = 4096
 
 async def _edit_or_reply(
     q: Any,
