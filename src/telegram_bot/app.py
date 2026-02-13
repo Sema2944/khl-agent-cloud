@@ -14,7 +14,6 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,70 +30,21 @@ from ..user_access import allowed_sports_for_user
 
 logger = logging.getLogger(__name__)
 
-# Telegram hard limit for message text length
-TG_TEXT_LIMIT = 4096
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()
 
-# Global Telegram application instance (python-telegram-bot Application).
+# feature flags
+HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
+
+MSK = datetime.now().astimezone().tzinfo
+
+# Telegram Application
 _telegram_app: Optional[Application] = None
 
-async def _edit_or_reply(
-    q: Any,
-    text: str,
-    *,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = ParseMode.HTML,
-    disable_web_page_preview: bool = True,
-) -> None:
-    """Edit callback message when possible; otherwise send a new message.
+TG_TEXT_LIMIT = 3800
 
-    This avoids crashes on Telegram 'Message is not modified' / edit limitations.
-    """
-    if q is None:
-        return
-
-    # Prefer editing existing message (CallbackQuery)
-    msg = getattr(q, "message", None)
-    if msg is not None:
-        try:
-            await msg.edit_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-            )
-            return
-        except BadRequest as e:
-            # Common benign error when content is identical
-            if "Message is not modified" in str(e):
-                return
-            # If edit fails for any other reason, fall back to sending a new message.
-
-    # Fallback: send a new message to the chat
-    try:
-        bot = getattr(q, "bot", None)
-        chat_id = None
-        if msg is not None:
-            chat_id = getattr(msg, "chat_id", None) or getattr(getattr(msg, "chat", None), "id", None)
-        if chat_id is None:
-            chat_id = getattr(getattr(q, "from_user", None), "id", None)
-        if bot is not None and chat_id is not None:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-            )
-        elif msg is not None:
-            await msg.reply_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                disable_web_page_preview=disable_web_page_preview,
-            )
-    except Exception:
-        # As a last resort, do nothing.
-        return
 SPORT_LABELS = {
     "ice-hockey": "🏒 Хоккей",
     "football": "⚽ Футбол",
@@ -680,26 +630,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # BACK:MENU
     if data == "BACK:MENU":
-        await _edit_or_reply(q, MAIN_MENU_TEXT, reply_markup=kb_main_menu(), parse_mode=ParseMode.HTML)
+        try:
+            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        except Exception:
+            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
         return
 
     # BUY:PRO (пока без платежей — показываем инструкцию)
     if data == "BUY:PRO":
         txt = _truncate_tg(_text_buy_pro(user_id))
-        await _edit_or_reply(q, _safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        try:
+            await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
     # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
         text = "🏟 Выбери спорт:"
-        await _edit_or_reply(q, text, reply_markup=kb_sports(user_id))
+        try:
+            await q.edit_message_text(text, reply_markup=kb_sports(user_id))
+        except Exception:
+            await q.message.reply_text(text, reply_markup=kb_sports(user_id))
         return
 
     # BACK:MATCHES => вернуться на последний экран матчей
     if data == "BACK:MATCHES":
         text, kb = _nav_back_to_last(user_id)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # MENU shortcuts
@@ -711,24 +673,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "3) в матче нажми: PRE / LIVE / LIVE PRO\n\n"
             "Диагностика: llm ping, env, version, last_error"
         )
-        await _edit_or_reply(q, reply, reply_markup=kb_main_menu())
+        try:
+            await q.edit_message_text(reply, reply_markup=kb_main_menu())
+        except Exception:
+            await q.message.reply_text(reply, reply_markup=kb_main_menu())
         return
 
     if data == "MENU:STRATEGY":
         reply = await call_agent_local(user_id, "стратегия")
         txt = _truncate_tg(reply)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data == "MENU:PROFILE":
         reply = await call_agent_local(user_id, "профиль")
         txt = _truncate_tg(reply)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data == "MENU:PREMIUM":
         txt = _truncate_tg(_text_buy_pro(user_id))
-        await _edit_or_reply(q, _safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        try:
+            await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
     # SPORT_LOCKED
@@ -739,7 +713,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"🔒 {title} недоступен по твоему тарифу.\n\n"
             "Сейчас доступно: " + ", ".join(SPORT_LABELS.get(s, s) for s in DEFAULT_SPORTS)
         )
-        await _edit_or_reply(q, txt, reply_markup=kb_sports(user_id))
+        try:
+            await q.edit_message_text(txt, reply_markup=kb_sports(user_id))
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=kb_sports(user_id))
         return
 
     # SPORT
@@ -748,12 +725,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not _is_allowed_sport(user_id, sport_slug):
             title = SPORT_LABELS.get(sport_slug, sport_slug)
             txt = f"🔒 {title} недоступен по твоему тарифу."
-            await _edit_or_reply(q, txt, reply_markup=kb_sports(user_id))
+            try:
+                await q.edit_message_text(txt, reply_markup=kb_sports(user_id))
+            except Exception:
+                await q.message.reply_text(txt, reply_markup=kb_sports(user_id))
             return
 
         text, kb = await _render_sport_nav_root(user_id, sport_slug)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:COUNTRY
@@ -774,7 +757,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_leagues(user_id, ckey)
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:LEAGUE
@@ -796,7 +782,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_matches(user_id, ckey, lkey, page=1)
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=1)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # NAV:PAGE
@@ -822,7 +811,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_matches(user_id, ckey, lkey, page=page)
         kb = _kb_matches(user_id, sport_slug, ckey, lkey, page=page)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # BACK:COUNTRIES
@@ -842,7 +834,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_countries(user_id, sport_slug)
         kb = _kb_countries(user_id, sport_slug)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # BACK:LEAGUES
@@ -863,7 +858,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _text_leagues(user_id, ckey)
         kb = _kb_leagues(user_id, sport_slug, ckey)
         txt = _truncate_tg(text)
-        await _edit_or_reply(q, _safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
     # MATCH open
@@ -885,16 +883,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"матч {match_id}")
         txt = _truncate_tg(reply)
 
-        await _edit_or_reply(q, _safe_markdown(txt),
+        try:
+            await q.edit_message_text(
+                _safe_markdown(txt),
                 reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,)
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await q.message.reply_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     # UI actions
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) < 4:
-            await _edit_or_reply(q, "⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            try:
+                await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            except Exception:
+                await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
             return
 
         match_id = parts[1].strip()
@@ -904,13 +914,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
 
-        await _edit_or_reply(q, _safe_markdown(txt),
+        try:
+            await q.edit_message_text(
+                _safe_markdown(txt),
                 reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,)
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            await q.message.reply_text(
+                _safe_markdown(txt),
+                reply_markup=kb_match_hub(match_id),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         return
 
     # fallback
-    await _edit_or_reply(q, "Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+    try:
+        await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+    except Exception:
+        await q.message.reply_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
