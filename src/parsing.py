@@ -238,8 +238,18 @@ async def analyze_with_llm_cached_safe(*args, **kwargs):
         }
         return text, meta
 
-def _msk_today_date() -> date:
-    return datetime.now(MSK).date()
+def _msk_today_date():
+    """
+    Safe Moscow date resolver.
+    Never raises NameError or timezone errors.
+    """
+    try:
+        if MSK:
+            return datetime.now(MSK).date()
+        return datetime.utcnow().date()
+    except Exception:
+        return datetime.utcnow().date()
+
 
 
 def _md_escape(s: str) -> str:
