@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # Telegram hard limit for message text length
 TG_TEXT_LIMIT = 4096
 
+# Global Telegram application instance (python-telegram-bot Application).
+_telegram_app: Optional[Application] = None
+
 async def _edit_or_reply(
     q: Any,
     text: str,
