@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,64 +33,63 @@ from ..user_access import allowed_sports_for_user
 logger = logging.getLogger(__name__)
 
 async def _edit_or_reply(
-    q,
+    q: Any,
     text: str,
     *,
-    reply_markup=None,
-    parse_mode: Optional[str] = None,
-    disable_web_page_preview: Optional[bool] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = ParseMode.HTML,
+    disable_web_page_preview: bool = True,
 ) -> None:
-    """Edit callback message; if it fails, send a new message.
+    """Edit callback message when possible; otherwise send a new message.
 
-    Important: ignore 'Message is not modified' to prevent spam when the UI
-    tries to re-render the same content/markup.
+    This avoids crashes on Telegram 'Message is not modified' / edit limitations.
     """
-    await _edit_or_reply(q, text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-        )
+    if q is None:
         return
-    except BadRequest as e:
-        # Telegram returns 400 for identical content+markup.
-        if "Message is not modified" in str(e):
+
+    # Prefer editing existing message (CallbackQuery)
+    msg = getattr(q, "message", None)
+    if msg is not None:
+        try:
+            await msg.edit_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
             return
-        # Fall through and try sending a new message.
-    except Exception:
-        # Fall through and try sending a new message.
-        pass
+        except BadRequest as e:
+            # Common benign error when content is identical
+            if "Message is not modified" in str(e):
+                return
+            # If edit fails for any other reason, fall back to sending a new message.
 
+    # Fallback: send a new message to the chat
     try:
-        await q.message.reply_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-        )
+        bot = getattr(q, "bot", None)
+        chat_id = None
+        if msg is not None:
+            chat_id = getattr(msg, "chat_id", None) or getattr(getattr(msg, "chat", None), "id", None)
+        if chat_id is None:
+            chat_id = getattr(getattr(q, "from_user", None), "id", None)
+        if bot is not None and chat_id is not None:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        elif msg is not None:
+            await msg.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
     except Exception:
-        # Last resort: ignore.
+        # As a last resort, do nothing.
         return
-
-
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip()
-WEBHOOK_PATH = "/telegram/webhook"
-WEBHOOK_URL = (os.getenv("TELEGRAM_WEBHOOK_URL") or "").strip()
-
-# feature flags
-HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
-
-from zoneinfo import ZoneInfo
-
-# Moscow timezone (used for 'today' grouping in menus)
-# Can be overridden via APP_TZ env var.
-MSK = ZoneInfo(os.getenv("APP_TZ", "Europe/Moscow"))
-
-# Telegram Application
-_telegram_app: Optional[Application] = None
-
-TG_TEXT_LIMIT = 3800
-
 SPORT_LABELS = {
     "ice-hockey": "🏒 Хоккей",
     "football": "⚽ Футбол",
@@ -675,8 +675,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # BACK:MENU
     if data == "BACK:MENU":
-        try:
-            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        await _edit_or_reply(q, MAIN_MENU_TEXT, reply_markup=kb_main_menu(), parse_mode=ParseMode.HTML)
         return
 
     # BUY:PRO (пока без платежей — показываем инструкцию)
