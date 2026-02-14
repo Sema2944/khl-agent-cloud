@@ -870,6 +870,15 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
 
                 api = SportAPIClient()
                 d = await api.match_details(sport, match_id)
+                # --- DEBUG: inspect raw LIVE payload from SportAPI (if provided in MatchDTO.raw) ---
+                raw = getattr(d, "raw", None) or {}
+                if not isinstance(raw, dict):
+                    raw = {"__non_dict_raw__": type(raw).__name__}
+                logger.warning("LIVE RAW keys=%s", list(raw.keys())[:80])
+                for k in ("statistics", "stats", "events", "incidents", "periods", "time", "clock", "penalties", "shots"):
+                    if k in raw:
+                        logger.warning("RAW has %s type=%s", k, type(raw.get(k)).__name__)
+                # ------------------------------------------------------------------------------
                 merged.update(
                     {
                         "sport": getattr(d, "sport_slug", merged.get("sport") or sport),
@@ -904,6 +913,15 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
 
             api = SportAPIClient()
             d = await api.match_details(sport, match_id)
+            # --- DEBUG: inspect raw LIVE payload from SportAPI (if provided in MatchDTO.raw) ---
+            raw = getattr(d, "raw", None) or {}
+            if not isinstance(raw, dict):
+                raw = {"__non_dict_raw__": type(raw).__name__}
+            logger.warning("LIVE RAW keys=%s", list(raw.keys())[:80])
+            for k in ("statistics", "stats", "events", "incidents", "periods", "time", "clock", "penalties", "shots"):
+                if k in raw:
+                    logger.warning("RAW has %s type=%s", k, type(raw.get(k)).__name__)
+            # ------------------------------------------------------------------------------
             return {
                 "id": match_id,
                 "sport": getattr(d, "sport_slug", sport),
