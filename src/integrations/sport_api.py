@@ -31,6 +31,7 @@ SPORT_ALIASES: Dict[str, List[str]] = {
 }
 
 
+# было
 @dataclass
 class MatchDTO:
     id: str
@@ -42,6 +43,24 @@ class MatchDTO:
     score: str = ""
     country: str = ""
     odds_base: Optional[Dict[str, Any]] = None
+
+# стало
+@dataclass
+class MatchDTO:
+    id: str
+    sport_slug: str
+    title: str
+    league: str
+    status: str
+    start_time: str
+    score: str = ""
+    country: str = ""
+    odds_base: Optional[Dict[str, Any]] = None
+
+    # NEW: чтобы видеть реально что пришло
+    raw: Optional[Dict[str, Any]] = None
+    extras: Optional[Dict[str, Any]] = None
+
 
 
 @dataclass
