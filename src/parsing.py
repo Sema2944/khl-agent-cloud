@@ -1251,7 +1251,10 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 snapshot=cur_snap,
             )
             _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
-            base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
+            if isinstance(analysis, str):
+                base_txt = analysis
+            else:
+                base_txt = _render_ui_json(analysis, mode=mode, action=teaser_action)
             out = _truncate_telegram(base_txt) + _pro_teaser_footer()
 
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
@@ -1284,7 +1287,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
     )
 
     _LAST_LLM_META_BY_USER[user_id] = dict(meta or {})
-    out = _render_ui_json(analysis, mode=mode, action=action)
+    # analysis may be a plain string (fallback) or a dict (normal LLM result)
+    if isinstance(analysis, str):
+        out = analysis
+    else:
+        out = _render_ui_json(analysis, mode=mode, action=action)
 
     if trial_banner and mode == "live" and action == "pro":
         out = trial_banner + out
