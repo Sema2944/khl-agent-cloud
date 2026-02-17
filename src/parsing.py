@@ -1191,11 +1191,16 @@ def _render_ui_json(analysis: Dict[str, Any], *, mode: str, action: str) -> str:
     if not analysis:
         return "AI недоступен."
 
+    is_pro_live = (mode == "live" and action == "pro")
     title = str(analysis.get("title") or "").strip() or ("🟢 LIVE" if mode == "live" else "📊 Обзор")
     lines: list[str] = [title]
 
     if analysis.get("summary"):
         lines += ["", str(analysis["summary"]).strip()]
+
+    # PRO LIVE: live_state — текущее состояние матча
+    if is_pro_live and analysis.get("live_state"):
+        lines += ["", f"📍 {str(analysis['live_state']).strip()}"]
 
     ctx = analysis.get("context") or []
     if ctx:
@@ -1203,10 +1208,38 @@ def _render_ui_json(analysis: Dict[str, Any], *, mode: str, action: str) -> str:
         for x in ctx[:6]:
             lines.append(f"• {x}")
 
+    # PRO LIVE: key_events — ключевые события
+    key_events = analysis.get("key_events") or []
+    if is_pro_live and key_events:
+        lines += ["", "⚡ Ключевые события"]
+        for e in key_events[:5]:
+            lines.append(f"• {e}")
+
+    # PRO LIVE: pro_angles — сценарии/углы
+    pro_angles = analysis.get("pro_angles") or []
+    if is_pro_live and pro_angles:
+        lines += ["", "🎯 Сценарии"]
+        for a in pro_angles[:4]:
+            lines.append(f"• {a}")
+
+    # PRO LIVE: bets — ставки/рекомендации
+    bets = analysis.get("bets") or []
+    if is_pro_live and bets:
+        lines += ["", "💡 Рекомендации"]
+        for b in bets[:4]:
+            lines.append(f"• {b}")
+
+    # Also render insights if present (regular LIVE schema)
+    insights = analysis.get("insights") or []
+    if not is_pro_live and insights:
+        lines += ["", "💡 Инсайты"]
+        for i in insights[:4]:
+            lines.append(f"• {i}")
+
     risks = analysis.get("risks") or []
     if risks:
         lines.append("")
-        lines.append("Риски")
+        lines.append("⚠️ Риски")
         for r in risks[:6]:
             lines.append(f"• {r}")
 
