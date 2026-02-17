@@ -41,7 +41,7 @@ OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 # Можно тюнить через ENV без деплоя кода.
 LLM_MAX_TOKENS_LEGACY = int((os.getenv("LLM_MAX_TOKENS_LEGACY") or "260").strip())
 LLM_MAX_TOKENS_UI_PRE = int((os.getenv("LLM_MAX_TOKENS_UI_PRE") or "380").strip())
-LLM_MAX_TOKENS_UI_LIVE = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE") or "220").strip())
+LLM_MAX_TOKENS_UI_LIVE = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE") or "480").strip())
 LLM_MAX_TOKENS_UI_LIVE_PRO = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE_PRO") or "320").strip())
 
 # Hard safety cap (на случай неверных ENV)
