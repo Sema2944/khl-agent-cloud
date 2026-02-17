@@ -56,9 +56,11 @@ LLMOutput = Union["LLMAnalysis", Dict[str, Any]]
 _ALLOWED_VERDICTS = {"lean_yes", "lean_no", "unclear"}
 
 _BANNED_PHRASES = (
-    "ставь", "ставьте", "бери", "берите", "выгодно", "лучше", "проход", "верняк",
+    "ставь", "ставьте", "бери", "берите", "верняк",
     "гарант", "гарантия", "100%", "фикс"
 )
+# Removed overly broad words: "лучше" (="better", common sports word),
+# "выгодно" (="advantageous"), "проход" (="pass through", common in hockey)
 
 # -----------------------------
 # Per-user throttle state (process-local)
