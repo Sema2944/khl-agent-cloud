@@ -363,25 +363,6 @@ def fallback_analysis(_: str) -> LLMAnalysis:
     )
 
 
-def _fallback_ui(schema: str, reason: str) -> Dict[str, Any]:
-    if schema == "ui_live":
-        return {
-            "title": "🟢 LIVE-обзор",
-            "context": [reason],
-            "markets": [],
-            "risks": ["Недостаточно данных для детального LIVE-разбора."],
-            "disclaimer": "Аналитический материал, не является рекомендацией.",
-        }
-    return {
-        "title": "📊 Обзор рынков",
-        "summary": reason,
-        "key_factors": [],
-        "line_logic": [],
-        "risks": ["Недостаточно данных для детального разбора."],
-        "disclaimer": "Аналитический материал, не является рекомендацией.",
-    }
-
-
 def _paywall_ui_live(reason: str = "LIVE-анализ доступен в Premium.") -> Dict[str, Any]:
     return {
         "title": "🟢 LIVE-обзор — Premium",
