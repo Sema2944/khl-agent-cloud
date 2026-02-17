@@ -35,6 +35,12 @@ def run_pro_engine(
         # 1) Normalize
         snapshot = build_snapshot(raw, odds_raw, match_meta)
 
+        # Finished match — show summary instead of scenarios
+        status_raw = (snapshot.get("status") or "").lower().strip()
+        _FINISHED_STATES = {"finished", "ft", "ended", "completed", "final", "after et", "after so", "after ot"}
+        if status_raw in _FINISHED_STATES or "finish" in status_raw:
+            return _render_finished(snapshot)
+
         # 2) Signals (with prev snapshot for deltas)
         prev_eng_snap = None
         if isinstance(prev_snapshot, dict) and prev_snapshot.get("_pro_engine"):
@@ -62,3 +68,32 @@ def run_pro_engine(
     except Exception:
         logger.exception("PRO engine run_pro_engine failed")
         return "🟢 LIVE PRO\n\nОшибка движка — попробуй позже.\n\nℹ️ Аналитический материал."
+
+
+def _render_finished(snapshot: Dict[str, Any]) -> str:
+    """Short summary for a finished match — no scenarios needed."""
+    teams = snapshot.get("teams") or {}
+    home = teams.get("home") or "Хозяева"
+    away = teams.get("away") or "Гости"
+    score = snapshot.get("score") or {}
+    s_h = score.get("home")
+    s_a = score.get("away")
+    score_txt = f"{s_h}:{s_a}" if (s_h is not None and s_a is not None) else "–:–"
+
+    league = snapshot.get("league") or ""
+    country = snapshot.get("country") or ""
+    league_line = " • ".join(p for p in [league, country] if p)
+
+    lines = [
+        "📋 Матч завершён",
+        "",
+        f"{home} — {away}",
+    ]
+    if league_line:
+        lines.append(league_line)
+    lines += [
+        f"Итог: {score_txt}",
+        "",
+        "ℹ️ LIVE PRO доступен только для матчей в процессе.",
+    ]
+    return "\n".join(lines)
