@@ -1212,17 +1212,29 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         return out
 
     trial_banner = ""
-    if mode == "live" and action == "pro" and not is_pro(user_id):
-        trial_used = False
-        with db_session() as session:
-            trial_used = _trial_live_used(session, user_id)
-            if not trial_used:
-                if _consume_trial_live(session, user_id):
-                    trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
-                else:
-                    trial_used = True
+    if mode == "live" and action == "pro":
+        # DB may be unavailable — never let DB errors kill LIVE response
+        try:
+            user_is_pro = is_pro(user_id)
+        except Exception:
+            logger.exception("is_pro DB error — defaulting to non-PRO, trial allowed through")
+            user_is_pro = False
 
-        if trial_used:
+        if not user_is_pro:
+            trial_used = False
+            try:
+                with db_session() as session:
+                    trial_used = _trial_live_used(session, user_id)
+                    if not trial_used:
+                        if _consume_trial_live(session, user_id):
+                            trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
+                        else:
+                            trial_used = True
+            except Exception:
+                logger.exception("DB unavailable for trial LIVE check — allowing LIVE PRO (trial not deducted)")
+                trial_used = False  # DB down → пропускаем пользователя, не ломаем ответ
+
+        if not user_is_pro and trial_used:
             teaser_action = "overview"
             prompt = _build_ui_prompt(match_meta, mode, teaser_action, prev_snap, cur_snap)
             cache_key = f"v16:ui:{sport_slug}:{match_id}:{mode}:{teaser_action}"
