@@ -1026,11 +1026,10 @@ def _build_ui_prompt(
     prev_snapshot: Optional[Dict[str, Any]],
     cur_snapshot: Optional[Dict[str, Any]],
 ) -> str:
-    # IMPORTANT:
-    # - Return ONLY JSON (no markdown, no extra text).
-    # - Write in Russian.
-    # - Do NOT give direct betting commands (no "ставь", "бет", "точно зайдёт"). Only аналитика/сценарии.
-    # - If данных мало, честно скажи и заполни поля коротко.
+    # PRO LIVE mode: используем hybrid engine (features + signals)
+    if mode == "live" and action == "pro":
+        return _build_pro_live_prompt(match_meta, prev_snapshot, cur_snapshot)
+
     schema = _ui_json_schema(mode=mode, action=action)
     cur = cur_snapshot or {}
     prev = prev_snapshot or {}
@@ -1043,7 +1042,6 @@ def _build_ui_prompt(
         "Верни только JSON по схеме ниже."
     )
 
-    # Mode hints
     if mode == "pre":
         focus = (
             "Фокус PRE: что важно проверить ДО матча и какие сценарии возможны. "
@@ -1058,16 +1056,7 @@ def _build_ui_prompt(
             "Если статус/счёт есть во входе — отрази их."
         )
 
-    if action == "pro":
-        depth = (
-            "Глубже (PRO): добавь 3–6 пунктов 'pro_angles' — конкретные наблюдаемые триггеры/сигналы "
-            "(темп, удаления, броски, вратари, серия, усталость, тренды по периодам). "
-            "В поле 'bets' пиши как 'сценарии/варианты' без призывов и без уверенных обещаний."
-        )
-    else:
-        depth = (
-            "Коротко (overview): 5–10 строк суммарно, упор на практический чек-лист и риски."
-        )
+    depth = "Коротко (overview): 5–10 строк суммарно, упор на практический чек-лист и риски."
 
     payload = {
         "match": match_meta,
@@ -1089,6 +1078,67 @@ def _build_ui_prompt(
         + "\n\n"
         + "Входные данные (JSON):\n"
         + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+def _build_pro_live_prompt(
+    match_meta: Dict[str, Any],
+    prev_snapshot: Optional[Dict[str, Any]],
+    cur_snapshot: Optional[Dict[str, Any]],
+) -> str:
+    """Hybrid PRO prompt: features + rule engine signals + LLM структурирование."""
+    try:
+        from .live_features import extract_live_features, build_live_signals, format_features_for_prompt
+        raw = match_meta.get("raw") or {}
+        odds_raw = (cur_snapshot or {}).get("odds") or {}
+        if isinstance(odds_raw, dict) and odds_raw.get("markets"):
+            pass  # уже норм
+        else:
+            odds_raw = match_meta.get("odds_base") or {}
+        features = extract_live_features(raw, odds_raw, match_meta)
+        signals = build_live_signals(features)
+        features_text = format_features_for_prompt(features, signals, match_meta)
+    except Exception:
+        logger.exception("PRO live_features extraction failed, using basic context")
+        features_text = "Статистические данные недоступны — используй только переданный контекст матча."
+        signals = {}
+
+    title = str(match_meta.get("title") or "Матч").strip()
+    league = str(match_meta.get("league") or "").strip()
+    status = str(match_meta.get("status") or "").strip()
+    score = str(match_meta.get("score") or "").strip()
+
+    system_guard = (
+        "Ты профессиональный live-аналитик.\n"
+        "Правила:\n"
+        "– Используй ТОЛЬКО переданные цифры и сигналы, не придумывай данные\n"
+        "– Не пересказывай очевидное (счёт, время) без аналитики\n"
+        "– Не пиши общие фразы ('стоит следить', 'возможно')\n"
+        "– Дай максимум 2–3 конкретных сценария\n"
+        "– Обязательно добавь риск-план (условие отмены сценария)\n"
+        "– Пиши по-русски, деловой стиль, коротко\n"
+        "– Верни только JSON по схеме ниже"
+    )
+
+    schema = _SCHEMA_UI_LIVE_PRO
+
+    context_block = "\n".join(filter(None, [
+        f"Матч: {title}",
+        f"Лига: {league}" if league else "",
+        f"Статус: {status}" if status else "",
+        f"Счёт: {score}" if score else "",
+        "",
+        features_text,
+    ]))
+
+    return (
+        system_guard
+        + "\n\n"
+        + "JSON-схема:\n"
+        + schema
+        + "\n\n"
+        + "Данные матча:\n"
+        + context_block
     )
 _SCHEMA_UI_PRE = """
 {
