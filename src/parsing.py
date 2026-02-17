@@ -1345,6 +1345,31 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                 _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
             return out
 
+    # ── PRO LIVE: deterministic engine (no LLM) ──────────────────────────────
+    if mode == "live" and action == "pro":
+        try:
+            from .pro_engine import run_pro_engine
+            prev_eng_snap = None
+            if isinstance(prev_snap, dict) and prev_snap.get("_pro_engine"):
+                prev_eng_snap = prev_snap["_pro_engine"]
+            out = run_pro_engine(
+                match_meta,
+                prev_snapshot={"_pro_engine": prev_eng_snap} if prev_eng_snap else None,
+                cur_snapshot={"odds": match_meta.get("odds_base") or {}},
+            )
+        except Exception:
+            logger.exception("run_pro_engine failed — fallback to LLM")
+            out = None
+
+        if out:
+            if trial_banner:
+                out = trial_banner + out
+            _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
+            _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
+            return out
+        # If PRO engine fails fall through to LLM below
+
+    # ── LLM path (overview / pre / fallback) ─────────────────────────────────
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
 
     if mode == "live":
