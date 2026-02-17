@@ -1290,9 +1290,8 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         cached = _LIVE_RENDER_BY_MATCH.get((match_id, action))
         if cached:
             return cached
-        out = _live_no_change_text(match_meta, action)
-        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
-        return out
+        # No cached render for THIS action (e.g. user switched from overview → pro).
+        # Fall through to LLM — don't short-circuit on first request for a new action.
 
     trial_banner = ""
     if mode == "live" and action == "pro":
