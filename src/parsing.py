@@ -1340,7 +1340,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
             out = _truncate_telegram(base_txt) + _pro_teaser_footer()
 
             _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
-            _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
+            # Only cache teaser if LLM succeeded — don't cache fallback renders
+            if not (meta or {}).get("used_fallback"):
+                _LIVE_RENDER_BY_MATCH[(match_id, teaser_action)] = out
             return out
 
     prompt = _build_ui_prompt(match_meta, mode, action, prev_snap, cur_snap)
@@ -1380,7 +1382,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     if mode == "live":
         _LIVE_SNAPSHOT_BY_MATCH[match_id] = cur_snap
-        _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
+        # Only cache successful renders — never cache fallback ("AI недоступен") text
+        if not (meta or {}).get("used_fallback"):
+            _LIVE_RENDER_BY_MATCH[(match_id, action)] = out
 
     return out
 
