@@ -196,32 +196,17 @@ def _as_str_list(v: Any, max_len: int = 5) -> list[str]:
 def _normalize_ui_obj(schema: str, obj: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(obj or {})
 
-    title = str(out.get("title") or "").strip()
-    if not title:
-        out["title"] = "🟢 LIVE-обзор" if schema == "ui_live" else "📊 Обзор рынков"
+    # Ensure title and disclaimer always present
+    if not str(out.get("title") or "").strip():
+        out["title"] = "🟢 LIVE-обзор" if "live" in (schema or "") else "📊 Обзор рынков"
 
-    disclaimer = str(out.get("disclaimer") or "").strip()
-    if not disclaimer:
+    if not str(out.get("disclaimer") or "").strip():
         out["disclaimer"] = "Аналитический материал, не является рекомендацией."
 
-    if "risks" in out and not isinstance(out["risks"], list):
-        out["risks"] = _as_str_list(out.get("risks"), max_len=6)
-
-    if schema == "ui_live":
-        if "context" in out and not isinstance(out["context"], list):
-            out["context"] = _as_str_list(out.get("context"), max_len=6)
-        mk = out.get("markets")
-        if mk is None or not isinstance(mk, list):
-            out["markets"] = []
-    else:
-        if "key_factors" in out and not isinstance(out["key_factors"], list):
-            out["key_factors"] = _as_str_list(out.get("key_factors"), max_len=6)
-        if "line_logic" in out and not isinstance(out["line_logic"], list):
-            out["line_logic"] = _as_str_list(out.get("line_logic"), max_len=6)
-
-        summary = str(out.get("summary") or "").strip()
-        if not summary and not out.get("key_factors") and not out.get("line_logic"):
-            out["summary"] = "Короткий разбор недоступен — показываю базовую структуру."
+    # Normalize list fields if present but wrong type
+    for list_field in ("risks", "context", "key_events", "insights", "pro_angles", "bets", "key_factors", "line_logic"):
+        if list_field in out and not isinstance(out[list_field], list):
+            out[list_field] = _as_str_list(out.get(list_field), max_len=6)
 
     return out
 
@@ -345,54 +330,12 @@ def validate_ui_json(schema: str, obj: Any) -> Tuple[bool, Optional[Dict[str, An
     if not title:
         return False, None, "title is empty"
 
-    disclaimer = str(obj.get("disclaimer", "")).strip()
-    if not disclaimer:
-        return False, None, "disclaimer is empty"
-
-    risks = _as_str_list(obj.get("risks"), max_len=6)
-
-    if schema == "ui_live":
-        context = _as_str_list(obj.get("context"), max_len=6)
-        markets = obj.get("markets") or []
-        if not isinstance(markets, list):
-            return False, None, "markets is not list"
-
-        mk_out: list[dict] = []
-        for it in markets[:4]:
-            if not isinstance(it, dict):
-                continue
-            name = str(it.get("name", "")).strip() or "Market"
-            direction = str(it.get("direction", "")).strip() or "unknown"
-            logic = str(it.get("logic", "")).strip()
-            mk_out.append({"name": name, "direction": direction, "logic": logic})
-
-        if not context and not mk_out:
-            return False, None, "context and markets are empty"
-
-        return True, {
-            "title": title,
-            "context": context,
-            "markets": mk_out,
-            "risks": risks,
-            "disclaimer": disclaimer,
-        }, "ok"
-
-    # ui_pre
-    summary = str(obj.get("summary", "")).strip()
-    key_factors = _as_str_list(obj.get("key_factors"), max_len=6)
-    line_logic = _as_str_list(obj.get("line_logic"), max_len=6)
-
-    if not summary and not key_factors and not line_logic:
-        return False, None, "summary/key_factors/line_logic are empty"
-
-    return True, {
-        "title": title,
-        "summary": summary,
-        "key_factors": key_factors,
-        "line_logic": line_logic,
-        "risks": risks,
-        "disclaimer": disclaimer,
-    }, "ok"
+    # Pass through all fields the LLM returned — parsing.py uses its own richer schema
+    # (summary, live_state, key_events, insights, pro_angles, bets) which differs from
+    # the legacy ui_live schema (context, markets). Accept both by returning obj as-is
+    # after normalisation, as long as title exists.
+    out = _normalize_ui_obj(schema, obj)
+    return True, out, "ok"
 
 
 # -----------------------------
