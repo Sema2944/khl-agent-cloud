@@ -43,6 +43,11 @@ class MatchDTO:
     country: str = ""
     odds_base: Optional[Dict[str, Any]] = None
 
+    # NEW: чтобы видеть реально что пришло
+    raw: Optional[Dict[str, Any]] = None
+    extras: Optional[Dict[str, Any]] = None
+
+
 
 @dataclass
 class OddsSnapshot:
@@ -389,7 +394,12 @@ class SportAPIClient:
             score=str(score or "").strip(),
             country=str(country or "").strip() or "Other",
             odds_base=odds_base if isinstance(odds_base, dict) else None,
+
+            # NEW:
+            raw=raw,        # ← вот это главное
+            extras=None,
         )
+
 
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
         sport_slug = (sport_slug or "").strip().lower()
@@ -484,6 +494,48 @@ class SportAPIClient:
                     last_err = e
 
         raise SportAPIError(f"match_details failed: {sport_slug}/{match_id}: {last_err}")
+
+    async def match_extras(self, sport_slug: str, match_id: str) -> Dict[str, Any]:
+        """
+        Пытаемся вытащить лайв-статистику/ивенты разными путями.
+        Ничего не ломаем: возвращаем dict со всеми успешными источниками.
+        """
+        sport_slug = (sport_slug or "").strip().lower()
+        match_id = str(match_id or "").strip()
+        if not sport_slug or not match_id:
+            raise SportAPIError("match_extras: missing sport_slug or match_id")
+
+        candidates_tpl = [
+            "/v2/{sport}/matches/{id}/statistics",
+            "/v2/{sport}/matches/{id}/stats",
+            "/v2/{sport}/matches/{id}/events",
+            "/v2/{sport}/events/{id}/statistics",
+            "/v2/{sport}/events/{id}/incidents",
+            "/v2/{sport}/match/{id}/statistics",
+            "/v2/{sport}/event/{id}/statistics",
+            "/v2/{sport}/game/{id}/statistics",
+        ]
+
+        sports = [sport_slug] + [s for s in SPORT_ALIASES.get(sport_slug, []) if s != sport_slug]
+
+        out: Dict[str, Any] = {}
+        last_err: Optional[Exception] = None
+
+        for s in sports:
+            for tpl in candidates_tpl:
+                path = tpl.format(sport=s, id=match_id)
+                try:
+                    data = await self._get_json(path)
+                    # сохраняем как есть, чтобы видеть структуру провайдера
+                    out[path] = data
+                except Exception as e:
+                    last_err = e
+
+        return {
+            "sources": out,
+            "last_error": str(last_err) if last_err else "",
+        }
+
 
     async def match_odds(self, sport_slug: str, match_id: str) -> OddsSnapshot:
         sport_slug = (sport_slug or "").strip().lower()
