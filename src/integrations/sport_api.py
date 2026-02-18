@@ -435,6 +435,85 @@ class SportAPIClient:
         Currently api-sport.ru only works for ice-hockey."""
         return sport_slug in {"ice-hockey", "hockey"}
 
+    async def _fetch_football_data_org(self, day: date) -> List[MatchDTO]:
+        """
+        Fetch football matches from football-data.org (free tier).
+        Covers: PL, BL1, PD, SA, FL1, CL, ELC, DED, PPL.
+        Free: 10 req/min, current season included.
+        """
+        api_key = _env("FOOTBALL_DATA_KEY")
+        if not api_key:
+            logger.warning("football-data.org: FOOTBALL_DATA_KEY not set")
+            return []
+
+        day_s = day.isoformat()
+        url = "https://api.football-data.org/v4/matches"
+        headers = {"X-Auth-Token": api_key}
+        params = {"dateFrom": day_s, "dateTo": day_s}
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, headers=headers, params=params)
+
+                if resp.status_code != 200:
+                    body = (resp.text or "")[:300]
+                    logger.warning("football-data.org: HTTP %d: %s", resp.status_code, body)
+                    return []
+
+                data = resp.json()
+                matches_raw = data.get("matches") or []
+                logger.info("football-data.org: %d matches on %s", len(matches_raw), day_s)
+
+                result: List[MatchDTO] = []
+                for m in matches_raw:
+                    try:
+                        mid = str(m.get("id", "unknown"))
+                        home_obj = m.get("homeTeam") or {}
+                        away_obj = m.get("awayTeam") or {}
+                        home = home_obj.get("shortName") or home_obj.get("name") or "Home"
+                        away = away_obj.get("shortName") or away_obj.get("name") or "Away"
+
+                        comp = m.get("competition") or {}
+                        league = comp.get("name") or ""
+                        country = (comp.get("area") or {}).get("name") or ""
+
+                        status_raw = (m.get("status") or "").upper()
+                        status_map = {
+                            "SCHEDULED": "NS", "TIMED": "NS", "IN_PLAY": "LIVE",
+                            "PAUSED": "HT", "FINISHED": "FT", "POSTPONED": "PST",
+                            "CANCELLED": "CANC", "SUSPENDED": "SUSP",
+                        }
+                        status = status_map.get(status_raw, status_raw)
+
+                        start_time = m.get("utcDate") or ""
+
+                        score_obj = m.get("score") or {}
+                        ft = score_obj.get("fullTime") or {}
+                        score = ""
+                        if ft.get("home") is not None and ft.get("away") is not None:
+                            score = f"{ft['home']}:{ft['away']}"
+
+                        result.append(MatchDTO(
+                            id=mid,
+                            sport_slug="football",
+                            title=f"{home} — {away}",
+                            league=league,
+                            status=status,
+                            start_time=start_time,
+                            score=score,
+                            country=country,
+                            raw=m,
+                        ))
+                    except Exception:
+                        continue
+
+                logger.info("football-data.org: parsed %d matches", len(result))
+                return result
+
+        except Exception:
+            logger.exception("football-data.org: request failed")
+            return []
+
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
         sport_slug = (sport_slug or "").strip().lower()
         if not sport_slug:
@@ -443,7 +522,29 @@ class SportAPIClient:
         day_s = day.isoformat()
         last_err: Optional[Exception] = None
 
-        # ── For non-hockey sports: go DIRECTLY to api-sports.io ──
+        # ── Football: use football-data.org (free, current season) ──
+        if sport_slug == "football":
+            try:
+                fd_matches = await self._fetch_football_data_org(day)
+                if fd_matches:
+                    logger.info("SportAPI football-data.org OK: n=%d", len(fd_matches))
+                    return fd_matches
+            except Exception as e:
+                logger.warning("football-data.org failed: %s", e)
+
+            # Fallback to api-sports.io if football-data.org fails
+            try:
+                fallback_matches = await self._fallback_api_sports(sport_slug, day)
+                if fallback_matches:
+                    return fallback_matches
+            except Exception as fb_err:
+                last_err = fb_err
+
+            if last_err:
+                raise SportAPIError(f"matches_by_date failed for football {day_s}: {last_err}")
+            raise SportAPIError(f"matches_by_date: no matches for football on {day_s}")
+
+        # ── For other non-hockey sports: go to api-sports.io ──
         if not self._is_primary_api_sport(sport_slug):
             try:
                 fallback_matches = await self._fallback_api_sports(sport_slug, day)
