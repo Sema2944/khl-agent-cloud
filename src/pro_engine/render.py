@@ -44,12 +44,27 @@ def render_pro_message(
         if status_line:
             lines.append(status_line)
 
+        # ── Rule 1: confidence < 2 → insufficient data message ──
+        conf = signals.get("confidence") or {}
+        conf_val = conf.get("value", 1)
+        if conf_val < 2:
+            lines.append("")
+            lines.append("⚠️ Недостаточно данных для полного анализа.")
+            lines.append("")
+            lines.append("LIVE PRO требует бросков и/или коэффициентов.")
+            lines.append("Данные обновятся по ходу матча — попробуй позже.")
+            lines.append("")
+            lines.append("👉 Пока посмотри PRE-анализ (доступен до матча и во время).")
+            lines.append("")
+            lines.append(_DISCLAIMER)
+            return "\n".join(lines)
+
         # ── 📊 Control (MCI) ────────────────────────────────
         mci = signals.get("mci") or {}
-        if mci.get("inputs_used"):
+        mci_val = mci.get("value")
+        if mci_val is not None and mci.get("inputs_used"):
             lines.append("")
             lines.append("📊 Control")
-            mci_val = mci.get("value", 50)
             mci_winner = mci.get("winner", "–")
             mci_explain = mci.get("explain", "")
             bullet = f"• MCI: {mci_val}/100 → {mci_winner}"
@@ -125,17 +140,19 @@ def render_pro_message(
 
         # ── 🛡 Risk / Confidence ─────────────────────────────
         risk = signals.get("risk") or {}
-        conf = signals.get("confidence") or {}
         data_flags = signals.get("data_flags") or {}
 
         risk_val = risk.get("value", "–")
-        conf_val = conf.get("value", "–")
         risk_factors = risk.get("factors") or []
+        conf_explain = conf.get("explain", "")
 
         lines.append("")
         lines.append("🛡 Risk / Confidence")
         lines.append(f"• Risk: {risk_val}/5{' — ' + '; '.join(risk_factors) if risk_factors else ''}")
-        lines.append(f"• Confidence: {conf_val}/5")
+        conf_line = f"• Confidence: {conf_val}/5"
+        if conf_explain:
+            conf_line += f" ({conf_explain})"
+        lines.append(conf_line)
 
         # Data availability line
         have = [k for k, v in data_flags.items() if v]
