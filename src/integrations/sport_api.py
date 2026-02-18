@@ -435,6 +435,97 @@ class SportAPIClient:
         Currently api-sport.ru only works for ice-hockey."""
         return sport_slug in {"ice-hockey", "hockey"}
 
+    async def _fetch_basketball_espn(self, day: date) -> List[MatchDTO]:
+        """
+        Fetch NBA games from ESPN public API (free, no key required).
+        Covers: NBA regular season + playoffs (~5-15 games/day Oct-Jun).
+        """
+        day_s = day.strftime("%Y%m%d")  # ESPN uses YYYYMMDD
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+        params = {"dates": day_s}
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, params=params)
+
+                if resp.status_code != 200:
+                    body = (resp.text or "")[:300]
+                    logger.warning("ESPN NBA: HTTP %d: %s", resp.status_code, body)
+                    return []
+
+                data = resp.json()
+                events = data.get("events") or []
+                logger.info("ESPN NBA: %d events on %s", len(events), day.isoformat())
+
+                result: List[MatchDTO] = []
+                for ev in events:
+                    try:
+                        mid = str(ev.get("id", "unknown"))
+                        comps = ev.get("competitions") or []
+                        if not comps:
+                            continue
+                        comp = comps[0]
+
+                        competitors = comp.get("competitors") or []
+                        home = away = "TBD"
+                        home_score = away_score = None
+                        for c in competitors:
+                            team = c.get("team") or {}
+                            name = (
+                                team.get("shortDisplayName")
+                                or team.get("displayName")
+                                or team.get("name")
+                                or "TBD"
+                            )
+                            if c.get("homeAway") == "home":
+                                home = name
+                                home_score = c.get("score")
+                            else:
+                                away = name
+                                away_score = c.get("score")
+
+                        # Status
+                        status_obj = comp.get("status") or {}
+                        status_type = status_obj.get("type") or {}
+                        status_name = status_type.get("name") or ""
+                        status_map = {
+                            "STATUS_SCHEDULED": "NS",
+                            "STATUS_IN_PROGRESS": "LIVE",
+                            "STATUS_HALFTIME": "HT",
+                            "STATUS_FINAL": "FT",
+                            "STATUS_POSTPONED": "PST",
+                            "STATUS_CANCELED": "CANC",
+                            "STATUS_END_PERIOD": "LIVE",
+                        }
+                        status = status_map.get(status_name, status_name)
+
+                        start_time = ev.get("date") or ""
+
+                        score = ""
+                        if home_score is not None and away_score is not None:
+                            score = f"{home_score}:{away_score}"
+
+                        result.append(MatchDTO(
+                            id=mid,
+                            sport_slug="basketball",
+                            title=f"{home} — {away}",
+                            league="NBA",
+                            status=status,
+                            start_time=start_time,
+                            score=score,
+                            country="USA",
+                            raw=ev,
+                        ))
+                    except Exception:
+                        continue
+
+                logger.info("ESPN NBA: parsed %d matches", len(result))
+                return result
+
+        except Exception:
+            logger.exception("ESPN NBA: request failed")
+            return []
+
     async def _fetch_football_data_org(self, day: date) -> List[MatchDTO]:
         """
         Fetch football matches from football-data.org (free tier).
@@ -521,6 +612,27 @@ class SportAPIClient:
 
         day_s = day.isoformat()
         last_err: Optional[Exception] = None
+
+        # ── Basketball: use ESPN public API (free, no key) ──
+        if sport_slug == "basketball":
+            try:
+                espn_matches = await self._fetch_basketball_espn(day)
+                logger.info("SportAPI ESPN NBA: n=%d", len(espn_matches))
+                return espn_matches  # even 0 is OK — no games on some days
+            except Exception as e:
+                logger.warning("ESPN NBA failed: %s", e)
+                last_err = e
+
+            # Fallback to api-sports.io
+            try:
+                fallback_matches = await self._fallback_api_sports(sport_slug, day)
+                if fallback_matches:
+                    return fallback_matches
+            except Exception as fb_err:
+                last_err = fb_err
+
+            logger.info("basketball: no matches on %s (normal for off-days)", day_s)
+            return []
 
         # ── Football: use football-data.org (free, current season) ──
         if sport_slug == "football":
