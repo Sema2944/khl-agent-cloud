@@ -126,7 +126,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Баскетбол",
         "slug": "basketball",
         "bot_slug": "basketball",
-        "enabled": False,  # disabled: api-sports.io free plan blocks current season
+        "enabled": True,  # NBA via ESPN free API (no key needed)
         "api_base": "https://v1.basketball.api-sports.io",
         "endpoints": {
             "fixtures":   "/games",
