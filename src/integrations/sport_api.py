@@ -15,6 +15,7 @@ class SportAPIError(Exception):
 
 
 LEAGUE_COUNTRY_HINTS = {
+    # Hockey
     "KHL": "Russia",
     "NHL": "USA",
     "AHL": "USA",
@@ -22,12 +23,40 @@ LEAGUE_COUNTRY_HINTS = {
     "Liiga": "Finland",
     "DEL": "Germany",
     "Extraliga": "Czech",
+    "VHL": "Russia",
     "NCAA": "USA",
+    # Football
+    "Premier League": "England",
+    "RPL": "Russia",
+    "La Liga": "Spain",
+    "Bundesliga": "Germany",
+    "Serie A": "Italy",
+    "Ligue 1": "France",
+    "Champions League": "Europe",
+    "Europa League": "Europe",
+    # Basketball
+    "NBA": "USA",
+    "Euroleague": "Europe",
+    "VTB": "Russia",
+    # Volleyball
+    "Superliga": "Russia",
+    "CEV": "Europe",
+    # MMA
+    "UFC": "USA",
+    # Handball
+    "EHF": "Europe",
 }
 
 SPORT_ALIASES: Dict[str, List[str]] = {
     "ice-hockey": ["hockey"],
     "table-tennis": ["ping-pong", "table_tennis", "tabletennis"],
+    "volleyball": ["volley"],
+    "handball": [],
+    "mma": ["ufc"],
+    "american-football": ["nfl", "american_football"],
+    "formula1": ["f1", "formula-1"],
+    "baseball": [],
+    "rugby": [],
 }
 
 
@@ -459,6 +488,18 @@ class SportAPIClient:
                 except Exception as e:
                     last_err = e
 
+        # ── Fallback: api-sports.io (works for all sports) ──
+        try:
+            fallback_matches = await self._fallback_api_sports(sport_slug, day)
+            if fallback_matches:
+                logger.info(
+                    "SportAPI fallback api-sports.io OK: sport=%s n=%d",
+                    sport_slug, len(fallback_matches),
+                )
+                return fallback_matches
+        except Exception as fb_err:
+            logger.debug("SportAPI fallback failed for %s: %s", sport_slug, fb_err)
+
         if last_err:
             raise SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
 
@@ -567,3 +608,128 @@ class SportAPIClient:
                     last_err = e
 
         raise SportAPIError(f"match_odds failed: {sport_slug}/{match_id}: {last_err}")
+
+    async def _fallback_api_sports(self, sport_slug: str, day: date) -> List[MatchDTO]:
+        """
+        Fallback: fetch matches from api-sports.io when primary API fails.
+        Uses sports_config for correct endpoints/leagues per sport.
+        """
+        try:
+            from ..sports_config import get_sport_config, get_leagues
+        except ImportError:
+            return []
+
+        cfg = get_sport_config(sport_slug)
+        if not cfg:
+            return []
+
+        api_key = _env("API_SPORTS_KEY")
+        if not api_key:
+            return []
+
+        api_base = cfg.get("api_base", "")
+        endpoints = cfg.get("endpoints", {})
+        fixtures_ep = endpoints.get("fixtures", "/games")
+        leagues = get_leagues(sport_slug, max_priority=2)
+
+        if not leagues:
+            return []
+
+        headers = {"x-apisports-key": api_key}
+        day_s = day.isoformat()
+        all_matches: List[MatchDTO] = []
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+            for league_id, league_info in leagues.items():
+                try:
+                    url = f"{api_base}{fixtures_ep}"
+                    params = {
+                        "league": league_id,
+                        "season": league_info.get("season", 2025),
+                        "date": day_s,
+                    }
+                    resp = await client.get(url, headers=headers, params=params)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    items = data.get("response") or []
+
+                    for item in items:
+                        try:
+                            dto = self._parse_api_sports_match(item, sport_slug, league_info)
+                            all_matches.append(dto)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+
+        return all_matches
+
+    def _parse_api_sports_match(
+        self, raw: Dict[str, Any], sport_slug: str, league_info: Dict[str, Any]
+    ) -> MatchDTO:
+        """Parse a single match from api-sports.io response into MatchDTO."""
+        teams = raw.get("teams") or {}
+        scores = raw.get("scores") or raw.get("goals") or {}
+        status_obj = raw.get("status") or {}
+
+        # Match ID
+        mid = str(raw.get("id") or raw.get("fixture", {}).get("id") or "unknown")
+
+        # For football, fixture is nested
+        fixture = raw.get("fixture") or {}
+        if fixture:
+            mid = str(fixture.get("id") or mid)
+
+        # Teams
+        home_obj = teams.get("home") or {}
+        away_obj = teams.get("away") or {}
+        home = home_obj.get("name", "Home") if isinstance(home_obj, dict) else str(home_obj)
+        away = away_obj.get("name", "Away") if isinstance(away_obj, dict) else str(away_obj)
+
+        # League
+        league_obj = raw.get("league") or {}
+        league_name = league_info.get("name", "")
+        if isinstance(league_obj, dict):
+            league_name = league_obj.get("name") or league_name
+
+        country = league_info.get("country", "Other")
+
+        # Status
+        if isinstance(status_obj, dict):
+            status = status_obj.get("short") or status_obj.get("long") or ""
+        else:
+            status = str(status_obj or "")
+
+        # Football has nested fixture.status
+        if fixture and "status" in fixture:
+            fs = fixture["status"]
+            if isinstance(fs, dict):
+                status = fs.get("short") or fs.get("long") or status
+
+        # Start time
+        start_time = str(
+            raw.get("date") or raw.get("timestamp") or
+            fixture.get("date") or fixture.get("timestamp") or ""
+        )
+
+        # Score
+        score = ""
+        if isinstance(scores, dict):
+            h_s = scores.get("home")
+            a_s = scores.get("away")
+            if h_s is not None and a_s is not None:
+                score = f"{h_s}:{a_s}"
+
+        title = f"{home} — {away}"
+        return MatchDTO(
+            id=mid,
+            sport_slug=sport_slug,
+            title=title,
+            league=league_name,
+            status=status,
+            start_time=start_time,
+            score=score,
+            country=country,
+            raw=raw,
+        )
