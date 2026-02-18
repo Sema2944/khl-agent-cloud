@@ -1,7 +1,7 @@
 # src/models.py
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 from sqlalchemy import BigInteger, UniqueConstraint
@@ -42,6 +42,12 @@ class User(SQLModel, table=True):
 
     # trial для LIVE
     trial_live_used: bool = Field(default=False)
+
+    # P0: onboarding
+    user_seen_intro: bool = Field(default=False)
+
+    # P0: Hunter trial (3 дня)
+    trial_started_at: Optional[datetime] = Field(default=None)
 
     # служебное
     created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
@@ -107,3 +113,20 @@ class UsageCounter(SQLModel, table=True):
     count: int = Field(default=0)
 
     updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class DailyPick(SQLModel, table=True):
+    """Охотник: ежедневные топ-пики от AI."""
+    __tablename__ = "daily_picks"
+    __table_args__ = ({"extend_existing": True},)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    pick_date: date = Field(index=True)
+    match_id: str = Field(default="", index=True)
+    sport_slug: str = Field(default="")
+    title: str = Field(default="")
+    league: str = Field(default="")
+    confidence: float = Field(default=0.0)
+    analysis_text: str = Field(default="")
+    pick_type: str = Field(default="top3")  # "top3" | "express"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
