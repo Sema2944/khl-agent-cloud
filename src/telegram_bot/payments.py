@@ -136,6 +136,27 @@ async def send_invoice(
     else:
         # ЮKassa (RUB) — amount in kopecks
         prices = [LabeledPrice(label=title, amount=tariff.price_rub * 100)]
+
+        # Чек 54-ФЗ (обязательно для ИП/ООО с ЮKassa)
+        import json
+        provider_data = json.dumps({
+            "receipt": {
+                "items": [
+                    {
+                        "description": f"PRO {tariff.label} — AI Sports Analytics",
+                        "quantity": "1.00",
+                        "amount": {
+                            "value": f"{tariff.price_rub:.2f}",
+                            "currency": "RUB",
+                        },
+                        "vat_code": 1,  # без НДС (УСН)
+                        "payment_mode": "full_payment",
+                        "payment_subject": "service",
+                    }
+                ]
+            }
+        })
+
         await context.bot.send_invoice(
             chat_id=chat_id,
             title=title,
@@ -146,9 +167,11 @@ async def send_invoice(
             prices=prices,
             need_name=False,
             need_phone_number=False,
-            need_email=False,
+            need_email=True,               # email для чека по 54-ФЗ
+            send_email_to_provider=True,    # передать email в ЮKassa
             need_shipping_address=False,
             is_flexible=False,
+            provider_data=provider_data,
         )
 
     logger.info("Invoice sent: user=%s tariff=%s stars=%s", user_id, tariff_key, use_stars)
