@@ -25,8 +25,13 @@ from telegram.ext import (
 
 from ..db import get_session
 from ..pro_db import is_pro
-from ..ui_text import MAIN_MENU_TEXT
+from ..ui_text import (
+    MAIN_MENU_TEXT, ONBOARDING_WELCOME, ONBOARDING_HOW_IT_WORKS,
+    HUNTER_FREE_TEXT, HUNTER_EXAMPLE_TEXT, HUNTER_NOT_READY_TEXT,
+    ABOUT_TEXT, MENU_HINT_TEXT,
+)
 from ..user_access import allowed_sports_for_user
+from ..user_store import get_user_seen_intro, set_user_seen_intro, get_or_create_user
 
 logger = logging.getLogger(__name__)
 
@@ -126,21 +131,165 @@ async def call_agent_local(user_id: int, text: str) -> str:
 
 def _text_buy_pro(user_id: int) -> str:
     return (
-        "⭐ Premium\n\n"
+        "⭐ PRO режим\n\n"
         "Что входит:\n"
-        "• LIVE PRO в матчах\n"
-        "• Больше аналитики\n\n"
+        "🎯 Охотник: Топ-3 + Экспресс каждое утро автоматически\n"
+        "🔥 LIVE PRO: MCI + импульс + сценарии + confidence\n\n"
+        "Инструмент, а не прогноз.\n\n"
         "Нажми кнопку ниже, чтобы оформить."
     )
 
 
+def _is_in_hunter_trial(user_id: int) -> bool:
+    """Check if user is within their 3-day trial period."""
+    try:
+        from ..user_store import get_user_by_tg_id
+        u = get_user_by_tg_id(user_id)
+        if u is None:
+            return False
+        started = getattr(u, 'trial_started_at', None)
+        if started is None:
+            return False
+        from datetime import timedelta, timezone
+        now = datetime.now(timezone.utc)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return now < started + timedelta(days=3)
+    except Exception:
+        logger.exception("_is_in_hunter_trial failed")
+        return False
+
+
+def _get_today_picks() -> list:
+    """Fetch today's daily picks from DB."""
+    try:
+        from sqlmodel import Session as SMSession
+        from sqlalchemy import text
+        from zoneinfo import ZoneInfo
+        from ..db import engine
+        today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+        with SMSession(engine) as s:
+            rows = s.exec(
+                text("SELECT match_id, sport_slug, title, league, confidence, analysis_text, pick_type FROM daily_picks WHERE pick_date = :d ORDER BY pick_type, confidence DESC"),
+                params={"d": today},
+            ).all()
+            return [
+                {
+                    "match_id": r[0], "sport_slug": r[1], "title": r[2],
+                    "league": r[3], "confidence": r[4], "analysis_text": r[5],
+                    "pick_type": r[6],
+                }
+                for r in rows
+            ]
+    except Exception:
+        logger.exception("_get_today_picks failed")
+        return []
+
+
+async def _handle_hunter(q, user_id: int):
+    """Show hunter screen — FREE or PRO version."""
+    user_is_pro = False
+    try:
+        user_is_pro = is_pro(user_id)
+    except Exception:
+        logger.exception("is_pro check failed in hunter")
+
+    in_trial = _is_in_hunter_trial(user_id)
+
+    if user_is_pro or in_trial:
+        picks = _get_today_picks()
+        top3 = [p for p in picks if p.get("pick_type") == "top3"]
+        express = [p for p in picks if p.get("pick_type") == "express"]
+
+        if not top3:
+            txt = HUNTER_NOT_READY_TEXT
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+            ])
+        else:
+            lines = ["🎯 Охотник — Топ матчи дня\n"]
+            rows = []
+            for i, p in enumerate(top3[:3], 1):
+                conf = int(float(p.get("confidence", 0)) * 100)
+                title = (p.get("title") or "Матч")[:50]
+                lines.append(f"{i}. {title} ({conf}%)")
+                summary = (p.get("analysis_text") or "")[:200]
+                if summary:
+                    lines.append(f"   {summary}\n")
+                mid = p.get("match_id", "")
+                rows.append([InlineKeyboardButton(
+                    f"🔍 Подробнее: {title[:30]}",
+                    callback_data=f"HUNTER:DETAIL:{mid}"
+                )])
+
+            if express:
+                lines.append("⚡ ЭКСПРЕСС ДНЯ")
+                for ep in express[:1]:
+                    lines.append(ep.get("analysis_text", "")[:200])
+
+            txt = "\n".join(lines)
+            if in_trial and not user_is_pro:
+                txt += "\n\n🎁 Пробный период (3 дня)"
+            rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
+            kb = InlineKeyboardMarkup(rows)
+    else:
+        txt = HUNTER_FREE_TEXT
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Посмотреть пример", callback_data="HUNTER:EXAMPLE")],
+            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+        ])
+
+    try:
+        await q.edit_message_text(txt, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(txt, reply_markup=kb)
+
+
+async def _handle_hunter_detail(q, user_id: int, match_id: str):
+    """Show detailed analysis for a hunter pick, with bridge to match hub."""
+    picks = _get_today_picks()
+    pick = next((p for p in picks if p.get("match_id") == match_id), None)
+
+    if not pick:
+        txt = "Подборка не найдена."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад", callback_data="MENU:HUNTER")],
+        ])
+    else:
+        conf = int(float(pick.get("confidence", 0)) * 100)
+        title = pick.get("title", "Матч")
+        league = pick.get("league", "")
+        analysis = pick.get("analysis_text", "")
+        sport = pick.get("sport_slug", "ice-hockey")
+
+        lines = [
+            f"🎯 {title}",
+            f"🏆 {league}" if league else "",
+            f"Confidence: {conf}%",
+            "",
+            analysis or "Анализ недоступен.",
+        ]
+        txt = "\n".join(l for l in lines if l is not None)
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Открыть матч", callback_data=f"MATCH:{sport}:{match_id}")],
+            [InlineKeyboardButton("⬅️ Назад к Охотнику", callback_data="MENU:HUNTER")],
+        ])
+
+    try:
+        await q.edit_message_text(txt, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(txt, reply_markup=kb)
+
+
 def kb_main_menu() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🏟 Матчи сегодня", callback_data="MENU:MATCHES")],
-        [InlineKeyboardButton("🧠 AI Аналитика", callback_data="MENU:AI")],
-        [InlineKeyboardButton("👤 Стратегия эксперта", callback_data="MENU:STRATEGY")],
-        [InlineKeyboardButton("📊 Профиль", callback_data="MENU:PROFILE")],
-        [InlineKeyboardButton("⭐ Premium", callback_data="MENU:PREMIUM")],
+        [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
+        [InlineKeyboardButton("📊 Анализ матчей", callback_data="MENU:MATCHES")],
+        [InlineKeyboardButton("⭐ PRO режим", callback_data="MENU:PREMIUM")],
+        [InlineKeyboardButton("👤 Профиль", callback_data="MENU:PROFILE")],
+        [InlineKeyboardButton("ℹ️ О боте", callback_data="MENU:ABOUT")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -556,9 +705,38 @@ def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 # Handlers
 # ============================================================
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "Привет! Выбери раздел 👇"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=kb_main_menu())
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    # Ensure user exists in DB
+    try:
+        get_or_create_user(
+            user_id,
+            username=getattr(update.effective_user, 'username', None),
+            first_name=getattr(update.effective_user, 'first_name', None),
+            last_name=getattr(update.effective_user, 'last_name', None),
+        )
+    except Exception:
+        logger.exception("handle_start: get_or_create_user failed")
+
+    # Onboarding check
+    seen = True
+    try:
+        seen = get_user_seen_intro(user_id)
+    except Exception:
+        logger.exception("handle_start: onboarding check failed")
+
+    if seen:
+        await update.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        return
+
+    # Show onboarding for new users
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Начать", callback_data="ONBOARD:START")],
+        [InlineKeyboardButton("ℹ️ Как это работает", callback_data="ONBOARD:HELP")],
+    ])
+    await update.message.reply_text(ONBOARDING_WELCOME, reply_markup=kb)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -645,6 +823,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
+    # ONBOARD:START
+    if data == "ONBOARD:START":
+        try:
+            set_user_seen_intro(
+                user_id,
+                username=getattr(update.effective_user, 'username', None),
+                first_name=getattr(update.effective_user, 'first_name', None),
+                last_name=getattr(update.effective_user, 'last_name', None),
+            )
+        except Exception:
+            logger.exception("set_user_seen_intro failed")
+        try:
+            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        except Exception:
+            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        return
+
+    # ONBOARD:HELP
+    if data == "ONBOARD:HELP":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Начать", callback_data="ONBOARD:START")],
+        ])
+        try:
+            await q.edit_message_text(ONBOARDING_HOW_IT_WORKS, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(ONBOARDING_HOW_IT_WORKS, reply_markup=kb)
+        return
+
+    # MENU:HUNTER
+    if data == "MENU:HUNTER":
+        await _handle_hunter(q, user_id)
+        return
+
+    # HUNTER:EXAMPLE
+    if data == "HUNTER:EXAMPLE":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="MENU:HUNTER")],
+        ])
+        try:
+            await q.edit_message_text(HUNTER_EXAMPLE_TEXT, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(HUNTER_EXAMPLE_TEXT, reply_markup=kb)
+        return
+
+    # HUNTER:DETAIL:<match_id>
+    if data.startswith("HUNTER:DETAIL:"):
+        match_id = data.split(":", 2)[2].strip()
+        await _handle_hunter_detail(q, user_id, match_id)
+        return
+
+    # MENU:ABOUT
+    if data == "MENU:ABOUT":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+        ])
+        try:
+            await q.edit_message_text(ABOUT_TEXT, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(ABOUT_TEXT, reply_markup=kb)
+        return
+
     # MENU:MATCHES / BACK:MATCHES_MENU => выбор спорта
     if data in {"MENU:MATCHES", "BACK:MATCHES_MENU"}:
         text = "🏟 Выбери спорт:"
@@ -662,30 +902,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # MENU shortcuts
-    if data == "MENU:AI":
-        reply = (
-            "Как пользоваться:\n"
-            "1) 🏟 Матчи сегодня\n"
-            "2) спорт → страна → лига → матч\n"
-            "3) в матче нажми: PRE / LIVE / LIVE PRO\n\n"
-            "Диагностика: llm ping, env, version, last_error"
-        )
-        try:
-            await q.edit_message_text(reply, reply_markup=kb_main_menu())
-        except Exception:
-            await q.message.reply_text(reply, reply_markup=kb_main_menu())
-        return
-
-    if data == "MENU:STRATEGY":
-        reply = await call_agent_local(user_id, "стратегия")
-        txt = _truncate_tg(reply)
-        try:
-            await q.edit_message_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), reply_markup=kb_main_menu(), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data == "MENU:PROFILE":
