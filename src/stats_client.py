@@ -1,10 +1,10 @@
 # src/stats_client.py
 """
-api-sports.io client (Hockey API v1 + Football API v3).
-https://api-sports.io/documentation/hockey/v1
+Universal api-sports.io client — works for all sports via sports_config.
+https://api-sports.io/documentation
 
 Env: API_SPORTS_KEY
-Free tier: 100 requests/day.
+Pro tier ($19/mo): all sports, one key.
 """
 from __future__ import annotations
 
@@ -16,39 +16,45 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .data_collector import H2HData, LiveStats, TeamForm
+from .sports_config import (
+    get_sport_config,
+    get_api_base,
+    get_endpoints,
+    get_leagues,
+    get_match_param,
+    resolve_sport_slug,
+)
 
 logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("API_SPORTS_KEY", "")
 TIMEOUT = 12.0
 
-HOCKEY_BASE = "https://v1.hockey.api-sports.io"
-FOOTBALL_BASE = "https://v3.football.api-sports.io"
-
-# League IDs for hockey
-HOCKEY_LEAGUES = {
-    "khl": 50,
-    "nhl": 57,
-    "shl": 56,
-    "liiga": 51,
-    "extraliga": 52,
-    "vhl": 48,
-}
-
-SEASON = 2025  # Current season
-
 
 def _headers() -> Dict[str, str]:
     return {"x-apisports-key": API_KEY}
 
 
-async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Make GET request to hockey api-sports."""
+# ---------------------------------------------------------------------------
+# Universal API request
+# ---------------------------------------------------------------------------
+
+async def _api_get(
+    sport_slug: str,
+    path: str,
+    params: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Universal GET request to api-sports.io for any sport."""
     if not API_KEY:
         logger.debug("API_SPORTS_KEY not set, skipping stats fetch")
         return []
 
-    url = f"{HOCKEY_BASE}{path}"
+    base = get_api_base(sport_slug)
+    if not base:
+        logger.debug("No API base for sport=%s", sport_slug)
+        return []
+
+    url = f"{base}{path}"
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         resp = await client.get(url, headers=_headers(), params=params)
         resp.raise_for_status()
@@ -56,37 +62,41 @@ async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]
         return data.get("response") or []
 
 
+# Backward compatibility: hockey-specific shortcut
+async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return await _api_get("ice-hockey", path, params)
+
+
 # ---------------------------------------------------------------------------
-# Team search
+# Team search (universal)
 # ---------------------------------------------------------------------------
 
 async def search_team_id(
     team_name: str,
     sport_slug: str = "ice-hockey",
 ) -> Optional[int]:
-    """Search for team ID by name."""
-    if sport_slug not in ("ice-hockey", "hockey"):
-        return None  # Only hockey for now
+    """Search for team ID by name. Works for any sport with /teams endpoint."""
+    slug = resolve_sport_slug(sport_slug) or sport_slug
 
     try:
-        results = await _hockey_get("/teams", {"search": team_name})
+        results = await _api_get(slug, "/teams", {"search": team_name})
         if results:
             return results[0].get("id")
 
         # Try shorter name (first word)
         short = team_name.split()[0] if team_name else ""
         if short and len(short) >= 3:
-            results = await _hockey_get("/teams", {"search": short})
+            results = await _api_get(slug, "/teams", {"search": short})
             if results:
                 return results[0].get("id")
     except Exception:
-        logger.exception("search_team_id failed for %s", team_name)
+        logger.exception("search_team_id failed for %s (%s)", team_name, slug)
 
     return None
 
 
 # ---------------------------------------------------------------------------
-# Team form / statistics
+# Team form / statistics (universal)
 # ---------------------------------------------------------------------------
 
 async def get_team_form(
@@ -95,17 +105,34 @@ async def get_team_form(
     league_id: Optional[int] = None,
 ) -> Optional[TeamForm]:
     """Fetch team season statistics and derive form."""
-    if sport_slug not in ("ice-hockey", "hockey"):
+    slug = resolve_sport_slug(sport_slug) or sport_slug
+    cfg = get_sport_config(slug)
+    if not cfg:
         return None
 
+    # Default league: first priority-1 league for this sport
     if league_id is None:
-        league_id = HOCKEY_LEAGUES.get("khl", 50)
+        leagues = get_leagues(slug, max_priority=1)
+        if leagues:
+            league_id = next(iter(leagues))
+        else:
+            leagues = get_leagues(slug)
+            league_id = next(iter(leagues)) if leagues else None
+    if league_id is None:
+        return None
+
+    # Get season for this league
+    league_info = cfg.get("leagues", {}).get(league_id, {})
+    season = league_info.get("season", 2025)
+
+    # Determine the right endpoint: football uses /teams/statistics, others may differ
+    stats_endpoint = "/teams/statistics"
 
     try:
-        data = await _hockey_get("/teams/statistics", {
+        data = await _api_get(slug, stats_endpoint, {
             "team": team_id,
             "league": league_id,
-            "season": SEASON,
+            "season": season,
         })
         if not data:
             return None
@@ -113,68 +140,107 @@ async def get_team_form(
         stats = data[0] if isinstance(data, list) else data
         return _parse_team_form(stats)
     except Exception:
-        logger.exception("get_team_form failed for team=%d", team_id)
+        logger.exception("get_team_form failed for team=%d sport=%s", team_id, slug)
         return None
 
 
 def _parse_team_form(stats: Dict[str, Any]) -> TeamForm:
-    """Parse api-sports team statistics into TeamForm."""
+    """Parse api-sports team statistics into TeamForm (universal)."""
     form = TeamForm()
 
-    games = stats.get("games") or {}
+    # Different sports return stats differently; handle common patterns
+    games = stats.get("games") or stats.get("fixtures") or {}
     wins_data = games.get("wins") or {}
-    loses_data = games.get("loses") or {}
+    loses_data = games.get("loses") or games.get("losses") or {}
 
-    # Total wins/losses
-    form.wins = _safe_int(wins_data.get("total"))
-    form.losses = _safe_int(loses_data.get("total"))
+    # If wins_data is a dict with total/home/away
+    if isinstance(wins_data, dict):
+        form.wins = _safe_int(wins_data.get("total"))
+        home_w = _safe_int(wins_data.get("home"))
+        away_w = _safe_int(wins_data.get("away"))
+    else:
+        form.wins = _safe_int(wins_data)
+        home_w = 0
+        away_w = 0
 
-    # Home / away splits
-    home_w = _safe_int(wins_data.get("home"))
-    home_l = _safe_int(loses_data.get("home"))
-    away_w = _safe_int(wins_data.get("away"))
-    away_l = _safe_int(loses_data.get("away"))
+    if isinstance(loses_data, dict):
+        form.losses = _safe_int(loses_data.get("total"))
+        home_l = _safe_int(loses_data.get("home"))
+        away_l = _safe_int(loses_data.get("away"))
+    else:
+        form.losses = _safe_int(loses_data)
+        home_l = 0
+        away_l = 0
 
     if home_w or home_l:
         form.home_record = f"{home_w}W-{home_l}L"
     if away_w or away_l:
         form.away_record = f"{away_w}W-{away_l}L"
 
-    # Goals
+    # Goals / points
     goals = stats.get("goals") or {}
     goals_for = goals.get("for") or {}
     goals_against = goals.get("against") or {}
-    total_games = form.wins + form.losses or 1
-    form.goals_per_game = round(_safe_float(goals_for.get("total")) / total_games, 1)
-    form.goals_against_per_game = round(_safe_float(goals_against.get("total")) / total_games, 1)
 
-    # Build last_10 string
+    total_games = form.wins + form.losses or 1
+    gf = _safe_float(goals_for.get("total") if isinstance(goals_for, dict) else goals_for)
+    ga = _safe_float(goals_against.get("total") if isinstance(goals_against, dict) else goals_against)
+    form.goals_per_game = round(gf / total_games, 1)
+    form.goals_against_per_game = round(ga / total_games, 1)
+
+    # Form string
     form.last_10 = f"{form.wins}W-{form.losses}L"
+
+    # Streak from "form" field (some sports return "WWLWW")
+    form_str = stats.get("form", "")
+    if form_str and isinstance(form_str, str):
+        streak_char = form_str[-1] if form_str else ""
+        count = 0
+        for c in reversed(form_str):
+            if c == streak_char:
+                count += 1
+            else:
+                break
+        if streak_char and count:
+            form.streak = f"{count}{streak_char}"
 
     return form
 
 
 # ---------------------------------------------------------------------------
-# H2H
+# H2H (universal)
 # ---------------------------------------------------------------------------
 
 async def get_h2h(
     team1_id: int,
     team2_id: int,
     last: int = 10,
+    sport_slug: str = "ice-hockey",
 ) -> Optional[H2HData]:
-    """Fetch head-to-head history."""
+    """Fetch head-to-head history for any sport."""
+    slug = resolve_sport_slug(sport_slug) or sport_slug
+    endpoints = get_endpoints(slug)
+    h2h_endpoint = endpoints.get("h2h", "/games/h2h")
+
     try:
-        data = await _hockey_get("/games/h2h", {
-            "h2h": f"{team1_id}-{team2_id}",
-            "last": last,
-        })
+        # Football uses different params format
+        if slug == "football":
+            data = await _api_get(slug, h2h_endpoint, {
+                "h2h": f"{team1_id}-{team2_id}",
+                "last": last,
+            })
+        else:
+            data = await _api_get(slug, h2h_endpoint, {
+                "h2h": f"{team1_id}-{team2_id}",
+                "last": last,
+            })
+
         if not data:
             return None
 
         return _parse_h2h(data, team1_id, team2_id)
     except Exception:
-        logger.exception("get_h2h failed for %d vs %d", team1_id, team2_id)
+        logger.exception("get_h2h failed for %d vs %d (%s)", team1_id, team2_id, slug)
         return None
 
 
@@ -185,12 +251,20 @@ def _parse_h2h(games: List[Dict[str, Any]], home_id: int, away_id: int) -> H2HDa
 
     for game in games:
         teams = game.get("teams") or {}
-        scores = game.get("scores") or {}
+        scores = game.get("scores") or game.get("goals") or {}
 
         home_team = teams.get("home") or {}
         away_team = teams.get("away") or {}
-        h_score = _safe_int(scores.get("home"))
-        a_score = _safe_int(scores.get("away"))
+
+        # Scores can be nested (football: goals.home) or flat (hockey: scores.home)
+        h_score = _safe_int(
+            scores.get("home") if not isinstance(scores.get("home"), dict)
+            else scores.get("home", {}).get("total", 0)
+        )
+        a_score = _safe_int(
+            scores.get("away") if not isinstance(scores.get("away"), dict)
+            else scores.get("away", {}).get("total", 0)
+        )
 
         total_goals += h_score + a_score
 
@@ -213,27 +287,30 @@ def _parse_h2h(games: List[Dict[str, Any]], home_id: int, away_id: int) -> H2HDa
 
     # Last result
     if games:
-        last = games[0]
-        lt = last.get("teams") or {}
-        ls = last.get("scores") or {}
+        last_game = games[0]
+        lt = last_game.get("teams") or {}
+        ls = last_game.get("scores") or last_game.get("goals") or {}
         h_name = (lt.get("home") or {}).get("name", "?")
-        h_s = _safe_int(ls.get("home"))
-        a_s = _safe_int(ls.get("away"))
+        h_s = _safe_int(ls.get("home") if not isinstance(ls.get("home"), dict) else ls.get("home", {}).get("total", 0))
+        a_s = _safe_int(ls.get("away") if not isinstance(ls.get("away"), dict) else ls.get("away", {}).get("total", 0))
         h2h.last_result = f"{h_name} {h_s}:{a_s}"
 
     return h2h
 
 
 # ---------------------------------------------------------------------------
-# Live stats
+# Live stats (universal)
 # ---------------------------------------------------------------------------
 
 async def get_live_stats(
     match_id: str,
     sport_slug: str = "ice-hockey",
 ) -> Optional[LiveStats]:
-    """Fetch live game statistics."""
-    if sport_slug not in ("ice-hockey", "hockey"):
+    """Fetch live game statistics for any sport."""
+    slug = resolve_sport_slug(sport_slug) or sport_slug
+    endpoints = get_endpoints(slug)
+    stats_endpoint = endpoints.get("statistics")
+    if not stats_endpoint:
         return None
 
     try:
@@ -241,14 +318,16 @@ async def get_live_stats(
     except (ValueError, TypeError):
         return None
 
+    match_param = get_match_param(slug)
+
     try:
-        data = await _hockey_get("/games/statistics", {"id": game_id})
+        data = await _api_get(slug, stats_endpoint, {match_param: game_id})
         if not data:
             return None
 
         return _parse_live_stats(data)
     except Exception:
-        logger.exception("get_live_stats failed for %s", match_id)
+        logger.exception("get_live_stats failed for %s (%s)", match_id, slug)
         return None
 
 
@@ -257,19 +336,19 @@ def _parse_live_stats(data: List[Dict[str, Any]]) -> LiveStats:
     stats = LiveStats()
 
     for team_data in data:
-        team = team_data.get("team") or {}
         team_stats = team_data.get("statistics") or {}
 
         # Determine home/away by position in list (first = home)
         is_home = data.index(team_data) == 0
 
-        shots = team_stats.get("shots_on_goal") or {}
+        # Handle both hockey and football stat formats
+        shots = team_stats.get("shots_on_goal") or team_stats.get("Total Shots") or team_stats.get("Shots on Goal") or {}
         shots_total = _safe_int(shots.get("total") if isinstance(shots, dict) else shots)
 
         penalties = _safe_int(
             (team_stats.get("penalty_minutes") or {}).get("total")
             if isinstance(team_stats.get("penalty_minutes"), dict)
-            else team_stats.get("penalty_minutes")
+            else team_stats.get("penalty_minutes", 0)
         )
 
         faceoffs = team_stats.get("faceoffs_won") or {}
@@ -286,13 +365,13 @@ def _parse_live_stats(data: List[Dict[str, Any]]) -> LiveStats:
         hits = _safe_int(
             (team_stats.get("hits") or {}).get("total")
             if isinstance(team_stats.get("hits"), dict)
-            else team_stats.get("hits")
+            else team_stats.get("hits", 0)
         )
 
         blocked = _safe_int(
             (team_stats.get("blocked_shots") or {}).get("total")
             if isinstance(team_stats.get("blocked_shots"), dict)
-            else team_stats.get("blocked_shots")
+            else team_stats.get("blocked_shots", 0)
         )
 
         if is_home:
@@ -314,26 +393,35 @@ def _parse_live_stats(data: List[Dict[str, Any]]) -> LiveStats:
 
 
 # ---------------------------------------------------------------------------
-# Games today
+# Games today (universal)
 # ---------------------------------------------------------------------------
 
 async def get_games_today(
     league_id: int = 50,
     sport_slug: str = "ice-hockey",
 ) -> List[Dict[str, Any]]:
-    """Fetch all games for today."""
-    if sport_slug not in ("ice-hockey", "hockey"):
+    """Fetch all games for today for any sport."""
+    slug = resolve_sport_slug(sport_slug) or sport_slug
+    cfg = get_sport_config(slug)
+    if not cfg:
         return []
+
+    endpoints = get_endpoints(slug)
+    fixtures_endpoint = endpoints.get("fixtures", "/games")
+
+    # Get season for this league
+    league_info = cfg.get("leagues", {}).get(league_id, {})
+    season = league_info.get("season", 2025)
 
     try:
         today = date.today().isoformat()
-        return await _hockey_get("/games", {
+        return await _api_get(slug, fixtures_endpoint, {
             "league": league_id,
-            "season": SEASON,
+            "season": season,
             "date": today,
         })
     except Exception:
-        logger.exception("get_games_today failed")
+        logger.exception("get_games_today failed for sport=%s league=%d", slug, league_id)
         return []
 
 
