@@ -166,6 +166,32 @@ def set_user_premium(
         return u
 
 
+def get_user_seen_intro(tg_user_id: int) -> bool:
+    """Check if user has seen onboarding intro."""
+    try:
+        with Session(engine) as s:
+            u = get_or_create_user(int(tg_user_id), session=s)
+            return bool(getattr(u, 'user_seen_intro', False))
+    except Exception:
+        logger.exception("get_user_seen_intro failed")
+        return True  # fallback: skip onboarding on DB error
+
+
+def set_user_seen_intro(tg_user_id: int, **profile) -> None:
+    """Mark user as having seen onboarding. Also starts 3-day trial."""
+    try:
+        with Session(engine) as s:
+            u = get_or_create_user(int(tg_user_id), session=s, **profile)
+            u.user_seen_intro = True
+            u.updated_at = _now()
+            if getattr(u, 'trial_started_at', None) is None:
+                u.trial_started_at = _now()
+            s.add(u)
+            s.commit()
+    except Exception:
+        logger.exception("set_user_seen_intro failed")
+
+
 def mark_trial_live_used(tg_user_id: int, *, session: Optional[Session] = None) -> User:
     with _with_session(session) as s:
         u = get_or_create_user(int(tg_user_id), session=s)
