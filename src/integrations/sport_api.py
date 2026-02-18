@@ -526,6 +526,189 @@ class SportAPIClient:
             logger.exception("ESPN NBA: request failed")
             return []
 
+    async def _fetch_tennis_espn(self, day: date) -> List[MatchDTO]:
+        """
+        Fetch tennis matches from ESPN public API (ATP + WTA).
+        Free, no key. 20-50 matches/day during tournaments (year-round).
+        """
+        day_s = day.strftime("%Y%m%d")
+        urls = [
+            ("ATP", "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"),
+            ("WTA", "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"),
+        ]
+        result: List[MatchDTO] = []
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                for tour_name, url in urls:
+                    try:
+                        resp = await client.get(url, params={"dates": day_s})
+                        if resp.status_code != 200:
+                            logger.warning("ESPN %s: HTTP %d", tour_name, resp.status_code)
+                            continue
+
+                        data = resp.json()
+                        events = data.get("events") or []
+                        logger.info("ESPN %s: %d events on %s", tour_name, len(events), day.isoformat())
+
+                        for ev in events:
+                            try:
+                                # Tournament name
+                                tournament = ev.get("name") or ev.get("shortName") or tour_name
+
+                                comps = ev.get("competitions") or []
+                                for comp in comps:
+                                    mid = str(comp.get("id") or ev.get("id") or "unknown")
+
+                                    competitors = comp.get("competitors") or []
+                                    if len(competitors) < 2:
+                                        continue
+
+                                    names = []
+                                    scores = []
+                                    for c in competitors:
+                                        athlete = c.get("athlete") or {}
+                                        name = (
+                                            athlete.get("shortName")
+                                            or athlete.get("displayName")
+                                            or athlete.get("name")
+                                            or (c.get("team") or {}).get("name")
+                                            or "TBD"
+                                        )
+                                        names.append(name)
+                                        scores.append(c.get("score") or "")
+
+                                    # Status
+                                    status_obj = comp.get("status") or {}
+                                    status_type = status_obj.get("type") or {}
+                                    status_name = status_type.get("name") or ""
+                                    status_map = {
+                                        "STATUS_SCHEDULED": "NS",
+                                        "STATUS_IN_PROGRESS": "LIVE",
+                                        "STATUS_FINAL": "FT",
+                                        "STATUS_POSTPONED": "PST",
+                                        "STATUS_CANCELED": "CANC",
+                                        "STATUS_RETIRED": "RET",
+                                        "STATUS_WALKOVER": "W/O",
+                                    }
+                                    status = status_map.get(status_name, status_name)
+
+                                    start_time = comp.get("date") or ev.get("date") or ""
+                                    score = f"{scores[0]}:{scores[1]}" if scores[0] and scores[1] else ""
+
+                                    result.append(MatchDTO(
+                                        id=mid,
+                                        sport_slug="tennis",
+                                        title=f"{names[0]} — {names[1]}",
+                                        league=f"{tour_name}: {tournament}",
+                                        status=status,
+                                        start_time=start_time,
+                                        score=score,
+                                        country="International",
+                                        raw=comp,
+                                    ))
+                            except Exception:
+                                continue
+                    except Exception:
+                        logger.exception("ESPN %s: request failed", tour_name)
+                        continue
+
+            logger.info("ESPN Tennis: total %d matches (ATP+WTA)", len(result))
+            return result
+
+        except Exception:
+            logger.exception("ESPN Tennis: request failed")
+            return []
+
+    async def _fetch_mma_espn(self, day: date) -> List[MatchDTO]:
+        """
+        Fetch UFC/MMA fights from ESPN public API.
+        Free, no key. ~10-13 fights per event, events every 1-2 weeks.
+        Returns fights from the nearest upcoming/current UFC card.
+        """
+        day_s = day.strftime("%Y%m%d")
+        url = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
+        params = {"dates": day_s}
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, params=params)
+
+                if resp.status_code != 200:
+                    logger.warning("ESPN MMA: HTTP %d", resp.status_code)
+                    return []
+
+                data = resp.json()
+                events = data.get("events") or []
+                logger.info("ESPN MMA: %d events on %s", len(events), day.isoformat())
+
+                result: List[MatchDTO] = []
+                for ev in events:
+                    try:
+                        card_name = ev.get("name") or ev.get("shortName") or "UFC"
+
+                        comps = ev.get("competitions") or []
+                        for comp in comps:
+                            mid = str(comp.get("id") or ev.get("id") or "unknown")
+
+                            competitors = comp.get("competitors") or []
+                            if len(competitors) < 2:
+                                continue
+
+                            names = []
+                            for c in competitors:
+                                athlete = c.get("athlete") or {}
+                                name = (
+                                    athlete.get("shortName")
+                                    or athlete.get("displayName")
+                                    or athlete.get("name")
+                                    or "TBD"
+                                )
+                                names.append(name)
+
+                            status_obj = comp.get("status") or {}
+                            status_type = status_obj.get("type") or {}
+                            status_name = status_type.get("name") or ""
+                            status_map = {
+                                "STATUS_SCHEDULED": "NS",
+                                "STATUS_IN_PROGRESS": "LIVE",
+                                "STATUS_FINAL": "FT",
+                                "STATUS_POSTPONED": "PST",
+                                "STATUS_CANCELED": "CANC",
+                            }
+                            status = status_map.get(status_name, status_name)
+
+                            start_time = comp.get("date") or ev.get("date") or ""
+
+                            # Winner info
+                            score = ""
+                            for c in competitors:
+                                if c.get("winner"):
+                                    athlete = c.get("athlete") or {}
+                                    score = "W: " + (athlete.get("shortName") or "")
+                                    break
+
+                            result.append(MatchDTO(
+                                id=mid,
+                                sport_slug="mma",
+                                title=f"{names[0]} vs {names[1]}",
+                                league=card_name,
+                                status=status,
+                                start_time=start_time,
+                                score=score,
+                                country="USA",
+                                raw=comp,
+                            ))
+                    except Exception:
+                        continue
+
+                logger.info("ESPN MMA: parsed %d fights", len(result))
+                return result
+
+        except Exception:
+            logger.exception("ESPN MMA: request failed")
+            return []
+
     async def _fetch_football_data_org(self, day: date) -> List[MatchDTO]:
         """
         Fetch football matches from football-data.org (free tier).
@@ -632,6 +815,26 @@ class SportAPIClient:
                 last_err = fb_err
 
             logger.info("basketball: no matches on %s (normal for off-days)", day_s)
+            return []
+
+        # ── Tennis: use ESPN public API (ATP + WTA, free, no key) ──
+        if sport_slug == "tennis":
+            try:
+                tennis_matches = await self._fetch_tennis_espn(day)
+                logger.info("SportAPI ESPN Tennis: n=%d", len(tennis_matches))
+                return tennis_matches
+            except Exception as e:
+                logger.warning("ESPN Tennis failed: %s", e)
+            return []
+
+        # ── MMA/UFC: use ESPN public API (free, no key) ──
+        if sport_slug == "mma":
+            try:
+                mma_matches = await self._fetch_mma_espn(day)
+                logger.info("SportAPI ESPN MMA: n=%d", len(mma_matches))
+                return mma_matches
+            except Exception as e:
+                logger.warning("ESPN MMA failed: %s", e)
             return []
 
         # ── Football: use football-data.org (free, current season) ──
