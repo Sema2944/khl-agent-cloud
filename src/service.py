@@ -262,7 +262,7 @@ async def agent_query(req: QueryRequest):
         return QueryResponse(reply=f"⚠️ Ошибка сервера (импорт агента): {type(e).__name__}: {e}")
 
     try:
-        reply = await run_dialog_agent(user_id=req.user_id, message=text)
+        reply = await run_dialog_agent(user_id=req.user_id, text=text)
     except Exception as e:
         logger.exception("Ошибка внутри run_dialog_agent")
         return QueryResponse(reply=f"⚠️ Внутренняя ошибка агента: {type(e).__name__}: {e}")
