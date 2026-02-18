@@ -35,8 +35,15 @@ def run_pro_engine(
         # 1) Normalize
         snapshot = build_snapshot(raw, odds_raw, match_meta)
 
-        # Finished match — show summary instead of scenarios
+        # Status detection
         status_raw = (snapshot.get("status") or "").lower().strip()
+
+        # Not started — redirect to PRE
+        _NOT_STARTED_STATES = {"notstarted", "scheduled", "ns", "fixture", "not started", "tbd", ""}
+        if status_raw in _NOT_STARTED_STATES:
+            return _render_not_started(snapshot)
+
+        # Finished match — show summary instead of scenarios
         _FINISHED_STATES = {"finished", "ft", "ended", "completed", "final", "after et", "after so", "after ot"}
         if status_raw in _FINISHED_STATES or "finish" in status_raw:
             return _render_finished(snapshot)
@@ -68,6 +75,37 @@ def run_pro_engine(
     except Exception:
         logger.exception("PRO engine run_pro_engine failed")
         return "🟢 LIVE PRO\n\nОшибка движка — попробуй позже.\n\nℹ️ Аналитический материал."
+
+
+def _render_not_started(snapshot: Dict[str, Any]) -> str:
+    """Message for matches that haven't started yet — redirect to PRE analysis."""
+    teams = snapshot.get("teams") or {}
+    home = teams.get("home") or "Хозяева"
+    away = teams.get("away") or "Гости"
+    league = snapshot.get("league") or ""
+    country = snapshot.get("country") or ""
+    league_line = " • ".join(p for p in [league, country] if p)
+
+    lines = [
+        "🟢 LIVE PRO",
+        "",
+        f"{home} — {away}",
+    ]
+    if league_line:
+        lines.append(league_line)
+    lines += [
+        "",
+        "⏳ Матч ещё не начался.",
+        "",
+        "LIVE PRO активируется после начала матча.",
+        "Посмотри PRE-анализ — там доступны:",
+        "• Движение линии (opening → current)",
+        "• Форма команд и H2H",
+        "• AI-оценка",
+        "",
+        "👉 Нажми «📈 PRE анализ» для предматчевого разбора.",
+    ]
+    return "\n".join(lines)
 
 
 def _render_finished(snapshot: Dict[str, Any]) -> str:
