@@ -20,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -130,14 +131,18 @@ async def call_agent_local(user_id: int, text: str) -> str:
 
 
 def _text_buy_pro(user_id: int) -> str:
-    return (
-        "⭐ PRO режим\n\n"
-        "Что входит:\n"
-        "🎯 Охотник: Топ-3 + Экспресс каждое утро автоматически\n"
-        "🔥 LIVE PRO: MCI + импульс + сценарии + confidence\n\n"
-        "Инструмент, а не прогноз.\n\n"
-        "Нажми кнопку ниже, чтобы оформить."
-    )
+    try:
+        from .payments import tariff_text
+        return tariff_text()
+    except Exception:
+        return (
+            "⭐ PRO режим\n\n"
+            "Что входит:\n"
+            "🎯 Охотник: Топ-3 + Экспресс каждое утро автоматически\n"
+            "🔥 LIVE PRO: MCI + импульс + сценарии + confidence\n\n"
+            "Инструмент, а не прогноз.\n\n"
+            "Нажми кнопку ниже, чтобы оформить."
+        )
 
 
 def _is_in_hunter_trial(user_id: int) -> bool:
@@ -648,12 +653,15 @@ def _text_matches(user_id: int, ckey: str, lkey: str, page: int) -> str:
 
 
 def kb_buy_pro() -> InlineKeyboardMarkup:
-    # временная заглушка, чтобы бот не падал из-за payments.py
-    rows = [
-        [InlineKeyboardButton("⭐ Оформить Premium (скоро)", callback_data="BUY:PRO")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
-    ]
-    return InlineKeyboardMarkup(rows)
+    try:
+        from .payments import kb_tariffs
+        return kb_tariffs()
+    except Exception:
+        rows = [
+            [InlineKeyboardButton("⭐ Оформить Premium", callback_data="BUY:PRO")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+        ]
+        return InlineKeyboardMarkup(rows)
 
 
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -719,6 +727,20 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
     except Exception:
         logger.exception("handle_start: get_or_create_user failed")
+
+    # Referral deep link: /start ref_<user_id>
+    args = context.args
+    if args and len(args) > 0 and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0].replace("ref_", ""))
+            if referrer_id != user_id:
+                from .payments import process_referral
+                bot = context.bot
+                asyncio.create_task(process_referral(user_id, referrer_id, bot=bot))
+        except (ValueError, TypeError):
+            pass
+        except Exception:
+            logger.exception("handle_start: referral processing failed")
 
     # Onboarding check
     seen = True
@@ -814,13 +836,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
         return
 
-    # BUY:PRO (пока без платежей — показываем инструкцию)
+    # BUY:PRO — show tariff selection
     if data == "BUY:PRO":
         txt = _truncate_tg(_text_buy_pro(user_id))
         try:
             await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         except Exception:
             await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        return
+
+    # PAY:<tariff_key> — send invoice for selected tariff
+    if data.startswith("PAY:"):
+        tariff_key = data.split(":", 1)[1].strip().lower()
+        try:
+            from .payments import send_invoice
+            await q.answer()
+            await send_invoice(update, context, tariff_key)
+        except Exception:
+            logger.exception("send_invoice failed for tariff=%s", tariff_key)
+            await q.answer("Ошибка при создании счёта. Попробуй позже.", show_alert=True)
         return
 
     # ONBOARD:START
@@ -1172,6 +1206,16 @@ def create_application() -> Application:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
+
+    # Payments: pre-checkout + successful payment
+    try:
+        from .payments import handle_pre_checkout as _pre_checkout
+        from .payments import handle_successful_payment as _success_pay
+        app.add_handler(PreCheckoutQueryHandler(_pre_checkout))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, _success_pay))
+    except Exception:
+        logger.exception("Failed to wire payment handlers")
+
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(handle_error)
