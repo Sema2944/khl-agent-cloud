@@ -737,6 +737,26 @@ class SportAPIClient:
                             "api-sports.io: league=%d errors=%s",
                             league_id, errors,
                         )
+                        # Free plan fallback: retry with season 2024
+                        err_msg = str(errors)
+                        if "Free plans" in err_msg and "season" in err_msg:
+                            logger.info(
+                                "api-sports.io: retrying league=%d with season=2024 (free plan fallback)",
+                                league_id,
+                            )
+                            params2 = dict(params)
+                            params2["season"] = 2024
+                            resp2 = await client.get(url, headers=headers, params=params2)
+                            if resp2.status_code == 200:
+                                data2 = resp2.json()
+                                errors2 = data2.get("errors")
+                                if not errors2:
+                                    items = data2.get("response") or []
+                                    logger.info(
+                                        "api-sports.io: league=%d season=2024 fallback → %d matches",
+                                        league_id, len(items),
+                                    )
+
                     results_count = data.get("results", 0)
                     logger.info(
                         "api-sports.io: league=%d (%s) → %d matches (results=%s)",
