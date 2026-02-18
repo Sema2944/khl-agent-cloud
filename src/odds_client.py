@@ -22,29 +22,19 @@ API_KEY = os.getenv("THE_ODDS_API_KEY", "")
 BASE_URL = "https://api.the-odds-api.com/v4"
 TIMEOUT = 10.0
 
-# Mapping: our sport_slug → Odds API sport key
-SPORT_MAP: Dict[str, List[str]] = {
-    "ice-hockey": [
-        "icehockey_russia_khl",
-        "icehockey_nhl",
-        "icehockey_sweden_shl",
-        "icehockey_finland_liiga",
-    ],
-    "football": [
-        "soccer_russia_premier_league",
-        "soccer_epl",
-        "soccer_spain_la_liga",
-        "soccer_germany_bundesliga",
-        "soccer_italy_serie_a",
-        "soccer_france_ligue_one",
-        "soccer_uefa_champs_league",
-        "soccer_uefa_europa_league",
-    ],
-    "basketball": [
-        "basketball_euroleague",
-        "basketball_nba",
-    ],
-}
+# Mapping: our sport_slug → Odds API sport key (from centralized config)
+def _build_sport_map() -> Dict[str, List[str]]:
+    try:
+        from .sports_config import get_enabled_sports
+        return {k: v.get("odds_keys", []) for k, v in get_enabled_sports().items() if v.get("odds_keys")}
+    except Exception:
+        return {
+            "ice-hockey": ["icehockey_russia_khl", "icehockey_nhl"],
+            "football": ["soccer_epl", "soccer_russia_premier_league"],
+            "basketball": ["basketball_nba", "basketball_euroleague"],
+        }
+
+SPORT_MAP: Dict[str, List[str]] = _build_sport_map()
 
 
 async def _api_get(path: str, params: Dict[str, Any]) -> Any:
