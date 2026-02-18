@@ -158,6 +158,30 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_daily_picks_date ON daily_picks (pick_date)"""))
 
+        # P1: match_cache (structured data from APIs)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS match_cache (
+                match_id TEXT PRIMARY KEY,
+                match_data JSONB NOT NULL DEFAULT '{}',
+                odds_updated_at TIMESTAMP NULL,
+                stats_updated_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        # P1: api_usage (tracking API request limits)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS api_usage (
+                id SERIAL PRIMARY KEY,
+                api_name TEXT NOT NULL,
+                endpoint TEXT,
+                called_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                response_code INT,
+                credits_used INT NOT NULL DEFAULT 1
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_api_usage_name_date ON api_usage (api_name, called_at)"""))
+
         # created_at/updated_at
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
