@@ -524,15 +524,19 @@ class SportAPIClient:
 
         # ── Football: use football-data.org (free, current season) ──
         if sport_slug == "football":
-            try:
-                fd_matches = await self._fetch_football_data_org(day)
-                if fd_matches:
-                    logger.info("SportAPI football-data.org OK: n=%d", len(fd_matches))
+            fd_key = _env("FOOTBALL_DATA_KEY")
+            if fd_key:
+                try:
+                    fd_matches = await self._fetch_football_data_org(day)
+                    # football-data.org succeeded (even if 0 matches) → return result
+                    # 0 matches is normal on days without games (weekdays)
+                    logger.info("SportAPI football-data.org: n=%d", len(fd_matches))
                     return fd_matches
-            except Exception as e:
-                logger.warning("football-data.org failed: %s", e)
+                except Exception as e:
+                    logger.warning("football-data.org failed: %s", e)
+                    last_err = e
 
-            # Fallback to api-sports.io if football-data.org fails
+            # Fallback to api-sports.io only if football-data.org key missing or errored
             try:
                 fallback_matches = await self._fallback_api_sports(sport_slug, day)
                 if fallback_matches:
@@ -540,9 +544,9 @@ class SportAPIClient:
             except Exception as fb_err:
                 last_err = fb_err
 
-            if last_err:
-                raise SportAPIError(f"matches_by_date failed for football {day_s}: {last_err}")
-            raise SportAPIError(f"matches_by_date: no matches for football on {day_s}")
+            # If we get here with no matches, return empty list (not an error)
+            logger.info("football: no matches on %s (normal for non-match days)", day_s)
+            return []
 
         # ── For other non-hockey sports: go to api-sports.io ──
         if not self._is_primary_api_sport(sport_slug):
