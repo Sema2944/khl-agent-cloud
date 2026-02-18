@@ -150,8 +150,8 @@ def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
                 s.exec(
                     text("""
                         INSERT INTO daily_picks
-                        (pick_date, match_id, sport_slug, title, league, confidence, analysis_text, pick_type)
-                        VALUES (:d, :mid, :sport, :title, :league, :conf, :txt, :ptype)
+                        (pick_date, match_id, sport_slug, title, league, confidence, analysis_text, pick_type, created_at)
+                        VALUES (:d, :mid, :sport, :title, :league, :conf, :txt, :ptype, NOW())
                     """),
                     params={
                         "d": pick_date.isoformat(),
