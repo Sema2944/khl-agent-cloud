@@ -925,6 +925,66 @@ def _ui_json_schema(*, mode: str, action: str) -> str:
     return _SCHEMA_UI_PRE
 
 
+async def _enrich_match_meta(
+    match_meta: Dict[str, Any],
+    sport_slug: str,
+    mode: str,
+) -> Dict[str, Any]:
+    """
+    Enrich match_meta with external data from Odds API, Sports API, RSS.
+    Adds '_enriched' key with context text for LLM prompts.
+    Never raises — returns original match_meta on any error.
+    """
+    try:
+        from .data_collector import collect_match_data
+        from .prompt_builder import build_enriched_context_text
+
+        title = str(match_meta.get("title") or "")
+        parts = title.split(" — ") if " — " in title else title.split(" - ")
+        home_team = parts[0].strip() if len(parts) >= 2 else title
+        away_team = parts[1].strip() if len(parts) >= 2 else ""
+
+        status = str(match_meta.get("status") or "").upper()
+        raw = match_meta.get("raw") or {}
+
+        # Extract team IDs if available
+        home_team_id = None
+        away_team_id = None
+        teams = raw.get("teams") or {}
+        if isinstance(teams, dict):
+            h = teams.get("home") or {}
+            a = teams.get("away") or {}
+            home_team_id = h.get("id") if isinstance(h, dict) else None
+            away_team_id = a.get("id") if isinstance(a, dict) else None
+
+        ctx = await collect_match_data(
+            match_id=str(match_meta.get("match_id") or ""),
+            home_team=home_team,
+            away_team=away_team,
+            league=str(match_meta.get("league") or ""),
+            country=str(match_meta.get("country") or ""),
+            start_time=str(match_meta.get("start_time") or ""),
+            status=status,
+            sport_slug=sport_slug,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+        )
+
+        enriched_text = build_enriched_context_text(ctx)
+        if enriched_text:
+            match_meta["_enriched"] = enriched_text
+            match_meta["_data_completeness"] = ctx.data_completeness()
+            logger.info(
+                "Enriched match %s: completeness=%d%%",
+                match_meta.get("match_id"), ctx.data_completeness()
+            )
+
+    except Exception:
+        logger.exception("_enrich_match_meta failed — continuing without enrichment")
+
+    return match_meta
+
+
 def _build_ui_prompt(
     match_meta: Dict[str, Any],
     mode: str,
@@ -964,13 +1024,26 @@ def _build_ui_prompt(
 
     depth = "Коротко (overview): 5–10 строк суммарно, упор на практический чек-лист и риски."
 
+    # Remove internal keys from match_meta before sending to LLM
+    meta_clean = {k: v for k, v in match_meta.items() if not k.startswith("_")}
     payload = {
-        "match": match_meta,
+        "match": meta_clean,
         "snapshot": cur,
         "prev_snapshot": prev,
         "mode": mode,
         "action": action,
     }
+
+    # Enriched data from external APIs (Odds, Form, H2H, News)
+    enriched = match_meta.get("_enriched") or ""
+    enrichment_block = ""
+    if enriched:
+        completeness = match_meta.get("_data_completeness", 0)
+        enrichment_block = (
+            f"\n\nДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ (из внешних источников, полнота {completeness}%):\n"
+            + enriched
+            + "\n\nИспользуй эти данные для конкретных цифр в анализе."
+        )
 
     return (
         guard
@@ -984,6 +1057,7 @@ def _build_ui_prompt(
         + "\n\n"
         + "Входные данные (JSON):\n"
         + json.dumps(payload, ensure_ascii=False)
+        + enrichment_block
     )
 
 
@@ -1028,6 +1102,9 @@ def _build_pro_live_prompt(
 
     schema = _SCHEMA_UI_LIVE_PRO
 
+    # Enriched external data (Odds API, Form, H2H, News)
+    enriched = match_meta.get("_enriched") or ""
+
     context_block = "\n".join(filter(None, [
         f"Матч: {title}",
         f"Лига: {league}" if league else "",
@@ -1035,6 +1112,8 @@ def _build_pro_live_prompt(
         f"Счёт: {score}" if score else "",
         "",
         features_text,
+        "",
+        enriched if enriched else "",
     ]))
 
     return (
@@ -1188,6 +1267,9 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     match_meta = await _get_match_context(user_id, match_id)
     sport_slug = str(match_meta.get("sport") or "ice-hockey").strip().lower()
+
+    # ── Enrich with external data (Odds API + Sports API + RSS) ──
+    match_meta = await _enrich_match_meta(match_meta, sport_slug, mode)
 
     prev_snap = _LIVE_SNAPSHOT_BY_MATCH.get(match_id) if mode == "live" else None
     cur_snap = _oddsbase_snapshot(match_meta, mode=mode)
