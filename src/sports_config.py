@@ -119,6 +119,30 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 
     # ==========================================
+    # 🎾 ТЕННИС — Приоритет 1
+    # ==========================================
+    "tennis": {
+        "emoji": "🎾",
+        "name": "Теннис",
+        "slug": "tennis",
+        "bot_slug": "tennis",
+        "enabled": True,  # ATP+WTA via ESPN free API (no key needed)
+        "api_base": "",  # ESPN public API, no base needed
+        "endpoints": {},
+        "match_param": "id",
+        "leagues": {},  # Tournaments loaded dynamically from ESPN
+        "odds_keys": [
+            "tennis_atp_australian_open",
+            "tennis_atp_french_open",
+            "tennis_atp_us_open",
+            "tennis_wta_australian_open",
+            "tennis_wta_french_open",
+            "tennis_wta_us_open",
+        ],
+        "rss_feeds": [],
+    },
+
+    # ==========================================
     # 🏀 БАСКЕТБОЛ — Приоритет 1
     # ==========================================
     "basketball": {
@@ -209,7 +233,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "MMA",
         "slug": "mma",
         "bot_slug": "mma",
-        "enabled": False,  # disabled: api-sports.io free plan blocks current season
+        "enabled": True,  # UFC via ESPN free API (no key needed)
         "api_base": "https://v1.mma.api-sports.io",
         "endpoints": {
             "fixtures": "/fights",
@@ -400,6 +424,8 @@ _SPORT_ALIASES: Dict[str, List[str]] = {
     "ice-hockey": ["hockey", "ice_hockey", "icehockey"],
     "american-football": ["american_football", "nfl"],
     "formula1": ["f1", "formula-1"],
+    "tennis": ["atp", "wta"],
+    "mma": ["ufc", "mixed-martial-arts"],
 }
 
 
