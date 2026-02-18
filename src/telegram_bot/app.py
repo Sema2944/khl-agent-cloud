@@ -685,6 +685,16 @@ async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, In
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")]])
         return text, kb
 
+    if not matches:
+        text = (
+            f"🏟 Матчи сегодня (по МСК) — {title}\n"
+            f"Дата: {today.isoformat()}\n\n"
+            "Сегодня нет запланированных матчей в доступных лигах.\n"
+            "Попробуйте завтра или выберите другой спорт."
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")]])
+        return text, kb
+
     st = _build_nav_state(user_id, sport_slug, matches)
     _NAV_BY_USER[user_id] = st
     return _text_countries(user_id, sport_slug), _kb_countries(user_id, sport_slug)
