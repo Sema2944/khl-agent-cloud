@@ -182,6 +182,36 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_api_usage_name_date ON api_usage (api_name, called_at)"""))
 
+        # P2: payments table (payment history)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                tariff TEXT NOT NULL DEFAULT 'month',
+                amount INT NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT 'RUB',
+                payment_method TEXT NOT NULL DEFAULT 'yukassa',
+                telegram_charge_id TEXT NOT NULL DEFAULT '',
+                provider_charge_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_payments_user_id ON payments (user_id)"""))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_payments_created_at ON payments (created_at)"""))
+
+        # P2: referrals table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                id SERIAL PRIMARY KEY,
+                referrer_id BIGINT NOT NULL,
+                referred_id BIGINT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (referrer_id, referred_id)
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_referrals_referrer ON referrals (referrer_id)"""))
+
         # created_at/updated_at
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
