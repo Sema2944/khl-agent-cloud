@@ -51,16 +51,18 @@ _telegram_app: Optional[Application] = None
 
 TG_TEXT_LIMIT = 3800
 
-SPORT_LABELS = {
-    "ice-hockey": "🏒 Хоккей",
-    "football": "⚽ Футбол",
-    "basketball": "🏀 Баскетбол",
-    "tennis": "🎾 Теннис",
-    "table-tennis": "🏓 Настольный теннис",
-    "esports": "🎮 Киберспорт",
-}
-
-DEFAULT_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "table-tennis", "esports"]
+# Sports config from centralized source
+try:
+    from ..sports_config import get_sport_labels, get_default_sports
+    SPORT_LABELS = get_sport_labels()
+    DEFAULT_SPORTS = get_default_sports()
+except Exception:
+    SPORT_LABELS = {
+        "ice-hockey": "🏒 Хоккей",
+        "football": "⚽ Футбол",
+        "basketball": "🏀 Баскетбол",
+    }
+    DEFAULT_SPORTS = ["ice-hockey", "football", "basketball"]
 
 
 def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
