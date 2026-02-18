@@ -22,6 +22,9 @@ from .pro_db import is_pro
 
 logger = logging.getLogger(__name__)
 
+# Admin guard: only this user can run debug/admin commands
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+
 # ============================================================
 # Telegram limits
 # ============================================================
@@ -49,6 +52,11 @@ _ACTIVE_SPORT_BY_USER: Dict[int, str] = {}
 
 # Stores last LLM meta for UI debug / consistency (per user).
 _LAST_LLM_META_BY_USER: Dict[int, Dict[str, Any]] = {}
+
+# Per-user navigation state (used by text-based nav in run_dialog_agent)
+_ACTIVE_COUNTRY_BY_USER: Dict[int, str] = {}
+_ACTIVE_LEAGUE_BY_USER: Dict[int, str] = {}
+_ACTIVE_PAGE_BY_USER: Dict[int, int] = {}
 
 # Stores last LIVE snapshot per match_id to detect changes (used in LIVE mode).
 # Structure: {match_id: {snapshot fields...}}
@@ -243,9 +251,7 @@ def _msk_today_date():
     Never raises NameError or timezone errors.
     """
     try:
-        if MSK:
-            return datetime.now(MSK).date()
-        return datetime.utcnow().date()
+        return datetime.now(ZoneInfo("Europe/Moscow")).date()
     except Exception:
         return datetime.utcnow().date()
 
@@ -1414,7 +1420,10 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
     norm = raw.lower().strip()
 
     if norm in {"ping", "/ping", "ping!", "пинг"}:
-        return "pong ✅"
+        if ADMIN_TELEGRAM_ID and user_id != ADMIN_TELEGRAM_ID:
+            pass  # non-admin: fall through to normal handling
+        else:
+            return "pong ✅"
 
     # UI callbacks from Telegram come like: UI:<match_id>:<pre|live>:<overview|pro|refresh|markets>
     if norm.startswith("ui:"):
@@ -1522,10 +1531,14 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
             logger.exception("match details failed")
             return f"⚠️ Не удалось открыть матч {match_id}: {type(e).__name__}: {str(e)[:200]}"
 
-    return (
-        "Воспользуйся кнопками меню:\n\n"
-        "🎯 Охотник — топ матчи дня\n"
-        "📊 Анализ матчей\n"
-        "⭐ PRO режим\n\n"
-        "Нажми /start чтобы открыть меню."
-    )
+    try:
+        from .ui_text import MENU_HINT_TEXT
+        return MENU_HINT_TEXT
+    except Exception:
+        return (
+            "Воспользуйся кнопками меню:\n\n"
+            "🎯 Охотник — топ матчи дня\n"
+            "📊 Анализ матчей\n"
+            "⭐ PRO режим\n\n"
+            "Нажми /start чтобы открыть меню."
+        )
