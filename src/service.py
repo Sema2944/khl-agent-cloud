@@ -106,6 +106,73 @@ def _maybe_mount_telegram_routes() -> None:
 _maybe_mount_telegram_routes()
 
 
+async def _hunter_loop():
+    """Background loop: runs daily Hunter at 08:00 UTC."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    # Wait 30 seconds for the app to fully start
+    await asyncio.sleep(30)
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # Check if today's picks exist; if not and it's past 08:00 — run now
+            run_now = False
+            if now.hour >= 8:
+                try:
+                    from .daily_pro import _fetch_all_matches_today
+                    from sqlmodel import Session as SMSession
+                    from sqlalchemy import text
+                    from .db import engine as db_engine
+                    from zoneinfo import ZoneInfo
+                    today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+                    with SMSession(db_engine) as s:
+                        count = s.exec(
+                            text("SELECT COUNT(*) FROM daily_picks WHERE pick_date = :d"),
+                            params={"d": today_msk},
+                        ).scalar()
+                        if not count:
+                            run_now = True
+                except Exception:
+                    logger.exception("Hunter loop: check for existing picks failed")
+
+            if run_now:
+                logger.info("Hunter loop: no picks for today, running now")
+                try:
+                    from .daily_pro import run_daily_hunter
+                    from .telegram_bot.app import _telegram_app
+                    bot = _telegram_app.bot if _telegram_app else None
+                    await run_daily_hunter(bot=bot)
+                except Exception:
+                    logger.exception("Hunter loop: immediate run failed")
+
+            # Calculate sleep until next 08:00 UTC
+            target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait = (target - now).total_seconds()
+            logger.info("Hunter loop: sleeping %.0f seconds until next 08:00 UTC", wait)
+            await asyncio.sleep(wait)
+
+            # Run daily hunter
+            try:
+                from .daily_pro import run_daily_hunter
+                from .telegram_bot.app import _telegram_app
+                bot = _telegram_app.bot if _telegram_app else None
+                await run_daily_hunter(bot=bot)
+            except Exception:
+                logger.exception("Hunter loop: scheduled run failed")
+
+        except asyncio.CancelledError:
+            logger.info("Hunter loop cancelled")
+            break
+        except Exception:
+            logger.exception("Hunter loop: unexpected error, retrying in 60s")
+            await asyncio.sleep(60)
+
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
@@ -124,6 +191,14 @@ async def on_startup():
         logger.info("Telegram startup complete.")
     except Exception as e:
         logger.exception("Telegram startup failed: %s", e)
+
+    # Hunter scheduler (asyncio background task)
+    try:
+        import asyncio
+        asyncio.create_task(_hunter_loop())
+        logger.info("Hunter scheduler started (daily at 08:00 UTC)")
+    except Exception:
+        logger.exception("Hunter scheduler failed to start")
 
 
 @app.on_event("shutdown")
