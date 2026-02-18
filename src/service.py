@@ -173,6 +173,29 @@ async def _hunter_loop():
             await asyncio.sleep(60)
 
 
+async def _expiry_loop():
+    """Background loop: checks expired subscriptions every hour."""
+    import asyncio
+
+    # Wait 60 seconds for app to start
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            from .telegram_bot.payments import check_expired_subscriptions
+            from .telegram_bot.app import _telegram_app
+            bot = _telegram_app.bot if _telegram_app else None
+            await check_expired_subscriptions(bot)
+        except asyncio.CancelledError:
+            logger.info("Expiry loop cancelled")
+            break
+        except Exception:
+            logger.exception("Expiry loop: error")
+
+        # Sleep 1 hour
+        await asyncio.sleep(3600)
+
+
 @app.on_event("startup")
 async def on_startup():
     init_db()
@@ -199,6 +222,14 @@ async def on_startup():
         logger.info("Hunter scheduler started (daily at 08:00 UTC)")
     except Exception:
         logger.exception("Hunter scheduler failed to start")
+
+    # Subscription expiry checker (every hour)
+    try:
+        import asyncio
+        asyncio.create_task(_expiry_loop())
+        logger.info("Subscription expiry checker started (hourly)")
+    except Exception:
+        logger.exception("Expiry checker failed to start")
 
 
 @app.on_event("shutdown")
