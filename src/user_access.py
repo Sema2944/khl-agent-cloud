@@ -9,14 +9,16 @@ from typing import List, Optional
 # parsing.py / ui может ожидать is_pro(user_id) — добавим совместимость.
 
 
-DEFAULT_ALLOWED_SPORTS: List[str] = [
-    "football",
-    "ice-hockey",
-    "basketball",
-    "tennis",
-    "table-tennis",
-    "esports",
-]
+# Load from centralized config
+try:
+    from .sports_config import get_default_sports
+    DEFAULT_ALLOWED_SPORTS: List[str] = get_default_sports()
+except Exception:
+    DEFAULT_ALLOWED_SPORTS: List[str] = [
+        "football",
+        "ice-hockey",
+        "basketball",
+    ]
 
 
 @dataclass
