@@ -126,7 +126,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Баскетбол",
         "slug": "basketball",
         "bot_slug": "basketball",
-        "enabled": True,
+        "enabled": False,  # disabled: api-sports.io free plan blocks current season
         "api_base": "https://v1.basketball.api-sports.io",
         "endpoints": {
             "fixtures":   "/games",
@@ -158,7 +158,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Волейбол",
         "slug": "volleyball",
         "bot_slug": "volleyball",
-        "enabled": True,
+        "enabled": False,  # disabled: api-sports.io free plan blocks current season
         "api_base": "https://v1.volleyball.api-sports.io",
         "endpoints": {
             "fixtures":   "/games",
@@ -184,7 +184,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Гандбол",
         "slug": "handball",
         "bot_slug": "handball",
-        "enabled": True,
+        "enabled": False,  # disabled: api-sports.io free plan blocks current season
         "api_base": "https://v1.handball.api-sports.io",
         "endpoints": {
             "fixtures":   "/games",
@@ -209,7 +209,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "MMA",
         "slug": "mma",
         "bot_slug": "mma",
-        "enabled": True,
+        "enabled": False,  # disabled: api-sports.io free plan blocks current season
         "api_base": "https://v1.mma.api-sports.io",
         "endpoints": {
             "fixtures": "/fights",
