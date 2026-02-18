@@ -1,109 +1,479 @@
 # src/telegram_bot/payments.py
+"""
+Payment system: multi-tier tariffs (RUB via ЮKassa + Telegram Stars).
+
+Tariffs:
+  - week   (7 дней)   — 299₽  / 150 Stars
+  - month  (30 дней)  — 799₽  / 400 Stars
+  - season (180 дней) — 4990₽ / 2500 Stars
+
+Flow: kb_tariffs → send_invoice → pre_checkout → successful_payment → grant_pro
+"""
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
 from telegram.ext import ContextTypes
-
-from ..user_store import get_user, activate_premium
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 PAYMENTS_PROVIDER_TOKEN = (os.getenv("PAYMENTS_PROVIDER_TOKEN") or "").strip()
-PREMIUM_PRICE_RUB = int((os.getenv("PREMIUM_PRICE_RUB") or "299").strip())
-PREMIUM_DAYS = int((os.getenv("PREMIUM_DAYS") or "30").strip())
-PREMIUM_CURRENCY = (os.getenv("PREMIUM_CURRENCY") or "RUB").strip().upper()
-PREMIUM_PAYLOAD = (os.getenv("PREMIUM_PAYLOAD") or "premium_month").strip()
 
-TRIAL_LIVE_ENABLED = (os.getenv("TRIAL_LIVE_ENABLED") or "1").strip() == "1"
+# If no provider token → we use Telegram Stars (XTR currency, no юрлицо needed)
+def _use_stars() -> bool:
+    return not PAYMENTS_PROVIDER_TOKEN
 
-def kb_paywall(user_id: int) -> InlineKeyboardMarkup:
-    u = get_user(user_id)
-    rows = []
 
-    rows.append([InlineKeyboardButton("💳 Оформить Premium", callback_data="PAY:PREMIUM")])
+# ---------------------------------------------------------------------------
+# Tariffs
+# ---------------------------------------------------------------------------
+@dataclass
+class Tariff:
+    key: str          # "week" / "month" / "season"
+    label: str        # display name
+    days: int
+    price_rub: int    # in rubles
+    price_stars: int   # Telegram Stars amount
+    emoji: str
 
-    if TRIAL_LIVE_ENABLED and not u.trial_live_used:
-        rows.append([InlineKeyboardButton("🎁 1 пробный LIVE", callback_data="PAY:TRIAL_LIVE")])
 
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MATCHES")])
-    return InlineKeyboardMarkup(rows)
+TARIFFS: Dict[str, Tariff] = {
+    "week": Tariff(
+        key="week", label="Неделя", days=7,
+        price_rub=299, price_stars=150, emoji="7️⃣",
+    ),
+    "month": Tariff(
+        key="month", label="Месяц", days=30,
+        price_rub=799, price_stars=400, emoji="30️⃣",
+    ),
+    "season": Tariff(
+        key="season", label="Сезон", days=180,
+        price_rub=4990, price_stars=2500, emoji="🏆",
+    ),
+}
 
-def paywall_text(user_id: int) -> str:
-    u = get_user(user_id)
-    lines = []
-    lines.append("🟢 LIVE-обзор — Premium")
+
+# ---------------------------------------------------------------------------
+# UI: tariff selection screen
+# ---------------------------------------------------------------------------
+def tariff_text() -> str:
+    use_stars = _use_stars()
+    lines = [
+        "⭐ PRO доступ — Выбери тариф\n",
+        "Что входит в PRO:",
+        "• Охотник — AI-подборка лучших матчей каждый день",
+        "• LIVE PRO — детальный анализ по ходу матча",
+        "• Расширенная аналитика с данными API",
+        "",
+    ]
+    for t in TARIFFS.values():
+        if use_stars:
+            lines.append(f"{t.emoji} {t.label} ({t.days} дн.) — {t.price_stars} Stars")
+        else:
+            lines.append(f"{t.emoji} {t.label} ({t.days} дн.) — {t.price_rub}₽")
     lines.append("")
-    lines.append("Что входит в Premium:")
-    lines.append("• LIVE-логика движения линии без чисел и призывов")
-    lines.append("• Быстрые обновления по кнопке 🔄")
-    lines.append("• Доступ к LIVE по всем матчам")
-    lines.append("")
-    if TRIAL_LIVE_ENABLED and not u.trial_live_used:
-        lines.append("🎁 Доступен 1 пробный LIVE.")
-    lines.append("Дисклеймер: аналитика, не рекомендация.")
+    lines.append("Выбери тариф ниже 👇")
     return "\n".join(lines)
 
-async def send_premium_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not PAYMENTS_PROVIDER_TOKEN:
-        await update.effective_message.reply_text("Оплата временно недоступна (PAYMENTS_PROVIDER_TOKEN не задан).")
+
+def kb_tariffs() -> InlineKeyboardMarkup:
+    use_stars = _use_stars()
+    rows: List[List[InlineKeyboardButton]] = []
+    for t in TARIFFS.values():
+        price = f"{t.price_stars} ⭐" if use_stars else f"{t.price_rub}₽"
+        rows.append([
+            InlineKeyboardButton(
+                f"{t.emoji} {t.label} — {price}",
+                callback_data=f"PAY:{t.key}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------------------
+# Invoice sending
+# ---------------------------------------------------------------------------
+async def send_invoice(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tariff_key: str,
+) -> None:
+    """Send Telegram payment invoice for selected tariff."""
+    tariff = TARIFFS.get(tariff_key)
+    if not tariff:
+        await update.effective_message.reply_text("Неизвестный тариф.")
         return
 
     chat_id = update.effective_chat.id
-    title = "Premium доступ на 30 дней"
-    description = "Открывает LIVE-обзор и расширенные функции."
-    payload = PREMIUM_PAYLOAD
+    user_id = update.effective_user.id if update.effective_user else 0
+    use_stars = _use_stars()
 
-    prices = [LabeledPrice(label=title, amount=PREMIUM_PRICE_RUB * 100)]  # в копейках
+    title = f"PRO {tariff.label} ({tariff.days} дн.)"
+    description = "Полный доступ к PRO-функциям: Охотник, LIVE PRO, расширенная аналитика."
+    payload = f"pro_{tariff.key}_{user_id}"
 
-    await context.bot.send_invoice(
-        chat_id=chat_id,
-        title=title,
-        description=description,
-        payload=payload,
-        provider_token=PAYMENTS_PROVIDER_TOKEN,
-        currency=PREMIUM_CURRENCY,
-        prices=prices,
-        need_name=False,
-        need_phone_number=False,
-        need_email=False,
-        need_shipping_address=False,
-        is_flexible=False,
-    )
+    if use_stars:
+        # Telegram Stars — currency XTR, provider_token empty string
+        prices = [LabeledPrice(label=title, amount=tariff.price_stars)]
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=prices,
+        )
+    else:
+        # ЮKassa (RUB) — amount in kopecks
+        prices = [LabeledPrice(label=title, amount=tariff.price_rub * 100)]
+        await context.bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token=PAYMENTS_PROVIDER_TOKEN,
+            currency="RUB",
+            prices=prices,
+            need_name=False,
+            need_phone_number=False,
+            need_email=False,
+            need_shipping_address=False,
+            is_flexible=False,
+        )
 
-async def handle_pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Invoice sent: user=%s tariff=%s stars=%s", user_id, tariff_key, use_stars)
+
+
+# ---------------------------------------------------------------------------
+# Pre-checkout validation
+# ---------------------------------------------------------------------------
+async def handle_pre_checkout(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Validate pre-checkout query — always approve if payload is valid."""
     q = update.pre_checkout_query
     if not q:
         return
 
-    # валидируем payload
-    if q.invoice_payload != PREMIUM_PAYLOAD:
-        await q.answer(ok=False, error_message="Некорректный payload. Попробуй ещё раз.")
+    payload = q.invoice_payload or ""
+    # Payload format: pro_<tariff_key>_<user_id>
+    if not payload.startswith("pro_"):
+        await q.answer(ok=False, error_message="Некорректный платёж. Попробуй ещё раз.")
+        return
+
+    parts = payload.split("_", 2)
+    tariff_key = parts[1] if len(parts) > 1 else ""
+    if tariff_key not in TARIFFS:
+        await q.answer(ok=False, error_message="Неизвестный тариф.")
         return
 
     await q.answer(ok=True)
 
-async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+# ---------------------------------------------------------------------------
+# Successful payment
+# ---------------------------------------------------------------------------
+async def handle_successful_payment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Process successful payment: grant PRO + log + notify."""
     msg = update.message
     if not msg or not msg.successful_payment:
         return
 
-    user_id = update.effective_user.id
+    user_id = update.effective_user.id if update.effective_user else 0
     sp = msg.successful_payment
+    payload = sp.invoice_payload or ""
 
-    if sp.invoice_payload != PREMIUM_PAYLOAD:
-        await msg.reply_text("Платёж получен, но payload не распознан. Напиши в поддержку.")
-        return
+    # Parse payload
+    parts = payload.split("_", 2)
+    tariff_key = parts[1] if len(parts) > 1 else "month"
+    tariff = TARIFFS.get(tariff_key)
+    if not tariff:
+        tariff = TARIFFS["month"]  # fallback
 
-    u = activate_premium(user_id, PREMIUM_DAYS)
-    until = u.premium_until.isoformat() if u.premium_until else "—"
+    # Grant PRO
+    try:
+        from ..pro_db import grant_pro
+        ok = grant_pro(user_id, days=tariff.days)
+        if not ok:
+            logger.error("grant_pro failed for user=%s after payment", user_id)
+    except Exception:
+        logger.exception("grant_pro error after payment user=%s", user_id)
 
+    # Determine payment info for logging
+    use_stars = _use_stars()
+    amount = tariff.price_stars if use_stars else tariff.price_rub
+    currency = "XTR" if use_stars else "RUB"
+
+    # Log payment to DB
+    try:
+        _log_payment(
+            user_id=user_id,
+            tariff_key=tariff.key,
+            amount=amount,
+            currency=currency,
+            payment_method="stars" if use_stars else "yukassa",
+            telegram_payment_charge_id=sp.telegram_payment_charge_id or "",
+            provider_payment_charge_id=sp.provider_payment_charge_id or "",
+        )
+    except Exception:
+        logger.exception("Payment log failed user=%s", user_id)
+
+    # Get premium_until for display
+    until_str = "—"
+    try:
+        from ..pro_db import get_pro_status
+        status = get_pro_status(user_id)
+        pu = status.get("premium_until")
+        if pu:
+            if isinstance(pu, datetime):
+                until_str = pu.strftime("%d.%m.%Y")
+            elif isinstance(pu, str):
+                until_str = pu[:10]
+    except Exception:
+        pass
+
+    price_label = f"{tariff.price_stars} Stars" if use_stars else f"{tariff.price_rub}₽"
     await msg.reply_text(
-        "✅ Оплата прошла!\n"
-        f"Premium активирован до: {until}\n\n"
-        "Теперь можешь пользоваться 🟢 LIVE.",
+        f"✅ Оплата прошла!\n\n"
+        f"Тариф: {tariff.emoji} {tariff.label} ({tariff.days} дн.)\n"
+        f"Сумма: {price_label}\n"
+        f"PRO активен до: {until_str}\n\n"
+        "Теперь доступны: Охотник, LIVE PRO, расширенная аналитика.\n"
+        "Нажми /start для возврата в меню.",
     )
+    logger.info(
+        "Payment OK: user=%s tariff=%s amount=%s %s",
+        user_id, tariff.key, amount, currency,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Payment logging (DB)
+# ---------------------------------------------------------------------------
+def _log_payment(
+    user_id: int,
+    tariff_key: str,
+    amount: int,
+    currency: str,
+    payment_method: str,
+    telegram_payment_charge_id: str = "",
+    provider_payment_charge_id: str = "",
+) -> None:
+    """Save payment record to the payments table."""
+    from sqlalchemy import text as sa_text
+    from ..db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        session.exec(
+            sa_text("""
+                INSERT INTO payments (
+                    user_id, tariff, amount, currency, payment_method,
+                    telegram_charge_id, provider_charge_id, status, created_at
+                ) VALUES (
+                    :uid, :tariff, :amount, :currency, :method,
+                    :tg_charge, :prov_charge, 'completed', NOW()
+                )
+            """),
+            params={
+                "uid": user_id,
+                "tariff": tariff_key,
+                "amount": amount,
+                "currency": currency,
+                "method": payment_method,
+                "tg_charge": telegram_payment_charge_id,
+                "prov_charge": provider_payment_charge_id,
+            },
+        )
+        session.commit()
+        logger.info("Payment logged: user=%s tariff=%s", user_id, tariff_key)
+    except Exception:
+        session.rollback()
+        logger.exception("_log_payment failed")
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Subscription expiry checker (called from cron in service.py)
+# ---------------------------------------------------------------------------
+async def check_expired_subscriptions(bot) -> None:
+    """
+    Check for expiring/expired PRO subscriptions:
+    1. Notify users 24h before expiry
+    2. Deactivate expired subscriptions
+    """
+    from sqlalchemy import text as sa_text
+    from ..db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        # 1. Notify users expiring within 24 hours (but not yet expired)
+        rows = session.exec(
+            sa_text("""
+                SELECT tg_user_id, premium_until
+                FROM users
+                WHERE is_premium = TRUE
+                  AND premium_until IS NOT NULL
+                  AND premium_until > NOW()
+                  AND premium_until <= NOW() + INTERVAL '24 hours'
+                  AND tg_user_id IS NOT NULL
+            """)
+        ).all()
+
+        for row in rows:
+            try:
+                uid = row[0]
+                until = row[1]
+                until_str = until.strftime("%d.%m.%Y %H:%M") if isinstance(until, datetime) else str(until)[:16]
+                if bot:
+                    await bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"⏰ Твой PRO доступ истекает {until_str} (МСК)\n\n"
+                            "Продли подписку, чтобы не потерять доступ к Охотнику и LIVE PRO.\n"
+                            "Нажми /start → PRO режим"
+                        ),
+                    )
+                    logger.info("Expiry notification sent to user=%s", uid)
+            except Exception:
+                logger.debug("Failed to notify user=%s about expiry", row[0])
+
+        # 2. Deactivate expired subscriptions
+        result = session.exec(
+            sa_text("""
+                UPDATE users
+                SET is_premium = FALSE,
+                    updated_at = NOW()
+                WHERE is_premium = TRUE
+                  AND premium_until IS NOT NULL
+                  AND premium_until <= NOW()
+            """)
+        )
+        session.commit()
+
+        affected = result.rowcount if hasattr(result, 'rowcount') else 0
+        if affected:
+            logger.info("Deactivated %d expired subscriptions", affected)
+
+    except Exception:
+        session.rollback()
+        logger.exception("check_expired_subscriptions failed")
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Referral bonus
+# ---------------------------------------------------------------------------
+REFERRAL_BONUS_DAYS = 3  # бонус за реферала (и приглашённому, и пригласившему)
+
+async def process_referral(
+    new_user_id: int,
+    referrer_id: int,
+    bot=None,
+) -> None:
+    """
+    Process referral: give bonus days to both referrer and new user.
+    Called from handle_start when ref_ deep link is detected.
+    """
+    if new_user_id == referrer_id:
+        return  # нельзя пригласить себя
+
+    from sqlalchemy import text as sa_text
+    from ..db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        # Check if referral already recorded
+        exists = session.exec(
+            sa_text("""
+                SELECT 1 FROM referrals
+                WHERE referrer_id = :ref AND referred_id = :new
+                LIMIT 1
+            """),
+            params={"ref": referrer_id, "new": new_user_id},
+        ).first()
+
+        if exists:
+            return  # already processed
+
+        # Record referral
+        session.exec(
+            sa_text("""
+                INSERT INTO referrals (referrer_id, referred_id, created_at)
+                VALUES (:ref, :new, NOW())
+            """),
+            params={"ref": referrer_id, "new": new_user_id},
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception("process_referral: DB error")
+        return
+    finally:
+        session.close()
+
+    # Grant bonus days to both
+    try:
+        from ..pro_db import grant_pro, is_pro, get_pro_status
+
+        # Referrer: extend or grant
+        grant_pro(referrer_id, days=REFERRAL_BONUS_DAYS)
+
+        # New user: extend or grant
+        grant_pro(new_user_id, days=REFERRAL_BONUS_DAYS)
+
+        # Notify referrer
+        if bot:
+            try:
+                await bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        f"🎉 По твоей ссылке зарегистрирован новый пользователь!\n"
+                        f"+{REFERRAL_BONUS_DAYS} дня PRO в подарок."
+                    ),
+                )
+            except Exception:
+                logger.debug("Failed to notify referrer=%s", referrer_id)
+
+    except Exception:
+        logger.exception("process_referral: grant_pro failed")
+
+
+def get_referral_link(user_id: int, bot_username: str) -> str:
+    """Generate referral deep link for a user."""
+    return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+
+def get_referral_count(user_id: int) -> int:
+    """Count how many users were referred by this user."""
+    from sqlalchemy import text as sa_text
+    from ..db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        count = session.exec(
+            sa_text("SELECT COUNT(*) FROM referrals WHERE referrer_id = :uid"),
+            params={"uid": user_id},
+        ).scalar()
+        return int(count or 0)
+    except Exception:
+        logger.exception("get_referral_count failed")
+        return 0
+    finally:
+        session.close()
