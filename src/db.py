@@ -137,6 +137,27 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP NULL"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_live_used BOOLEAN NOT NULL DEFAULT FALSE"""))
 
+        # P0: onboarding + hunter trial
+        conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS user_seen_intro BOOLEAN NOT NULL DEFAULT FALSE"""))
+        conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP NULL"""))
+
+        # P0: daily_picks table (Hunter)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS daily_picks (
+                id SERIAL PRIMARY KEY,
+                pick_date DATE NOT NULL,
+                match_id TEXT NOT NULL DEFAULT '',
+                sport_slug TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                league TEXT NOT NULL DEFAULT '',
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                analysis_text TEXT NOT NULL DEFAULT '',
+                pick_type TEXT NOT NULL DEFAULT 'top3',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_daily_picks_date ON daily_picks (pick_date)"""))
+
         # created_at/updated_at
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
