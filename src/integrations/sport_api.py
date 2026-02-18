@@ -705,12 +705,20 @@ class SportAPIClient:
                         "league": league_id,
                         "season": league_info.get("season", 2025),
                         "date": day_s,
+                        "timezone": "Europe/Moscow",
                     }
                     logger.info(
                         "api-sports.io: GET %s league=%s season=%s date=%s",
                         url, league_id, params["season"], day_s,
                     )
                     resp = await client.get(url, headers=headers, params=params)
+
+                    # Log remaining requests from response headers
+                    remaining = resp.headers.get("x-ratelimit-requests-remaining", "?")
+                    logger.info(
+                        "api-sports.io: league=%d HTTP %d, remaining_requests=%s",
+                        league_id, resp.status_code, remaining,
+                    )
 
                     if resp.status_code != 200:
                         body = (resp.text or "")[:300]
@@ -722,9 +730,17 @@ class SportAPIClient:
 
                     data = resp.json()
                     items = data.get("response") or []
+                    # Log errors array if present (api-sports.io sends errors here)
+                    errors = data.get("errors")
+                    if errors:
+                        logger.warning(
+                            "api-sports.io: league=%d errors=%s",
+                            league_id, errors,
+                        )
+                    results_count = data.get("results", 0)
                     logger.info(
-                        "api-sports.io: league=%d (%s) → %d matches",
-                        league_id, league_info.get("name", ""), len(items),
+                        "api-sports.io: league=%d (%s) → %d matches (results=%s)",
+                        league_id, league_info.get("name", ""), len(items), results_count,
                     )
 
                     for item in items:
@@ -737,7 +753,14 @@ class SportAPIClient:
                     logger.exception("api-sports.io: error fetching league=%d sport=%s", league_id, sport_slug)
                     continue
 
-        logger.info("api-sports.io: total %d matches for %s %s", len(all_matches), sport_slug, day_s)
+        if all_matches:
+            logger.info("api-sports.io: total %d matches for %s %s", len(all_matches), sport_slug, day_s)
+        else:
+            logger.warning(
+                "api-sports.io: 0 total matches for %s on %s. "
+                "Possible causes: free tier limits, wrong season, or no games scheduled.",
+                sport_slug, day_s,
+            )
         return all_matches
 
     async def _fallback_match_details(self, sport_slug: str, match_id: str) -> Optional[MatchDTO]:
