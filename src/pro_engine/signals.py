@@ -104,8 +104,11 @@ def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, An
         score_score = _clamp((score_h - score_a) * 15, -30, 30)
         inputs_used.append("score")
 
-    if not inputs_used:
-        return {"value": 50, "winner": "–", "explain": "нет данных", "confidence": 0.1, "inputs_used": []}
+    # Rule: MCI requires at least shots or odds — score alone is NOT enough
+    # (score 0:0 at 20-5 shots ≠ MCI 50; score alone = scoreboard data, not PRO value)
+    if not has_shots and not has_ml:
+        return {"value": None, "winner": "–", "explain": "недостаточно данных для MCI (нет бросков и коэффициентов)",
+                "confidence": 0.0, "inputs_used": inputs_used}
 
     if has_shots and has_ml:
         mci = 50 + 0.55 * shot_score + 0.25 * market_score + 0.20 * score_score
@@ -114,7 +117,7 @@ def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, An
     elif has_ml:
         mci = 50 + 0.70 * market_score + 0.30 * score_score
     else:
-        mci = 50 + score_score
+        mci = 50 + score_score  # unreachable due to guard above
 
     mci = int(round(_clamp(mci, 0, 100)))
 
@@ -336,7 +339,7 @@ def _data_flags(shots_h, shots_a, ml_h, ml_a, period, pen_h, pen_a) -> Dict[str,
 
 def _empty_signals() -> Dict[str, Any]:
     return {
-        "mci": {"value": 50, "winner": "–", "explain": "ошибка расчёта", "confidence": 0.0, "inputs_used": []},
+        "mci": {"value": None, "winner": "–", "explain": "ошибка расчёта", "confidence": 0.0, "inputs_used": []},
         "momentum": {"value": None, "delta_home": None, "delta_away": None, "explain": "недоступно", "confidence": 0.0, "inputs_used": []},
         "market": {"ml_home": None, "ml_away": None, "status": "недоступно", "explain": "", "drift_team": None, "delta_implied_home": None, "confidence": 0.0, "inputs_used": []},
         "risk": {"value": 3, "factors": [], "explain": "неизвестно", "confidence": 0.0, "inputs_used": []},
