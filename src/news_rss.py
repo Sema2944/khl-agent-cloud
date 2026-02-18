@@ -14,24 +14,28 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# RSS feeds by sport category
-RSS_FEEDS: Dict[str, List[str]] = {
-    "ice-hockey": [
-        "https://www.championat.com/hockey/_khl/rss.xml",
-        "https://sport-express.ru/hockey/khl/rss/",
-    ],
-    "hockey": [
-        "https://www.championat.com/hockey/_khl/rss.xml",
-        "https://sport-express.ru/hockey/khl/rss/",
-    ],
-    "football": [
-        "https://www.championat.com/football/rss.xml",
-        "https://sport-express.ru/football/rss/",
-    ],
-    "basketball": [
-        "https://www.championat.com/basketball/rss.xml",
-    ],
-}
+# RSS feeds by sport category (loaded from centralized config)
+def _build_rss_feeds() -> Dict[str, List[str]]:
+    try:
+        from .sports_config import SPORTS_CONFIG
+        feeds: Dict[str, List[str]] = {}
+        for slug, cfg in SPORTS_CONFIG.items():
+            rss = cfg.get("rss_feeds", [])
+            if rss:
+                feeds[slug] = rss
+        # Add alias "hockey" -> "ice-hockey"
+        if "ice-hockey" in feeds:
+            feeds["hockey"] = feeds["ice-hockey"]
+        return feeds
+    except Exception:
+        return {
+            "ice-hockey": ["https://www.championat.com/hockey/_khl/rss.xml"],
+            "hockey": ["https://www.championat.com/hockey/_khl/rss.xml"],
+            "football": ["https://www.championat.com/football/rss.xml"],
+            "basketball": ["https://www.championat.com/basketball/rss.xml"],
+        }
+
+RSS_FEEDS: Dict[str, List[str]] = _build_rss_feeds()
 
 # Team name aliases for fuzzy matching in news
 TEAM_ALIASES: Dict[str, List[str]] = {
