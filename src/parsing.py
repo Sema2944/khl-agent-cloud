@@ -17,7 +17,6 @@ from sqlalchemy import text
 
 from .db import get_session
 from . import bets_db
-from .expert_db import ExpertStrategy
 from .llm_client import analyze_with_llm_cached
 from .pro_db import is_pro
 
@@ -337,99 +336,6 @@ def _consume_trial_live(session: Session, user_id: int) -> bool:
         session.rollback()
         logger.exception("_consume_trial_live failed")
         return False
-
-
-# -----------------------------
-# Экспертная стратегия
-# -----------------------------
-def _get_strategy_row(session: Session, day) -> Optional[ExpertStrategy]:
-    st = (
-        select(ExpertStrategy)
-        .where(ExpertStrategy.date == day)
-        .order_by(ExpertStrategy.updated_at.desc())
-    )
-    return session.exec(st).first()
-
-
-def _format_expert_strategy_for_today() -> str:
-    today = _msk_today_date()
-
-    text_ = ""
-    date_label = today.isoformat()
-
-    try:
-        with db_session() as session:
-            row = _get_strategy_row(session, today)
-            if row and row.text:
-                text_ = row.text
-                date_label = row.date.isoformat()
-    except Exception:
-        logger.exception("expert_strategy table missing or db error (fallback to env)")
-
-    if not text_ and EXPERT_STRATEGY_TEXT:
-        text_ = EXPERT_STRATEGY_TEXT
-        date_label = EXPERT_STRATEGY_DATE or date_label
-
-    if not text_:
-        return (
-            "👤 Стратегия эксперта на сегодня (по МСК)\n"
-            "Пока не опубликована.\n\n"
-            "Если ты админ — обнови командой:\n"
-            "админ стратегия: <текст>"
-        )
-
-    return "\n".join(
-        [
-            "👤 Стратегия эксперта на сегодня (по МСК)",
-            f"Дата: {date_label}",
-            "",
-            text_,
-            "",
-            "Дисклеймер: это аналитическая заметка, не призыв к действию.",
-        ]
-    )
-
-
-def _try_admin_update_strategy(user_id: int, raw_text: str) -> Tuple[bool, str]:
-    if ADMIN_TELEGRAM_ID <= 0:
-        return False, "ADMIN_TELEGRAM_ID не задан в окружении backend."
-    if user_id != ADMIN_TELEGRAM_ID:
-        return False, "Доступ запрещён."
-
-    m = re.match(
-        r"админ\s+стратегия\s*:\s*(.+)$",
-        (raw_text or "").strip(),
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        return False, "Неверный формат. Пример: админ стратегия: текст..."
-
-    new_text = m.group(1).strip()
-    if not new_text:
-        return False, "Пустой текст стратегии."
-
-    today = _msk_today_date()
-    now = datetime.utcnow()
-
-    with db_session() as session:
-        row = _get_strategy_row(session, today)
-        if row is None:
-            row = ExpertStrategy(
-                date=today,
-                text=new_text,
-                created_at=now,
-                updated_at=now,
-                updated_by=user_id,
-            )
-            session.add(row)
-        else:
-            row.text = new_text
-            row.updated_at = now
-            row.updated_by = user_id
-            session.add(row)
-        session.commit()
-
-    return True, "✅ Стратегия обновлена (по МСК)."
 
 
 # -----------------------------
@@ -1534,26 +1440,10 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
             logger.exception("match details failed")
             return f"⚠️ Не удалось открыть матч {match_id}: {type(e).__name__}: {str(e)[:200]}"
 
-    if "стратег" in norm:
-        try:
-            return _format_expert_strategy_for_today()
-        except Exception as e:
-            logger.exception("strategy failed")
-            return f"⚠️ Стратегия недоступна: {type(e).__name__}: {str(e)[:160]}"
-
-    try:
-        ok, msg = _try_admin_update_strategy(user_id, raw)
-        if ok:
-            return msg
-    except Exception:
-        pass
-
     return (
-        "Не понял команду.\n\n"
-        "Доступно:\n"
-        "• ping\n"
-        "• матчи сегодня [ice-hockey|football|basketball|tennis|table-tennis|esports]\n"
-        "• страна: <название>\n"
-        "• лига: <страна> | <лига> | <страница>\n"
-        "• матч <match_id>\n"
+        "Воспользуйся кнопками меню:\n\n"
+        "🎯 Охотник — топ матчи дня\n"
+        "📊 Анализ матчей\n"
+        "⭐ PRO режим\n\n"
+        "Нажми /start чтобы открыть меню."
     )
