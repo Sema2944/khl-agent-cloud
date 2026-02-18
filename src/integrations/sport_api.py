@@ -430,13 +430,40 @@ class SportAPIClient:
         )
 
 
+    def _is_primary_api_sport(self, sport_slug: str) -> bool:
+        """Check if primary API (SPORT_API_BASE) supports this sport.
+        Currently api-sport.ru only works for ice-hockey."""
+        return sport_slug in {"ice-hockey", "hockey"}
+
     async def matches_by_date(self, sport_slug: str, day: date) -> List[MatchDTO]:
         sport_slug = (sport_slug or "").strip().lower()
         if not sport_slug:
             raise SportAPIError("matches_by_date: sport_slug is empty")
 
         day_s = day.isoformat()
+        last_err: Optional[Exception] = None
 
+        # ── For non-hockey sports: go DIRECTLY to api-sports.io ──
+        if not self._is_primary_api_sport(sport_slug):
+            try:
+                fallback_matches = await self._fallback_api_sports(sport_slug, day)
+                if fallback_matches:
+                    logger.info(
+                        "SportAPI api-sports.io OK: sport=%s n=%d",
+                        sport_slug, len(fallback_matches),
+                    )
+                    return fallback_matches
+                else:
+                    logger.warning("SportAPI api-sports.io returned 0 matches for %s %s", sport_slug, day_s)
+            except Exception as fb_err:
+                logger.exception("SportAPI api-sports.io failed for %s: %s", sport_slug, fb_err)
+                last_err = fb_err
+
+            if last_err:
+                raise SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
+            raise SportAPIError(f"matches_by_date: no matches for {sport_slug} on {day_s} (check API_SPORTS_KEY)")
+
+        # ── Hockey: try primary API first (api-sport.ru) ──
         params = {
             "date": day_s,
             "day": day_s,
@@ -460,8 +487,6 @@ class SportAPIClient:
             ("/v2/{sport}/games", {"date": day_s}),
             ("/v2/{sport}/events/date/{day}", None),
         ]
-
-        last_err: Optional[Exception] = None
 
         for cand in candidates:
             for tpl, p in paths:
@@ -488,7 +513,7 @@ class SportAPIClient:
                 except Exception as e:
                     last_err = e
 
-        # ── Fallback: api-sports.io (works for all sports) ──
+        # ── Fallback for hockey too: api-sports.io ──
         try:
             fallback_matches = await self._fallback_api_sports(sport_slug, day)
             if fallback_matches:
@@ -511,6 +536,23 @@ class SportAPIClient:
         if not sport_slug or not match_id:
             raise SportAPIError("match_details: missing sport_slug or match_id")
 
+        last_err: Optional[Exception] = None
+
+        # ── For non-hockey sports: use api-sports.io directly ──
+        if not self._is_primary_api_sport(sport_slug):
+            try:
+                dto = await self._fallback_match_details(sport_slug, match_id)
+                if dto:
+                    return dto
+            except Exception as e:
+                last_err = e
+                logger.warning("api-sports.io match_details failed for %s/%s: %s", sport_slug, match_id, e)
+
+            if last_err:
+                raise SportAPIError(f"match_details failed: {sport_slug}/{match_id}: {last_err}")
+            raise SportAPIError(f"match_details: not found {sport_slug}/{match_id}")
+
+        # ── Hockey: try primary API ──
         candidates_tpl = [
             "/v2/{sport}/matches/{id}",
             "/v2/{sport}/events/{id}",
@@ -518,8 +560,6 @@ class SportAPIClient:
             "/v2/{sport}/event/{id}",
             "/v2/{sport}/game/{id}",
         ]
-
-        last_err: Optional[Exception] = None
 
         sports = [sport_slug] + [s for s in SPORT_ALIASES.get(sport_slug, []) if s != sport_slug]
 
@@ -533,6 +573,14 @@ class SportAPIClient:
                         return self._match_to_dto(obj, sport_slug)
                 except Exception as e:
                     last_err = e
+
+        # ── Fallback for hockey too ──
+        try:
+            dto = await self._fallback_match_details(sport_slug, match_id)
+            if dto:
+                return dto
+        except Exception:
+            pass
 
         raise SportAPIError(f"match_details failed: {sport_slug}/{match_id}: {last_err}")
 
@@ -611,28 +659,38 @@ class SportAPIClient:
 
     async def _fallback_api_sports(self, sport_slug: str, day: date) -> List[MatchDTO]:
         """
-        Fallback: fetch matches from api-sports.io when primary API fails.
+        Fetch matches from api-sports.io.
+        For non-hockey sports this is the PRIMARY source.
         Uses sports_config for correct endpoints/leagues per sport.
         """
         try:
             from ..sports_config import get_sport_config, get_leagues
         except ImportError:
+            logger.warning("api-sports.io fallback: sports_config not available")
             return []
 
         cfg = get_sport_config(sport_slug)
         if not cfg:
+            logger.warning("api-sports.io: no config for sport=%s", sport_slug)
             return []
 
         api_key = _env("API_SPORTS_KEY")
         if not api_key:
+            logger.warning("api-sports.io: API_SPORTS_KEY not set")
             return []
 
         api_base = cfg.get("api_base", "")
+        if not api_base:
+            logger.warning("api-sports.io: no api_base for sport=%s", sport_slug)
+            return []
+
         endpoints = cfg.get("endpoints", {})
         fixtures_ep = endpoints.get("fixtures", "/games")
-        leagues = get_leagues(sport_slug, max_priority=2)
+        # Use all configured leagues (not just priority <= 2)
+        leagues = get_leagues(sport_slug, max_priority=3)
 
         if not leagues:
+            logger.warning("api-sports.io: no leagues configured for sport=%s", sport_slug)
             return []
 
         headers = {"x-apisports-key": api_key}
@@ -648,11 +706,26 @@ class SportAPIClient:
                         "season": league_info.get("season", 2025),
                         "date": day_s,
                     }
+                    logger.info(
+                        "api-sports.io: GET %s league=%s season=%s date=%s",
+                        url, league_id, params["season"], day_s,
+                    )
                     resp = await client.get(url, headers=headers, params=params)
+
                     if resp.status_code != 200:
+                        body = (resp.text or "")[:300]
+                        logger.warning(
+                            "api-sports.io: HTTP %d for league=%d sport=%s: %s",
+                            resp.status_code, league_id, sport_slug, body,
+                        )
                         continue
+
                     data = resp.json()
                     items = data.get("response") or []
+                    logger.info(
+                        "api-sports.io: league=%d (%s) → %d matches",
+                        league_id, league_info.get("name", ""), len(items),
+                    )
 
                     for item in items:
                         try:
@@ -661,9 +734,53 @@ class SportAPIClient:
                         except Exception:
                             continue
                 except Exception:
+                    logger.exception("api-sports.io: error fetching league=%d sport=%s", league_id, sport_slug)
                     continue
 
+        logger.info("api-sports.io: total %d matches for %s %s", len(all_matches), sport_slug, day_s)
         return all_matches
+
+    async def _fallback_match_details(self, sport_slug: str, match_id: str) -> Optional[MatchDTO]:
+        """Fetch single match details from api-sports.io."""
+        try:
+            from ..sports_config import get_sport_config
+        except ImportError:
+            return None
+
+        cfg = get_sport_config(sport_slug)
+        if not cfg:
+            return None
+
+        api_key = _env("API_SPORTS_KEY")
+        if not api_key:
+            return None
+
+        api_base = cfg.get("api_base", "")
+        endpoints = cfg.get("endpoints", {})
+        fixtures_ep = endpoints.get("fixtures", "/games")
+        match_param = cfg.get("match_param", "id")
+
+        headers = {"x-apisports-key": api_key}
+        url = f"{api_base}{fixtures_ep}"
+        params = {match_param: match_id}
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            items = data.get("response") or []
+            if not items:
+                return None
+
+            item = items[0]
+            # Find league_info from config
+            league_obj = item.get("league") or {}
+            league_id = league_obj.get("id") if isinstance(league_obj, dict) else None
+            all_leagues = cfg.get("leagues", {})
+            league_info = all_leagues.get(league_id, {"name": "", "country": ""})
+
+            return self._parse_api_sports_match(item, sport_slug, league_info)
 
     def _parse_api_sports_match(
         self, raw: Dict[str, Any], sport_slug: str, league_info: Dict[str, Any]
