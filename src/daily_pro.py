@@ -22,7 +22,7 @@ from .llm_client import analyze_with_llm_cached
 logger = logging.getLogger(__name__)
 MSK = ZoneInfo("Europe/Moscow")
 
-HUNTER_SPORTS = ["ice-hockey", "football", "basketball"]
+HUNTER_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "mma"]
 
 _SCORE_PROMPT = """Ты спортивный аналитик. Оцени матч по интересности для аналитического разбора.
 
