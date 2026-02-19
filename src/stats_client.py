@@ -765,21 +765,87 @@ def _get_match_date_str(m: Dict[str, Any]) -> str:
 
 
 def _extract_score_pair(m: Dict[str, Any]) -> tuple:
-    """Extract (home_score, away_score) ints from a match dict."""
-    score = m.get("score") or m.get("scores") or m.get("result") or {}
-    if isinstance(score, str):
-        sm = _re.match(r"(\d+)\s*[:\-]\s*(\d+)", score)
-        return (int(sm.group(1)), int(sm.group(2))) if sm else (0, 0)
+    """Extract (home_score, away_score) ints from a match dict.
+    Handles many api-sport.ru response formats."""
+
+    # --- 1. Direct numeric fields ---
+    for hk, ak in (
+        ("homeScore", "awayScore"),
+        ("home_score", "away_score"),
+        ("scoreHome", "scoreAway"),
+        ("goalsHome", "goalsAway"),
+    ):
+        h_val = m.get(hk)
+        a_val = m.get(ak)
+        if h_val is not None and a_val is not None:
+            return (_safe_int(h_val), _safe_int(a_val))
+
+    # --- 2. "score" field ---
+    score = m.get("score")
+    if isinstance(score, str) and score.strip():
+        sm = _re.match(r"(\d+)\s*[:\-]\s*(\d+)", score.strip())
+        if sm:
+            return (int(sm.group(1)), int(sm.group(2)))
     if isinstance(score, dict):
+        # score.home / score.away (can be int or nested dict)
         h = score.get("home")
         a = score.get("away")
-        h = h if not isinstance(h, dict) else h.get("total", 0)
-        a = a if not isinstance(a, dict) else a.get("total", 0)
-        return (_safe_int(h), _safe_int(a))
-    return (
-        _safe_int(m.get("homeScore") or m.get("home_score") or 0),
-        _safe_int(m.get("awayScore") or m.get("away_score") or 0),
-    )
+        if h is not None and a is not None:
+            h = h if not isinstance(h, dict) else h.get("total", h.get("current", 0))
+            a = a if not isinstance(a, dict) else a.get("total", a.get("current", 0))
+            return (_safe_int(h), _safe_int(a))
+        # score.fullTime.home / fullTime.away
+        ft = score.get("fullTime") or score.get("full_time") or score.get("ft")
+        if isinstance(ft, dict):
+            return (_safe_int(ft.get("home", 0)), _safe_int(ft.get("away", 0)))
+        # score.current.home etc.
+        cur = score.get("current")
+        if isinstance(cur, dict):
+            return (_safe_int(cur.get("home", 0)), _safe_int(cur.get("away", 0)))
+
+    # --- 3. "scores" field ---
+    scores = m.get("scores")
+    if isinstance(scores, dict):
+        h = scores.get("home")
+        a = scores.get("away")
+        if h is not None and a is not None:
+            h = h if not isinstance(h, dict) else h.get("total", 0)
+            a = a if not isinstance(a, dict) else a.get("total", 0)
+            return (_safe_int(h), _safe_int(a))
+
+    # --- 4. "result" field ---
+    result = m.get("result")
+    if isinstance(result, str) and result.strip():
+        sm = _re.match(r"(\d+)\s*[:\-]\s*(\d+)", result.strip())
+        if sm:
+            return (int(sm.group(1)), int(sm.group(2)))
+    if isinstance(result, dict):
+        h = result.get("home") or result.get("homeScore")
+        a = result.get("away") or result.get("awayScore")
+        if h is not None and a is not None:
+            return (_safe_int(h), _safe_int(a))
+
+    # --- 5. Nested in homeTeam/awayTeam objects ---
+    ht = m.get("homeTeam") or m.get("home_team") or m.get("home") or {}
+    at = m.get("awayTeam") or m.get("away_team") or m.get("away") or {}
+    if isinstance(ht, dict) and isinstance(at, dict):
+        h = ht.get("score") or ht.get("goals") or ht.get("points")
+        a = at.get("score") or at.get("goals") or at.get("points")
+        if h is not None and a is not None:
+            return (_safe_int(h), _safe_int(a))
+
+    # --- 6. "winner" field as fallback (no exact score) ---
+    winner = m.get("winner") or m.get("winnerCode")
+    if winner is not None:
+        w = str(winner).lower().strip()
+        if w in ("home", "1", "homeTeam"):
+            return (1, 0)
+        if w in ("away", "2", "awayTeam"):
+            return (0, 1)
+        if w in ("draw", "x", "0"):
+            return (0, 0)
+
+    return (0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -891,15 +957,20 @@ async def get_team_form_primary(
     for sport in sports:
         path = f"/v2/{sport}/matches"
         for param_name in ("team_id", "team", "teams", "teamId"):
-            data = await _primary_get(path, {param_name: team_id, "last": last})
+            data = await _primary_get(path, {param_name: team_id})
             if data is None:
                 continue
             items = _primary_unwrap_list(data)
+            if not items:
+                continue
+            # API may ignore ?last=, so sort + limit client-side
             finished = [m for m in items if _is_finished_match(m)]
-            if finished:
-                logger.info("get_team_form_primary: %s?%s=%d → %d matches",
-                            path, param_name, team_id, len(finished))
-                return _parse_primary_form(finished[:last], team_id)
+            finished.sort(key=_get_match_date_str, reverse=True)
+            recent = finished[:last]
+            if recent:
+                logger.info("get_team_form_primary: %s?%s=%d → %d total, %d finished, using %d recent",
+                            path, param_name, team_id, len(items), len(finished), len(recent))
+                return _parse_primary_form(recent, team_id)
 
     # === Strategy 2: Date range + client-side filter ===
     all_matches = await _fetch_recent_matches_primary(sport_slug)
@@ -917,15 +988,32 @@ async def get_team_form_primary(
 
 def _parse_primary_form(matches: List[Dict[str, Any]], team_id: int) -> TeamForm:
     """Parse list of recent matches from api-sport.ru into TeamForm."""
+    import json as _json
+
+    # === RAW LOG: dump first 3 matches to see actual JSON structure ===
+    for idx, sample in enumerate(matches[:3]):
+        try:
+            # Log top-level keys + full JSON (truncated to 1500 chars)
+            raw_str = _json.dumps(sample, ensure_ascii=False, default=str)
+            logger.info("RAW_MATCH[%d] team=%d keys=%s JSON=%.1500s",
+                        idx, team_id, list(sample.keys()), raw_str)
+        except Exception:
+            logger.info("RAW_MATCH[%d] team=%d keys=%s (json dump failed)", idx, team_id, list(sample.keys())[:20])
+
     form = TeamForm()
     wins = losses = otl = 0
     home_w = home_l = away_w = away_l = 0
     goals_for = goals_against = 0
     streak_chars = []
 
-    for m in matches:
+    for idx, m in enumerate(matches):
         h_id, a_id = _get_match_team_ids(m)
         h_score, a_score = _extract_score_pair(m)
+
+        # Log score extraction for first 5 matches
+        if idx < 5:
+            logger.info("FORM_PARSE[%d] team=%d h_id=%s a_id=%s h_score=%d a_score=%d",
+                        idx, team_id, h_id, a_id, h_score, a_score)
 
         # Determine if this team is home or away
         is_home = (h_id == team_id) if h_id is not None else (a_id != team_id)
@@ -1001,22 +1089,34 @@ async def get_h2h_primary(
     for sport in sports:
         path = f"/v2/{sport}/matches"
         for params in (
-            {"h2h": f"{team1_id}-{team2_id}", "last": last},
-            {"h2h": f"{team2_id}-{team1_id}", "last": last},
+            {"h2h": f"{team1_id}-{team2_id}"},
+            {"h2h": f"{team2_id}-{team1_id}"},
         ):
             data = await _primary_get(path, params)
             if data is None:
                 continue
             items = _primary_unwrap_list(data)
-            # Verify these are actually H2H matches
+            logger.info("get_h2h_primary: %s?%s → %d raw items", path, params, len(items))
+            # Verify these are actually H2H matches (API might return unrelated data)
             h2h_items = []
             for m in items:
                 ids = _get_match_team_ids(m)
                 if team1_id in ids and team2_id in ids:
-                    h2h_items.append(m)
+                    if _is_finished_match(m):
+                        h2h_items.append(m)
             if h2h_items:
-                logger.info("get_h2h_primary: %s?h2h → %d H2H matches", path, len(h2h_items))
+                h2h_items.sort(key=_get_match_date_str, reverse=True)
+                logger.info("get_h2h_primary: %s?h2h → %d verified H2H matches", path, len(h2h_items))
                 return _parse_primary_h2h(h2h_items[:last], team1_id, team2_id)
+            elif items:
+                # Log why H2H filter failed — items exist but no H2H match
+                import json as _json
+                for si, sample in enumerate(items[:2]):
+                    try:
+                        raw_s = _json.dumps(sample, ensure_ascii=False, default=str)
+                        logger.info("H2H_RAW[%d] keys=%s JSON=%.1000s", si, list(sample.keys()), raw_s)
+                    except Exception:
+                        logger.info("H2H_RAW[%d] keys=%s", si, list(sample.keys())[:20])
 
     # === Strategy 2: Date range + client-side filter ===
     all_matches = await _fetch_recent_matches_primary(sport_slug)
@@ -1040,12 +1140,24 @@ def _parse_primary_h2h(
     matches: List[Dict[str, Any]], home_id: int, away_id: int
 ) -> H2HData:
     """Parse H2H matches from api-sport.ru into H2HData."""
+    import json as _json
+
+    # RAW LOG first 2 H2H matches
+    for idx, sample in enumerate(matches[:2]):
+        try:
+            raw_s = _json.dumps(sample, ensure_ascii=False, default=str)
+            logger.info("H2H_PARSE_RAW[%d] %d vs %d JSON=%.1500s", idx, home_id, away_id, raw_s)
+        except Exception:
+            pass
+
     h2h = H2HData(total_games=len(matches))
     total_goals = 0
 
-    for m in matches:
+    for idx, m in enumerate(matches):
         h_id, _ = _get_match_team_ids(m)
         h_score, a_score = _extract_score_pair(m)
+        if idx < 3:
+            logger.info("H2H_PARSE[%d] h_id=%s h_score=%d a_score=%d", idx, h_id, h_score, a_score)
 
         total_goals += h_score + a_score
 
