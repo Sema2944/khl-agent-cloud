@@ -988,6 +988,25 @@ async def _enrich_match_meta(
                     away_team_id = fa.get("id")
 
         _mid = str(match_meta.get("id") or match_meta.get("match_id") or "")
+
+        # Extract odds_base: try match_meta.odds_base first, then raw.oddsBase
+        _odds_base = match_meta.get("odds_base")
+        if not _odds_base or not isinstance(_odds_base, dict):
+            _odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")
+        if _odds_base and isinstance(_odds_base, dict):
+            import json as _json
+            try:
+                _ob_str = _json.dumps(_odds_base, ensure_ascii=False, default=str)
+                logger.info("ODDS_BASE_RAW match=%s type=%s keys=%s JSON=%.800s",
+                            _mid, type(_odds_base).__name__,
+                            list(_odds_base.keys())[:10], _ob_str)
+            except Exception:
+                logger.info("ODDS_BASE_RAW match=%s keys=%s", _mid, list(_odds_base.keys())[:10])
+        else:
+            logger.info("ODDS_BASE_RAW match=%s → None (meta=%s raw_keys=%s)",
+                        _mid, type(match_meta.get("odds_base")).__name__,
+                        [k for k in raw.keys() if "odd" in k.lower()][:5] if raw else [])
+
         ctx = await collect_match_data(
             match_id=_mid,
             home_team=home_team,
@@ -999,7 +1018,7 @@ async def _enrich_match_meta(
             sport_slug=sport_slug,
             home_team_id=home_team_id,
             away_team_id=away_team_id,
-            odds_base=match_meta.get("odds_base"),
+            odds_base=_odds_base,
         )
 
         enriched_text = build_enriched_context_text(ctx)
