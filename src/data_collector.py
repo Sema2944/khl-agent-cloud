@@ -304,13 +304,17 @@ async def _collect_form(
 
 
 async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
-    """Fallback: try to find team IDs by name and fetch form."""
+    """Fallback: try to find team IDs by name and fetch form + H2H."""
     try:
         from .stats_client import search_team_id, get_team_form
         home_id = await search_team_id(ctx.home_team, sport_slug)
         away_id = await search_team_id(ctx.away_team, sport_slug)
         if home_id and away_id:
-            await _collect_form(ctx, home_id, away_id, sport_slug)
+            await asyncio.gather(
+                _collect_form(ctx, home_id, away_id, sport_slug),
+                _collect_h2h(ctx, home_id, away_id),
+                return_exceptions=True,
+            )
     except Exception:
         logger.exception("Data collector: form_by_name failed")
 
