@@ -643,6 +643,7 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "score": getattr(m, "score", "") or "",
             "odds_base": getattr(m, "odds_base", None),
             "country": country,
+            "raw": getattr(m, "raw", None),
         }
 
     return _render_countries(user_id, title, today.isoformat())
@@ -803,6 +804,7 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                         "country": getattr(d, "country", merged.get("country") or "")
                         if hasattr(d, "country")
                         else merged.get("country") or "",
+                        "raw": getattr(d, "raw", merged.get("raw")),
                     }
                 )
             except Exception:
@@ -844,6 +846,7 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                 "score": getattr(d, "score", ""),
                 "odds_base": getattr(d, "odds_base", None),
                 "country": getattr(d, "country", "") if hasattr(d, "country") else "",
+                "raw": getattr(d, "raw", None),
             }
         except Exception:
             logger.exception("match_details on cache miss failed; will try day-list refresh")
@@ -953,7 +956,7 @@ async def _enrich_match_meta(
         status = str(match_meta.get("status") or "").upper()
         raw = match_meta.get("raw") or {}
 
-        # Extract team IDs if available
+        # Extract team IDs if available (support multiple API formats)
         home_team_id = None
         away_team_id = None
         teams = raw.get("teams") or {}
@@ -962,9 +965,31 @@ async def _enrich_match_meta(
             a = teams.get("away") or {}
             home_team_id = h.get("id") if isinstance(h, dict) else None
             away_team_id = a.get("id") if isinstance(a, dict) else None
+        # Fallback: homeTeam/awayTeam format (primary API)
+        if not home_team_id:
+            ht = raw.get("homeTeam") or raw.get("home_team") or {}
+            if isinstance(ht, dict):
+                home_team_id = ht.get("id")
+        if not away_team_id:
+            at = raw.get("awayTeam") or raw.get("away_team") or {}
+            if isinstance(at, dict):
+                away_team_id = at.get("id")
+        # Fallback: fixture.teams (football api-sports format)
+        if not home_team_id and not away_team_id:
+            fixture_teams = (raw.get("fixture") or {}).get("teams") or {}
+            if not fixture_teams:
+                fixture_teams = raw.get("teams") or {}
+            if isinstance(fixture_teams, dict):
+                fh = fixture_teams.get("home") or {}
+                fa = fixture_teams.get("away") or {}
+                if isinstance(fh, dict) and not home_team_id:
+                    home_team_id = fh.get("id")
+                if isinstance(fa, dict) and not away_team_id:
+                    away_team_id = fa.get("id")
 
+        _mid = str(match_meta.get("id") or match_meta.get("match_id") or "")
         ctx = await collect_match_data(
-            match_id=str(match_meta.get("match_id") or ""),
+            match_id=_mid,
             home_team=home_team,
             away_team=away_team,
             league=str(match_meta.get("league") or ""),
@@ -982,7 +1007,13 @@ async def _enrich_match_meta(
             match_meta["_data_completeness"] = ctx.data_completeness()
             logger.info(
                 "Enriched match %s: completeness=%d%%",
-                match_meta.get("match_id"), ctx.data_completeness()
+                _mid, ctx.data_completeness()
+            )
+        else:
+            logger.warning(
+                "Enrichment empty for match %s: odds=%s form=%s h2h=%s news=%d team_ids=%s/%s",
+                _mid, ctx.has_odds(), ctx.has_form(), ctx.has_h2h(),
+                len(ctx.news), home_team_id, away_team_id,
             )
 
     except Exception:
