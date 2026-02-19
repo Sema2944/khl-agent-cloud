@@ -216,3 +216,224 @@ def _fuzzy_team(name_a: str, name_b: str) -> bool:
         return False
     overlap = words_a & words_b
     return len(overlap) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Fallback #1: Parse odds_base from primary API (api-sport.ru)
+# ---------------------------------------------------------------------------
+
+def parse_odds_base(odds_base: Dict[str, Any]) -> Optional[OddsData]:
+    """
+    Convert odds_base from primary API (api-sport.ru) into OddsData.
+    Format: {"markets": [{"name": "1X2", "choices": [{"name": "1", "odd": "1.85"}, ...]}]}
+    """
+    if not isinstance(odds_base, dict):
+        return None
+
+    markets = odds_base.get("markets")
+    if not isinstance(markets, list) or not markets:
+        return None
+
+    odds = OddsData(bookmaker="api-sport.ru")
+
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+
+        mname = (market.get("name") or "").lower()
+        choices = market.get("choices") or market.get("outcomes") or []
+
+        # --- 1X2 / Moneyline ---
+        if any(k in mname for k in ("1x2", "1 x 2", "moneyline", "match winner", "result")):
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                cname = str(ch.get("name") or "").strip()
+                codd = _safe_float(ch.get("odd") or ch.get("price") or ch.get("value"))
+                if codd <= 0:
+                    continue
+
+                if cname in ("1", "W1", "Home", "П1"):
+                    odds.home_win = codd
+                elif cname in ("2", "W2", "Away", "П2"):
+                    odds.away_win = codd
+                elif cname.upper() in ("X", "DRAW", "Ничья"):
+                    odds.draw = codd
+
+        # --- Total Over/Under ---
+        if any(k in mname for k in ("total", "over", "under", "тотал")):
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                cname = str(ch.get("name") or "").strip().lower()
+                codd = _safe_float(ch.get("odd") or ch.get("price") or ch.get("value"))
+                if codd <= 0:
+                    continue
+
+                # Extract total line from name like "Over 5.5" or "Тотал Б 5.5"
+                import re
+                line_match = re.search(r"(\d+\.?\d*)", cname)
+                if line_match:
+                    odds.total_line = float(line_match.group(1))
+
+                if any(k in cname for k in ("over", "больше", "б ")):
+                    odds.total_over = codd
+                elif any(k in cname for k in ("under", "меньше", "м ")):
+                    odds.total_under = codd
+
+    if odds.home_win > 0 and odds.away_win > 0:
+        logger.info("parse_odds_base: OK hw=%.2f draw=%s aw=%.2f total=%.1f",
+                     odds.home_win, odds.draw, odds.away_win, odds.total_line)
+        return odds
+
+    logger.debug("parse_odds_base: incomplete data from %d markets", len(markets))
+    return None
+
+
+def _safe_float(val: Any) -> float:
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fallback #2: api-sports.io hockey /odds endpoint
+# ---------------------------------------------------------------------------
+
+API_SPORTS_KEY = os.getenv("API_SPORTS_KEY", "")
+
+
+async def get_odds_api_sports(
+    match_id: str,
+    sport_slug: str = "ice-hockey",
+) -> Optional[OddsData]:
+    """
+    Try api-sports.io /odds or /bets endpoint for match odds.
+    Works for KHL and other leagues not covered by The Odds API.
+    """
+    if not API_SPORTS_KEY:
+        return None
+
+    try:
+        from .sports_config import get_api_base
+    except ImportError:
+        return None
+
+    base = get_api_base(sport_slug)
+    if not base:
+        return None
+
+    headers = {"x-apisports-key": API_SPORTS_KEY}
+
+    # Try /odds first, then /bets
+    for endpoint in ("/odds", "/bets"):
+        try:
+            url = f"{base}{endpoint}"
+            params = {"game": match_id}
+
+            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+                resp = await client.get(url, headers=headers, params=params)
+
+                logger.info("api-sports odds: GET %s?game=%s → HTTP %d",
+                            endpoint, match_id, resp.status_code)
+
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                response = data.get("response")
+
+                if not response:
+                    logger.info("api-sports odds: %s empty response for game=%s", endpoint, match_id)
+                    continue
+
+                # Log raw structure for debugging
+                if isinstance(response, list) and response:
+                    first = response[0]
+                    logger.info("api-sports odds: %s returned %d items, first_keys=%s",
+                                endpoint, len(response),
+                                list(first.keys())[:15] if isinstance(first, dict) else type(first).__name__)
+                elif isinstance(response, dict):
+                    logger.info("api-sports odds: %s returned dict, keys=%s",
+                                endpoint, list(response.keys())[:15])
+
+                odds = _parse_api_sports_odds(response)
+                if odds:
+                    return odds
+
+        except Exception:
+            logger.exception("api-sports odds: %s failed for game=%s", endpoint, match_id)
+
+    return None
+
+
+def _parse_api_sports_odds(response: Any) -> Optional[OddsData]:
+    """Parse api-sports.io odds/bets response into OddsData."""
+    items = response if isinstance(response, list) else [response]
+
+    odds = OddsData(bookmaker="api-sports.io")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        bookmakers = item.get("bookmakers") or []
+        # Also handle direct odds structure
+        if not bookmakers and item.get("values"):
+            bookmakers = [item]
+
+        for bk in bookmakers:
+            if not isinstance(bk, dict):
+                continue
+
+            bets = bk.get("bets") or bk.get("markets") or []
+            for bet in bets:
+                if not isinstance(bet, dict):
+                    continue
+
+                bet_name = str(bet.get("name") or "").lower()
+                values = bet.get("values") or bet.get("outcomes") or bet.get("odds") or []
+
+                # Match Winner / 1X2
+                if any(k in bet_name for k in ("match winner", "1x2", "home/away")):
+                    for v in values:
+                        if not isinstance(v, dict):
+                            continue
+                        vname = str(v.get("value") or v.get("name") or "").strip().lower()
+                        vodd = _safe_float(v.get("odd") or v.get("price"))
+                        if vodd <= 0:
+                            continue
+                        if vname in ("home", "1"):
+                            odds.home_win = vodd
+                        elif vname in ("away", "2"):
+                            odds.away_win = vodd
+                        elif vname in ("draw", "x"):
+                            odds.draw = vodd
+
+                # Over/Under / Total
+                if any(k in bet_name for k in ("over/under", "total", "goals")):
+                    for v in values:
+                        if not isinstance(v, dict):
+                            continue
+                        vname = str(v.get("value") or v.get("name") or "").strip().lower()
+                        vodd = _safe_float(v.get("odd") or v.get("price"))
+                        if vodd <= 0:
+                            continue
+                        if "over" in vname:
+                            odds.total_over = vodd
+                            import re
+                            m = re.search(r"(\d+\.?\d*)", vname)
+                            if m:
+                                odds.total_line = float(m.group(1))
+                        elif "under" in vname:
+                            odds.total_under = vodd
+
+    if odds.home_win > 0 and odds.away_win > 0:
+        logger.info("_parse_api_sports_odds: OK hw=%.2f draw=%s aw=%.2f total=%.1f",
+                     odds.home_win, odds.draw, odds.away_win, odds.total_line)
+        return odds
+
+    return None
