@@ -68,8 +68,33 @@ async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
-# Team search (universal)
+# Team search (universal) with in-memory cache
 # ---------------------------------------------------------------------------
+
+# Cache: "slug:team_name" → team_id (persists for process lifetime)
+_team_id_cache: Dict[str, Optional[int]] = {}
+
+
+async def resolve_team_id(
+    team_name: str,
+    sport_slug: str = "ice-hockey",
+) -> Optional[int]:
+    """
+    Resolve team name → api-sports.io team ID with caching.
+    Always searches api-sports.io by name (ignores IDs from other APIs).
+    """
+    slug = resolve_sport_slug(sport_slug) or sport_slug
+    cache_key = f"{slug}:{team_name.lower().strip()}"
+
+    if cache_key in _team_id_cache:
+        cached = _team_id_cache[cache_key]
+        logger.debug("resolve_team_id CACHE HIT: '%s' → %s (%s)", team_name, cached, slug)
+        return cached
+
+    tid = await search_team_id(team_name, sport_slug)
+    _team_id_cache[cache_key] = tid
+    return tid
+
 
 async def search_team_id(
     team_name: str,
