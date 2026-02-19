@@ -280,15 +280,24 @@ async def _collect_odds(
     if odds_base and isinstance(odds_base, dict):
         try:
             from .odds_client import parse_odds_base
+            logger.info("_collect_odds [odds_base]: trying parse for %s, keys=%s",
+                        ctx.match_id, list(odds_base.keys())[:10])
             odds = parse_odds_base(odds_base)
             if odds and odds.home_win > 0:
                 ctx.odds = odds
                 cache_set(cache_key, odds, "odds")
-                logger.info("_collect_odds [odds_base]: %s hw=%.2f aw=%.2f",
-                            ctx.match_id, odds.home_win, odds.away_win)
+                logger.info("_collect_odds [odds_base]: %s hw=%.2f draw=%s aw=%.2f total=%.1f bk=%s",
+                            ctx.match_id, odds.home_win, odds.draw, odds.away_win,
+                            odds.total_line, odds.bookmaker)
                 return
+            else:
+                logger.info("_collect_odds [odds_base]: parse returned incomplete for %s (hw=%.2f aw=%.2f)",
+                            ctx.match_id, odds.home_win if odds else 0, odds.away_win if odds else 0)
         except Exception:
-            logger.debug("_collect_odds: odds_base parse failed for %s", ctx.match_id)
+            logger.exception("_collect_odds: odds_base parse EXCEPTION for %s", ctx.match_id)
+    else:
+        logger.info("_collect_odds: no odds_base for %s (type=%s)",
+                     ctx.match_id, type(odds_base).__name__ if odds_base else "None")
 
     # --- Attempt 3: api-sports.io /odds or /bets ---
     try:
