@@ -71,93 +71,102 @@ async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]
 # Team name normalization: Russian → English for api-sports.io
 # ---------------------------------------------------------------------------
 
-# KHL teams (api-sport.ru Russian names → api-sports.io English names)
-_TEAM_NAME_MAP: Dict[str, str] = {
-    # KHL
-    "динамо москва": "Dynamo Moscow",
-    "динамо мск": "Dynamo Moscow",
-    "динамо м": "Dynamo Moscow",
-    "динамо минск": "Dinamo Minsk",
-    "динамо мн": "Dinamo Minsk",
-    "динамо рига": "Dinamo Riga",
-    "хк сочи": "HC Sochi",
-    "сочи": "HC Sochi",
-    "ак барс": "Ak Bars",
-    "ак барс казань": "Ak Bars",
-    "лада": "Lada",
-    "лада тольятти": "Lada",
-    "ска": "SKA",
-    "ска спб": "SKA",
-    "ска санкт-петербург": "SKA",
-    "цска": "CSKA Moscow",
-    "цска москва": "CSKA Moscow",
-    "спартак": "Spartak Moscow",
-    "спартак москва": "Spartak Moscow",
-    "локомотив": "Lokomotiv Yaroslavl",
-    "локомотив ярославль": "Lokomotiv Yaroslavl",
-    "металлург": "Metallurg Magnitogorsk",
-    "металлург мг": "Metallurg Magnitogorsk",
-    "металлург магнитогорск": "Metallurg Magnitogorsk",
-    "авангард": "Avangard",
-    "авангард омск": "Avangard",
-    "салават юлаев": "Salavat Yulaev",
-    "салават юлаев уфа": "Salavat Yulaev",
-    "трактор": "Traktor",
-    "трактор челябинск": "Traktor",
-    "сибирь": "Sibir",
-    "сибирь новосибирск": "Sibir",
-    "торпедо": "Torpedo",
-    "торпедо нижний новгород": "Torpedo",
-    "торпедо нн": "Torpedo",
-    "нефтехимик": "Neftekhimik",
-    "нефтехимик нижнекамск": "Neftekhimik",
-    "северсталь": "Severstal",
-    "северсталь череповец": "Severstal",
-    "витязь": "Vityaz",
-    "витязь подольск": "Vityaz",
-    "адмирал": "Admiral",
-    "адмирал владивосток": "Admiral",
-    "амур": "Amur",
-    "амур хабаровск": "Amur",
-    "барыс": "Barys",
-    "барыс астана": "Barys",
-    "куньлунь": "Kunlun",
-    "куньлунь ред стар": "Kunlun",
-    "автомобилист": "Avtomobilist",
-    "автомобилист екатеринбург": "Avtomobilist",
-    # RPL football
-    "зенит": "Zenit",
-    "зенит спб": "Zenit",
-    "краснодар": "Krasnodar",
-    "фк краснодар": "Krasnodar",
-    "рубин": "Rubin",
-    "рубин казань": "Rubin",
-    "ростов": "Rostov",
-    "фк ростов": "Rostov",
-    "крылья советов": "Krylya Sovetov",
-    "факел": "Fakel",
-    "факел воронеж": "Fakel",
-    "оренбург": "Orenburg",
-    "фк оренбург": "Orenburg",
-    "ахмат": "Akhmat",
-    "ахмат грозный": "Akhmat Grozny",
-    "урал": "Ural",
-    "урал екатеринбург": "Ural",
-    "пари нн": "Pari NN",
-    "химки": "Khimki",
-    "балтика": "Baltika",
+# KHL teams: Russian name → list of English search variants for api-sports.io
+# Multiple variants tried in order; first successful match wins.
+# Source: eliteprospects.com/league/khl/2024-2025 + hockeydb.com
+_TEAM_NAME_MAP: Dict[str, List[str]] = {
+    # ===== KHL (22–23 teams) =====
+    "динамо москва": ["Dynamo Moscow", "Dynamo Moskva", "Dynamo"],
+    "динамо мск": ["Dynamo Moscow", "Dynamo Moskva"],
+    "динамо м": ["Dynamo Moscow", "Dynamo Moskva"],
+    "динамо минск": ["Dinamo Minsk"],
+    "динамо мн": ["Dinamo Minsk"],
+    "динамо рига": ["Dinamo Riga"],
+    "хк сочи": ["HC Sochi", "Sochi"],
+    "сочи": ["HC Sochi", "Sochi"],
+    "ак барс": ["Ak Bars Kazan", "Ak Bars", "Ak-Bars"],
+    "ак барс казань": ["Ak Bars Kazan", "Ak Bars"],
+    "лада": ["Lada Togliatti", "Lada"],
+    "лада тольятти": ["Lada Togliatti", "Lada"],
+    "ска": ["SKA St. Petersburg", "SKA Saint Petersburg", "SKA"],
+    "ска спб": ["SKA St. Petersburg", "SKA"],
+    "ска санкт-петербург": ["SKA St. Petersburg", "SKA"],
+    "цска": ["CSKA Moscow", "CSKA Moskva", "CSKA"],
+    "цска москва": ["CSKA Moscow", "CSKA Moskva", "CSKA"],
+    "спартак": ["Spartak Moscow", "Spartak Moskva", "Spartak"],
+    "спартак москва": ["Spartak Moscow", "Spartak Moskva"],
+    "локомотив": ["Lokomotiv Yaroslavl", "Lokomotiv"],
+    "локомотив ярославль": ["Lokomotiv Yaroslavl", "Lokomotiv"],
+    "металлург": ["Metallurg Magnitogorsk", "Metallurg Mg", "Metallurg"],
+    "металлург мг": ["Metallurg Magnitogorsk", "Metallurg"],
+    "металлург магнитогорск": ["Metallurg Magnitogorsk"],
+    "авангард": ["Avangard Omsk", "Avangard"],
+    "авангард омск": ["Avangard Omsk", "Avangard"],
+    "салават юлаев": ["Salavat Yulaev Ufa", "Salavat Yulaev"],
+    "салават юлаев уфа": ["Salavat Yulaev Ufa", "Salavat Yulaev"],
+    "трактор": ["Traktor Chelyabinsk", "Traktor"],
+    "трактор челябинск": ["Traktor Chelyabinsk", "Traktor"],
+    "сибирь": ["Sibir Novosibirsk", "Sibir"],
+    "сибирь новосибирск": ["Sibir Novosibirsk", "Sibir"],
+    "торпедо": ["Torpedo Nizhny Novgorod", "Torpedo"],
+    "торпедо нижний новгород": ["Torpedo Nizhny Novgorod", "Torpedo"],
+    "торпедо нн": ["Torpedo Nizhny Novgorod", "Torpedo"],
+    "нефтехимик": ["Neftekhimik Nizhnekamsk", "Neftekhimik"],
+    "нефтехимик нижнекамск": ["Neftekhimik Nizhnekamsk", "Neftekhimik"],
+    "северсталь": ["Severstal Cherepovets", "Severstal"],
+    "северсталь череповец": ["Severstal Cherepovets", "Severstal"],
+    "витязь": ["Vityaz", "Vityaz Podolsk"],
+    "витязь подольск": ["Vityaz", "Vityaz Podolsk"],
+    "адмирал": ["Admiral Vladivostok", "Admiral"],
+    "адмирал владивосток": ["Admiral Vladivostok", "Admiral"],
+    "амур": ["Amur Khabarovsk", "Amur"],
+    "амур хабаровск": ["Amur Khabarovsk", "Amur"],
+    "барыс": ["Barys Astana", "Barys", "Barys Nur-Sultan"],
+    "барыс астана": ["Barys Astana", "Barys"],
+    "куньлунь": ["Kunlun Red Star", "Kunlun", "Shanghai Dragons"],
+    "куньлунь ред стар": ["Kunlun Red Star", "Kunlun"],
+    "автомобилист": ["Avtomobilist Yekaterinburg", "Avtomobilist"],
+    "автомобилист екатеринбург": ["Avtomobilist Yekaterinburg", "Avtomobilist"],
+    # ===== RPL (Russia football) =====
+    "зенит": ["Zenit St. Petersburg", "Zenit"],
+    "зенит спб": ["Zenit St. Petersburg", "Zenit"],
+    "краснодар": ["FK Krasnodar", "Krasnodar"],
+    "фк краснодар": ["FK Krasnodar", "Krasnodar"],
+    "рубин": ["Rubin Kazan", "Rubin"],
+    "рубин казань": ["Rubin Kazan", "Rubin"],
+    "ростов": ["FK Rostov", "Rostov"],
+    "фк ростов": ["FK Rostov", "Rostov"],
+    "крылья советов": ["Krylya Sovetov", "Krylia Sovetov"],
+    "факел": ["Fakel Voronezh", "Fakel"],
+    "факел воронеж": ["Fakel Voronezh", "Fakel"],
+    "оренбург": ["Orenburg", "FK Orenburg"],
+    "фк оренбург": ["Orenburg", "FK Orenburg"],
+    "ахмат": ["Akhmat Grozny", "Akhmat"],
+    "ахмат грозный": ["Akhmat Grozny", "Akhmat"],
+    "урал": ["Ural", "FK Ural"],
+    "урал екатеринбург": ["Ural", "FK Ural"],
+    "пари нн": ["Pari NN", "Pari Nizhny Novgorod"],
+    "химки": ["Khimki", "FK Khimki"],
+    "балтика": ["Baltika", "Baltika Kaliningrad"],
+    "локомотив москва": ["Lokomotiv Moscow"],
+    "цска москва футбол": ["CSKA Moscow"],
+    "динамо москва футбол": ["Dynamo Moscow"],
+    "спартак москва футбол": ["Spartak Moscow"],
 }
 
 # Prefixes to strip before lookup
 _STRIP_PREFIXES = ("хк ", "фк ", "бк ", "hc ", "fc ", "bc ")
 
 
-def _normalize_team_name(name: str) -> str:
-    """Normalize team name: strip prefixes, lookup mapping."""
+def _get_search_variants(name: str) -> List[str]:
+    """
+    Get list of English search variants for a team name.
+    Checks mapping, strips prefixes, returns variants to try in order.
+    """
     clean = name.strip()
     lower = clean.lower()
 
-    # Direct mapping hit
+    # Direct mapping hit → return all variants
     if lower in _TEAM_NAME_MAP:
         return _TEAM_NAME_MAP[lower]
 
@@ -168,8 +177,8 @@ def _normalize_team_name(name: str) -> str:
             if stripped in _TEAM_NAME_MAP:
                 return _TEAM_NAME_MAP[stripped]
 
-    # No mapping found — return original (will try search as-is)
-    return clean
+    # No mapping → return original as single variant
+    return [clean]
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +195,7 @@ async def resolve_team_id(
 ) -> Optional[int]:
     """
     Resolve team name → api-sports.io team ID with caching.
-    Normalizes Russian names to English before searching.
+    Tries multiple English name variants from mapping.
     """
     slug = resolve_sport_slug(sport_slug) or sport_slug
     cache_key = f"{slug}:{team_name.lower().strip()}"
@@ -196,19 +205,25 @@ async def resolve_team_id(
         logger.debug("resolve_team_id CACHE HIT: '%s' → %s (%s)", team_name, cached, slug)
         return cached
 
-    # Normalize: Russian → English
-    normalized = _normalize_team_name(team_name)
-    if normalized != team_name:
-        logger.info("resolve_team_id: normalized '%s' → '%s'", team_name, normalized)
+    # Get search variants from mapping
+    variants = _get_search_variants(team_name)
+    logger.info("resolve_team_id: '%s' → variants=%s (%s)", team_name, variants, slug)
 
-    tid = await search_team_id(normalized, sport_slug)
+    tid = None
+    for variant in variants:
+        tid = await search_team_id(variant, sport_slug)
+        if tid is not None:
+            logger.info("resolve_team_id: '%s' found via variant '%s' → id=%d", team_name, variant, tid)
+            break
 
-    # If normalized name failed, try original as fallback
-    if tid is None and normalized != team_name:
-        logger.info("resolve_team_id: normalized search failed, trying original '%s'", team_name)
+    # Last resort: try original name (if not in variants)
+    if tid is None and team_name not in variants:
+        logger.info("resolve_team_id: all variants failed, trying original '%s'", team_name)
         tid = await search_team_id(team_name, sport_slug)
 
     _team_id_cache[cache_key] = tid
+    if tid is None:
+        logger.warning("resolve_team_id: FAILED for '%s' (%s), tried: %s", team_name, slug, variants)
     return tid
 
 
@@ -216,7 +231,7 @@ async def search_team_id(
     team_name: str,
     sport_slug: str = "ice-hockey",
 ) -> Optional[int]:
-    """Search for team ID by name on api-sports.io."""
+    """Search for team ID by name on api-sports.io. Single attempt."""
     slug = resolve_sport_slug(sport_slug) or sport_slug
 
     try:
@@ -227,18 +242,20 @@ async def search_team_id(
             logger.info("search_team_id: '%s' → id=%s name='%s' (%s)", team_name, tid, tname, slug)
             return tid
 
-        # Try shorter name (first word)
-        short = team_name.split()[0] if team_name else ""
-        if short and len(short) >= 3:
-            results = await _api_get(slug, "/teams", {"search": short})
-            if results:
-                tid = results[0].get("id")
-                tname = results[0].get("name", "?")
-                logger.info("search_team_id: '%s' (short='%s') → id=%s name='%s' (%s)",
-                            team_name, short, tid, tname, slug)
-                return tid
+        # Try shorter name (first significant word, min 3 chars)
+        words = team_name.split()
+        if len(words) > 1:
+            short = words[0]
+            if len(short) >= 3:
+                results = await _api_get(slug, "/teams", {"search": short})
+                if results:
+                    tid = results[0].get("id")
+                    tname = results[0].get("name", "?")
+                    logger.info("search_team_id: '%s' (short='%s') → id=%s name='%s' (%s)",
+                                team_name, short, tid, tname, slug)
+                    return tid
 
-        logger.warning("search_team_id: NOT FOUND '%s' (%s)", team_name, slug)
+        logger.debug("search_team_id: NOT FOUND '%s' (%s)", team_name, slug)
     except Exception:
         logger.exception("search_team_id failed for %s (%s)", team_name, slug)
 
