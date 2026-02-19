@@ -218,10 +218,12 @@ async def collect_match_data(
     # 1. Odds (The Odds API → odds_base fallback → api-sports.io fallback)
     tasks.append(_collect_odds(ctx, sport_slug, odds_base=odds_base))
 
-    # 2. Form + H2H (api-sports.io)
-    # IMPORTANT: Always resolve team IDs by name on api-sports.io.
-    # IDs from other APIs (api-sport.ru, ESPN) are incompatible with api-sports.io.
-    if home_team and away_team:
+    # 2. Form + H2H
+    # Hockey: use api-sport.ru with original team IDs (api-sports.io doesn't cover KHL)
+    # Other sports: resolve by name on api-sports.io
+    if sport_slug in ("ice-hockey", "hockey") and home_team_id and away_team_id:
+        tasks.append(_collect_form_primary(ctx, home_team_id, away_team_id, sport_slug))
+    elif home_team and away_team:
         tasks.append(_collect_form_by_name(ctx, sport_slug))
 
     # 3. News (RSS)
@@ -346,6 +348,57 @@ async def _collect_form(
             ctx.away_form = cached_a
     except Exception:
         logger.exception("Data collector: form failed")
+
+
+async def _collect_form_primary(
+    ctx: MatchContext, home_id: int, away_id: int, sport_slug: str
+) -> None:
+    """Fetch form + H2H from primary API (api-sport.ru) using original team IDs."""
+    cache_key_h = f"form_primary:{home_id}"
+    cache_key_a = f"form_primary:{away_id}"
+    cache_key_h2h = f"h2h_primary:{home_id}:{away_id}"
+
+    try:
+        from .stats_client import get_team_form_primary, get_h2h_primary
+
+        logger.info("_collect_form_primary: fetching form+h2h via api-sport.ru home=%d away=%d",
+                     home_id, away_id)
+
+        # Form (home)
+        cached_h = cache_get(cache_key_h)
+        if cached_h:
+            ctx.home_form = cached_h
+        else:
+            hf = await get_team_form_primary(home_id, sport_slug)
+            if hf:
+                ctx.home_form = hf
+                cache_set(cache_key_h, hf, "form")
+                logger.info("_collect_form_primary: home=%d → %s", home_id, hf.last_10)
+
+        # Form (away)
+        cached_a = cache_get(cache_key_a)
+        if cached_a:
+            ctx.away_form = cached_a
+        else:
+            af = await get_team_form_primary(away_id, sport_slug)
+            if af:
+                ctx.away_form = af
+                cache_set(cache_key_a, af, "form")
+                logger.info("_collect_form_primary: away=%d → %s", away_id, af.last_10)
+
+        # H2H
+        cached_h2h = cache_get(cache_key_h2h)
+        if cached_h2h:
+            ctx.h2h = cached_h2h
+        else:
+            h2h = await get_h2h_primary(home_id, away_id, sport_slug)
+            if h2h:
+                ctx.h2h = h2h
+                cache_set(cache_key_h2h, h2h, "h2h")
+                logger.info("_collect_form_primary: h2h %d vs %d → %d games", home_id, away_id, h2h.total_games)
+
+    except Exception:
+        logger.exception("Data collector: form_primary failed for home=%d away=%d", home_id, away_id)
 
 
 async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
