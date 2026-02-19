@@ -999,6 +999,7 @@ async def _enrich_match_meta(
             sport_slug=sport_slug,
             home_team_id=home_team_id,
             away_team_id=away_team_id,
+            odds_base=match_meta.get("odds_base"),
         )
 
         enriched_text = build_enriched_context_text(ctx)
