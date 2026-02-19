@@ -108,6 +108,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
             53:  {"name": "DEL", "flag": "🇩🇪", "country": "Германия", "season": 2025, "priority": 3},
         },
         "odds_keys": [
+            "icehockey_russia_khl",
             "icehockey_nhl",
             "icehockey_sweden_hockey_league",
             "icehockey_liiga",
