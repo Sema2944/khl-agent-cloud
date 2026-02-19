@@ -711,8 +711,6 @@ def _primary_unwrap_list(data: Any) -> List[Dict[str, Any]]:
 import re as _re
 from datetime import timedelta
 
-# In-memory cache for recent matches from api-sport.ru (shared across form/H2H)
-_primary_matches_cache: Dict[str, Any] = {}
 
 
 def _get_match_team_ids(m: Dict[str, Any]) -> tuple:
@@ -764,11 +762,48 @@ def _get_match_date_str(m: Dict[str, Any]) -> str:
     )
 
 
+def _score_from_val(val: Any) -> Optional[int]:
+    """Extract a score number from int, str, or dict.
+    Returns None if cannot extract."""
+    if val is None:
+        return None
+    # Simple int/float
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return int(val)
+    # String "3"
+    if isinstance(val, str):
+        s = val.strip()
+        if s.isdigit():
+            return int(s)
+        return None
+    # Dict: {"current": 3}, {"display": 3}, {"total": 3}
+    if isinstance(val, dict):
+        for k in ("current", "display", "total", "value", "score", "normalTime", "ft", "final"):
+            v = val.get(k)
+            if v is not None and isinstance(v, (int, float)) and not isinstance(v, bool):
+                return int(v)
+            if isinstance(v, str) and v.strip().isdigit():
+                return int(v.strip())
+        # Sum period scores: {"period1": 1, "period2": 2, "period3": 0}
+        period_sum = 0
+        has_periods = False
+        for k, v in val.items():
+            if _re.match(r"^(period\d+|p[123]|overtime|ot)$", k, _re.IGNORECASE):
+                try:
+                    period_sum += int(v)
+                    has_periods = True
+                except (ValueError, TypeError):
+                    pass
+        if has_periods:
+            return period_sum
+    return None
+
+
 def _extract_score_pair(m: Dict[str, Any]) -> tuple:
     """Extract (home_score, away_score) ints from a match dict.
-    Handles many api-sport.ru response formats."""
+    Handles api-sport.ru response formats including dict-type scores."""
 
-    # --- 1. Direct numeric fields ---
+    # --- 1. Direct fields (homeScore/awayScore — can be int OR dict) ---
     for hk, ak in (
         ("homeScore", "awayScore"),
         ("home_score", "away_score"),
@@ -778,40 +813,40 @@ def _extract_score_pair(m: Dict[str, Any]) -> tuple:
         h_val = m.get(hk)
         a_val = m.get(ak)
         if h_val is not None and a_val is not None:
-            return (_safe_int(h_val), _safe_int(a_val))
+            h = _score_from_val(h_val)
+            a = _score_from_val(a_val)
+            if h is not None and a is not None:
+                return (h, a)
 
-    # --- 2. "score" field ---
+    # --- 2. "score" field (string or dict) ---
     score = m.get("score")
     if isinstance(score, str) and score.strip():
         sm = _re.match(r"(\d+)\s*[:\-]\s*(\d+)", score.strip())
         if sm:
             return (int(sm.group(1)), int(sm.group(2)))
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        pass  # single number, not useful
     if isinstance(score, dict):
-        # score.home / score.away (can be int or nested dict)
-        h = score.get("home")
-        a = score.get("away")
+        h = _score_from_val(score.get("home"))
+        a = _score_from_val(score.get("away"))
         if h is not None and a is not None:
-            h = h if not isinstance(h, dict) else h.get("total", h.get("current", 0))
-            a = a if not isinstance(a, dict) else a.get("total", a.get("current", 0))
-            return (_safe_int(h), _safe_int(a))
-        # score.fullTime.home / fullTime.away
-        ft = score.get("fullTime") or score.get("full_time") or score.get("ft")
-        if isinstance(ft, dict):
-            return (_safe_int(ft.get("home", 0)), _safe_int(ft.get("away", 0)))
-        # score.current.home etc.
-        cur = score.get("current")
-        if isinstance(cur, dict):
-            return (_safe_int(cur.get("home", 0)), _safe_int(cur.get("away", 0)))
+            return (h, a)
+        # score.fullTime / score.current
+        for sub_key in ("fullTime", "full_time", "ft", "current", "normalTime"):
+            sub = score.get(sub_key)
+            if isinstance(sub, dict):
+                h = _score_from_val(sub.get("home"))
+                a = _score_from_val(sub.get("away"))
+                if h is not None and a is not None:
+                    return (h, a)
 
     # --- 3. "scores" field ---
     scores = m.get("scores")
     if isinstance(scores, dict):
-        h = scores.get("home")
-        a = scores.get("away")
+        h = _score_from_val(scores.get("home"))
+        a = _score_from_val(scores.get("away"))
         if h is not None and a is not None:
-            h = h if not isinstance(h, dict) else h.get("total", 0)
-            a = a if not isinstance(a, dict) else a.get("total", 0)
-            return (_safe_int(h), _safe_int(a))
+            return (h, a)
 
     # --- 4. "result" field ---
     result = m.get("result")
@@ -820,27 +855,28 @@ def _extract_score_pair(m: Dict[str, Any]) -> tuple:
         if sm:
             return (int(sm.group(1)), int(sm.group(2)))
     if isinstance(result, dict):
-        h = result.get("home") or result.get("homeScore")
-        a = result.get("away") or result.get("awayScore")
+        h = _score_from_val(result.get("home") or result.get("homeScore"))
+        a = _score_from_val(result.get("away") or result.get("awayScore"))
         if h is not None and a is not None:
-            return (_safe_int(h), _safe_int(a))
+            return (h, a)
 
     # --- 5. Nested in homeTeam/awayTeam objects ---
     ht = m.get("homeTeam") or m.get("home_team") or m.get("home") or {}
     at = m.get("awayTeam") or m.get("away_team") or m.get("away") or {}
     if isinstance(ht, dict) and isinstance(at, dict):
-        h = ht.get("score") or ht.get("goals") or ht.get("points")
-        a = at.get("score") or at.get("goals") or at.get("points")
-        if h is not None and a is not None:
-            return (_safe_int(h), _safe_int(a))
+        for fld in ("score", "goals", "points"):
+            h = _score_from_val(ht.get(fld))
+            a = _score_from_val(at.get(fld))
+            if h is not None and a is not None:
+                return (h, a)
 
     # --- 6. "winner" field as fallback (no exact score) ---
     winner = m.get("winner") or m.get("winnerCode")
     if winner is not None:
         w = str(winner).lower().strip()
-        if w in ("home", "1", "homeTeam"):
+        if w in ("home", "1", "hometeam"):
             return (1, 0)
-        if w in ("away", "2", "awayTeam"):
+        if w in ("away", "2", "awayteam"):
             return (0, 1)
         if w in ("draw", "x", "0"):
             return (0, 0)
@@ -849,91 +885,49 @@ def _extract_score_pair(m: Dict[str, Any]) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Fetch recent matches from api-sport.ru (cached, shared)
+# Shared cache: team matches from api-sport.ru
+# ?team_id=X returns ALL matches for a team. We cache and reuse for form + H2H.
 # ---------------------------------------------------------------------------
 
-async def _fetch_recent_matches_primary(
+# Cache: team_id → (all_finished_matches, expires_at)
+_team_matches_cache: Dict[int, Any] = {}
+
+
+async def _fetch_team_matches_primary(
+    team_id: int,
     sport_slug: str = "ice-hockey",
-    days_back: int = 60,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch all finished matches from api-sport.ru for the last N days.
-    Strategy: date range params → day-by-day fallback. Cached for 6 hours.
+    Fetch all matches for a team from api-sport.ru via ?team_id=X.
+    Cached for 6 hours. Returns finished matches sorted newest-first.
     """
-    cache_key = f"primary_recent:{sport_slug}:{days_back}"
     now = datetime.utcnow()
-    if cache_key in _primary_matches_cache:
-        cached_data, expires = _primary_matches_cache[cache_key]
+    if team_id in _team_matches_cache:
+        cached_data, expires = _team_matches_cache[team_id]
         if now < expires:
-            logger.debug("_fetch_recent_primary: CACHE HIT (%d matches)", len(cached_data))
+            logger.debug("_fetch_team_matches: CACHE HIT team=%d (%d matches)", team_id, len(cached_data))
             return cached_data
-
-    today = date.today()
-    date_from_s = (today - timedelta(days=days_back)).isoformat()
-    date_to_s = today.isoformat()
 
     sports = ["ice-hockey", "hockey"] if sport_slug in ("ice-hockey", "hockey") else [sport_slug]
 
-    # === Strategy 1: Date range in one request ===
     for sport in sports:
-        for path in (f"/v2/{sport}/matches", f"/v2/{sport}/events"):
-            for params in (
-                {"dateFrom": date_from_s, "dateTo": date_to_s},
-                {"from": date_from_s, "to": date_to_s},
-                {"startDate": date_from_s, "endDate": date_to_s},
-                {"date_from": date_from_s, "date_to": date_to_s},
-            ):
-                raw = await _primary_get(path, params)
-                if raw is None:
-                    continue
-                items = _primary_unwrap_list(raw)
-                # Date range should return more than a single day's matches
-                if len(items) > 10:
-                    finished = [m for m in items if _is_finished_match(m)]
-                    finished.sort(key=_get_match_date_str, reverse=True)
-                    _primary_matches_cache[cache_key] = (finished, now + timedelta(hours=6))
-                    logger.info("_fetch_recent_primary: %s range → %d items, %d finished",
-                                path, len(items), len(finished))
-                    return finished
+        path = f"/v2/{sport}/matches"
+        for param_name in ("team_id", "team", "teams", "teamId"):
+            data = await _primary_get(path, {param_name: team_id})
+            if data is None:
+                continue
+            items = _primary_unwrap_list(data)
+            if not items:
+                continue
+            finished = [m for m in items if _is_finished_match(m)]
+            finished.sort(key=_get_match_date_str, reverse=True)
+            _team_matches_cache[team_id] = (finished, now + timedelta(hours=6))
+            logger.info("_fetch_team_matches: %s?%s=%d → %d total, %d finished",
+                        path, param_name, team_id, len(items), len(finished))
+            return finished
 
-    # === Strategy 2: Day-by-day (max 14 days to limit API calls) ===
-    max_days = min(days_back, 14)
-    logger.info("_fetch_recent_primary: date range failed, trying day-by-day (%d days)", max_days)
-
-    all_finished: List[Dict[str, Any]] = []
-    working_path: Optional[str] = None
-
-    for i in range(max_days):
-        day_s = (today - timedelta(days=i)).isoformat()
-
-        if working_path is None:
-            # First iteration: probe to find working endpoint
-            for sport in sports:
-                for path in (f"/v2/{sport}/matches", f"/v2/{sport}/events"):
-                    raw = await _primary_get(path, {"date": day_s})
-                    if raw is not None:
-                        items = _primary_unwrap_list(raw)
-                        if items:
-                            working_path = path
-                            all_finished.extend(m for m in items if _is_finished_match(m))
-                            logger.info("_fetch_recent_primary: working endpoint=%s", path)
-                            break
-                if working_path:
-                    break
-            if not working_path:
-                logger.warning("_fetch_recent_primary: no working endpoint found on %s", day_s)
-                return []
-        else:
-            raw = await _primary_get(working_path, {"date": day_s})
-            if raw is not None:
-                items = _primary_unwrap_list(raw)
-                all_finished.extend(m for m in items if _is_finished_match(m))
-
-    all_finished.sort(key=_get_match_date_str, reverse=True)
-    if all_finished:
-        _primary_matches_cache[cache_key] = (all_finished, now + timedelta(hours=6))
-    logger.info("_fetch_recent_primary: day-by-day → %d finished matches", len(all_finished))
-    return all_finished
+    logger.warning("_fetch_team_matches: no matches for team=%d sport=%s", team_id, sport_slug)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -947,43 +941,17 @@ async def get_team_form_primary(
 ) -> Optional[TeamForm]:
     """
     Fetch team form from api-sport.ru.
-    api-sport.ru has no dedicated team-matches endpoint, so we:
-    1. Try query params (?team_id=X, ?team=X, etc.) on /matches
-    2. Fall back to fetching all recent matches and filtering by team_id
+    Uses ?team_id=X on /matches, takes last N finished.
     """
-    sports = ["ice-hockey", "hockey"] if sport_slug in ("ice-hockey", "hockey") else [sport_slug]
+    finished = await _fetch_team_matches_primary(team_id, sport_slug)
+    if not finished:
+        logger.warning("get_team_form_primary: no data for team=%d sport=%s", team_id, sport_slug)
+        return None
 
-    # === Strategy 1: Direct team filter params ===
-    for sport in sports:
-        path = f"/v2/{sport}/matches"
-        for param_name in ("team_id", "team", "teams", "teamId"):
-            data = await _primary_get(path, {param_name: team_id})
-            if data is None:
-                continue
-            items = _primary_unwrap_list(data)
-            if not items:
-                continue
-            # API may ignore ?last=, so sort + limit client-side
-            finished = [m for m in items if _is_finished_match(m)]
-            finished.sort(key=_get_match_date_str, reverse=True)
-            recent = finished[:last]
-            if recent:
-                logger.info("get_team_form_primary: %s?%s=%d → %d total, %d finished, using %d recent",
-                            path, param_name, team_id, len(items), len(finished), len(recent))
-                return _parse_primary_form(recent, team_id)
-
-    # === Strategy 2: Date range + client-side filter ===
-    all_matches = await _fetch_recent_matches_primary(sport_slug)
-    if all_matches:
-        team_matches = [m for m in all_matches if team_id in _get_match_team_ids(m)]
-        if team_matches:
-            team_matches.sort(key=_get_match_date_str, reverse=True)
-            logger.info("get_team_form_primary: filtered %d/%d matches for team=%d",
-                        len(team_matches), len(all_matches), team_id)
-            return _parse_primary_form(team_matches[:last], team_id)
-
-    logger.warning("get_team_form_primary: no data for team=%d sport=%s", team_id, sport_slug)
-    return None
+    recent = finished[:last]
+    logger.info("get_team_form_primary: team=%d → %d finished, using %d recent",
+                team_id, len(finished), len(recent))
+    return _parse_primary_form(recent, team_id)
 
 
 def _parse_primary_form(matches: List[Dict[str, Any]], team_id: int) -> TeamForm:
@@ -1010,10 +978,21 @@ def _parse_primary_form(matches: List[Dict[str, Any]], team_id: int) -> TeamForm
         h_id, a_id = _get_match_team_ids(m)
         h_score, a_score = _extract_score_pair(m)
 
-        # Log score extraction for first 5 matches
+        # Log score extraction for first 5 matches (show raw types too)
         if idx < 5:
-            logger.info("FORM_PARSE[%d] team=%d h_id=%s a_id=%s h_score=%d a_score=%d",
-                        idx, team_id, h_id, a_id, h_score, a_score)
+            raw_hs = m.get("homeScore")
+            raw_as = m.get("awayScore")
+            raw_score = m.get("score")
+            raw_winner = m.get("winner") or m.get("winnerCode")
+            logger.info(
+                "FORM_PARSE[%d] team=%d h_id=%s a_id=%s → h_score=%d a_score=%d | "
+                "raw homeScore=%s(%s) awayScore=%s(%s) score=%s(%s) winner=%s",
+                idx, team_id, h_id, a_id, h_score, a_score,
+                repr(raw_hs)[:80], type(raw_hs).__name__,
+                repr(raw_as)[:80], type(raw_as).__name__,
+                repr(raw_score)[:80], type(raw_score).__name__,
+                repr(raw_winner)[:40],
+            )
 
         # Determine if this team is home or away
         is_home = (h_id == team_id) if h_id is not None else (a_id != team_id)
@@ -1080,60 +1059,31 @@ async def get_h2h_primary(
 ) -> Optional[H2HData]:
     """
     Fetch H2H from api-sport.ru.
-    1. Try direct H2H query params (?h2h=X-Y)
-    2. Fall back to fetching all recent matches and filtering by both team IDs
+    Uses cached team matches from ?team_id=X, filters where both teams play.
     """
-    sports = ["ice-hockey", "hockey"] if sport_slug in ("ice-hockey", "hockey") else [sport_slug]
+    # Get all matches for team1 (uses cache from form call)
+    team1_matches = await _fetch_team_matches_primary(team1_id, sport_slug)
+    if not team1_matches:
+        logger.warning("get_h2h_primary: no matches for team1=%d", team1_id)
+        return None
 
-    # === Strategy 1: Direct H2H param ===
-    for sport in sports:
-        path = f"/v2/{sport}/matches"
-        for params in (
-            {"h2h": f"{team1_id}-{team2_id}"},
-            {"h2h": f"{team2_id}-{team1_id}"},
-        ):
-            data = await _primary_get(path, params)
-            if data is None:
-                continue
-            items = _primary_unwrap_list(data)
-            logger.info("get_h2h_primary: %s?%s → %d raw items", path, params, len(items))
-            # Verify these are actually H2H matches (API might return unrelated data)
-            h2h_items = []
-            for m in items:
-                ids = _get_match_team_ids(m)
-                if team1_id in ids and team2_id in ids:
-                    if _is_finished_match(m):
-                        h2h_items.append(m)
-            if h2h_items:
-                h2h_items.sort(key=_get_match_date_str, reverse=True)
-                logger.info("get_h2h_primary: %s?h2h → %d verified H2H matches", path, len(h2h_items))
-                return _parse_primary_h2h(h2h_items[:last], team1_id, team2_id)
-            elif items:
-                # Log why H2H filter failed — items exist but no H2H match
-                import json as _json
-                for si, sample in enumerate(items[:2]):
-                    try:
-                        raw_s = _json.dumps(sample, ensure_ascii=False, default=str)
-                        logger.info("H2H_RAW[%d] keys=%s JSON=%.1000s", si, list(sample.keys()), raw_s)
-                    except Exception:
-                        logger.info("H2H_RAW[%d] keys=%s", si, list(sample.keys())[:20])
+    # Filter: matches where team2 also plays
+    h2h_matches = []
+    for m in team1_matches:
+        ids = _get_match_team_ids(m)
+        if team2_id in ids:
+            h2h_matches.append(m)
 
-    # === Strategy 2: Date range + client-side filter ===
-    all_matches = await _fetch_recent_matches_primary(sport_slug)
-    if all_matches:
-        h2h_matches = []
-        for m in all_matches:
-            ids = _get_match_team_ids(m)
-            if team1_id in ids and team2_id in ids:
-                h2h_matches.append(m)
-        if h2h_matches:
-            h2h_matches.sort(key=_get_match_date_str, reverse=True)
-            logger.info("get_h2h_primary: filtered %d H2H matches for %d vs %d",
-                        len(h2h_matches), team1_id, team2_id)
-            return _parse_primary_h2h(h2h_matches[:last], team1_id, team2_id)
+    if not h2h_matches:
+        logger.info("get_h2h_primary: no H2H in %d matches for %d vs %d",
+                     len(team1_matches), team1_id, team2_id)
+        return None
 
-    logger.warning("get_h2h_primary: no H2H for %d vs %d sport=%s", team1_id, team2_id, sport_slug)
-    return None
+    # Already sorted newest-first from cache
+    recent = h2h_matches[:last]
+    logger.info("get_h2h_primary: %d vs %d → %d H2H matches found (using %d)",
+                team1_id, team2_id, len(h2h_matches), len(recent))
+    return _parse_primary_h2h(recent, team1_id, team2_id)
 
 
 def _parse_primary_h2h(
