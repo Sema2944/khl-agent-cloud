@@ -1,441 +1,403 @@
-# src/sports_config.py
+# src/data_collector.py
 """
-Centralized sports configuration for all api-sports.io endpoints.
-One API key ($19/mo) covers all sports.
+Data Collector: собирает данные из всех API-источников
+и формирует структурированный MatchContext для LLM.
 
-To enable a new sport: set "enabled": True → it auto-appears in the bot menu.
+Pipeline: Odds API + Sports API + RSS → MatchContext → prompt_builder → LLM
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
 
-# ============================================================
-# FULL SPORTS CONFIG
-# ============================================================
 
-SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
-    # ==========================================
-    # ⚽ ФУТБОЛ — Приоритет 1
-    # ==========================================
-    "football": {
-        "emoji": "⚽",
-        "name": "Футбол",
-        "slug": "football",             # internal slug
-        "bot_slug": "football",          # slug used in bot callbacks
-        "enabled": True,
-        "api_base": "https://v3.football.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/fixtures",
-            "statistics": "/fixtures/statistics",
-            "h2h":        "/fixtures/headtohead",
-            "lineups":    "/fixtures/lineups",
-            "standings":  "/standings",
-            "injuries":   "/injuries",
-        },
-        "match_param": "fixture",        # ?fixture=123
-        "leagues": {
-            # Россия
-            235: {"name": "РПЛ", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
-            237: {"name": "Кубок России", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
-            # Англия
-            39:  {"name": "Premier League", "flag": "🏴", "country": "Англия", "season": 2025, "priority": 1},
-            45:  {"name": "FA Cup", "flag": "🏴", "country": "Англия", "season": 2025, "priority": 2},
-            # Испания
-            140: {"name": "La Liga", "flag": "🇪🇸", "country": "Испания", "season": 2025, "priority": 1},
-            143: {"name": "Copa del Rey", "flag": "🇪🇸", "country": "Испания", "season": 2025, "priority": 2},
-            # Германия
-            78:  {"name": "Bundesliga", "flag": "🇩🇪", "country": "Германия", "season": 2025, "priority": 1},
-            # Италия
-            135: {"name": "Serie A", "flag": "🇮🇹", "country": "Италия", "season": 2025, "priority": 1},
-            # Франция
-            61:  {"name": "Ligue 1", "flag": "🇫🇷", "country": "Франция", "season": 2025, "priority": 1},
-            # Еврокубки
-            2:   {"name": "Лига Чемпионов", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
-            3:   {"name": "Лига Европы", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
-            848: {"name": "Лига Конференций", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
-            # Турция
-            203: {"name": "Super Lig", "flag": "🇹🇷", "country": "Турция", "season": 2025, "priority": 2},
-            # Португалия
-            94:  {"name": "Primeira Liga", "flag": "🇵🇹", "country": "Португалия", "season": 2025, "priority": 2},
-            # Нидерланды
-            88:  {"name": "Eredivisie", "flag": "🇳🇱", "country": "Нидерланды", "season": 2025, "priority": 2},
-        },
-        # Odds API sport keys
-        "odds_keys": [
-            "soccer_russia_premier_league",
-            "soccer_epl",
-            "soccer_spain_la_liga",
-            "soccer_germany_bundesliga",
-            "soccer_italy_serie_a",
-            "soccer_france_ligue_one",
-            "soccer_uefa_champs_league",
-            "soccer_uefa_europa_league",
-        ],
-        # RSS feeds
-        "rss_feeds": [
-            "https://www.championat.com/football/rss.xml",
-            "https://sport-express.ru/football/rss/",
-        ],
-    },
+@dataclass
+class OddsData:
+    """Кэфы и движение линии."""
+    home_win: float = 0.0
+    away_win: float = 0.0
+    draw: Optional[float] = None
+    total_line: float = 0.0
+    total_over: float = 0.0
+    total_under: float = 0.0
+    # Opening odds (для движения линии)
+    home_win_open: Optional[float] = None
+    away_win_open: Optional[float] = None
+    total_over_open: Optional[float] = None
+    # Букмекер-источник
+    bookmaker: str = ""
 
-    # ==========================================
-    # 🏒 ХОККЕЙ — Приоритет 1
-    # ==========================================
-    "ice-hockey": {
-        "emoji": "🏒",
-        "name": "Хоккей",
-        "slug": "ice-hockey",
-        "bot_slug": "ice-hockey",
-        "enabled": True,
-        "api_base": "https://v1.hockey.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/games/statistics",
-            "h2h":        "/games/h2h",
-            "lineups":    "/games/lineups",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            50:  {"name": "KHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
-            57:  {"name": "NHL", "flag": "🇺🇸", "country": "USA/Canada", "season": 2025, "priority": 1},
-            48:  {"name": "VHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
-            56:  {"name": "SHL", "flag": "🇸🇪", "country": "Швеция", "season": 2025, "priority": 2},
-            51:  {"name": "Liiga", "flag": "🇫🇮", "country": "Финляндия", "season": 2025, "priority": 2},
-            52:  {"name": "Extraliga", "flag": "🇨🇿", "country": "Чехия", "season": 2025, "priority": 3},
-            53:  {"name": "DEL", "flag": "🇩🇪", "country": "Германия", "season": 2025, "priority": 3},
-        },
-        "odds_keys": [
-            "icehockey_russia_khl",
-            "icehockey_nhl",
-            "icehockey_sweden_hockey_league",
-            "icehockey_liiga",
-        ],
-        "rss_feeds": [
-            "https://www.championat.com/hockey/_khl/rss.xml",
-            "https://sport-express.ru/hockey/khl/rss/",
-        ],
-    },
 
-    # ==========================================
-    # 🎾 ТЕННИС — Приоритет 1
-    # ==========================================
-    "tennis": {
-        "emoji": "🎾",
-        "name": "Теннис",
-        "slug": "tennis",
-        "bot_slug": "tennis",
-        "enabled": True,  # ATP+WTA via ESPN free API (no key needed)
-        "api_base": "",  # ESPN public API, no base needed
-        "endpoints": {},
-        "match_param": "id",
-        "leagues": {},  # Tournaments loaded dynamically from ESPN
-        "odds_keys": [
-            "tennis_atp_australian_open",
-            "tennis_atp_french_open",
-            "tennis_atp_us_open",
-            "tennis_wta_australian_open",
-            "tennis_wta_french_open",
-            "tennis_wta_us_open",
-        ],
-        "rss_feeds": [],
-    },
+@dataclass
+class TeamForm:
+    """Форма команды (последние N матчей)."""
+    wins: int = 0
+    losses: int = 0
+    otl: int = 0
+    last_10: str = ""          # "6W-3L-1OTL"
+    home_record: str = ""      # "8W-2L"
+    away_record: str = ""      # "2W-7L-1OTL"
+    streak: str = ""           # "2W" или "3L"
+    goals_per_game: float = 0.0
+    goals_against_per_game: float = 0.0
 
-    # ==========================================
-    # 🏀 БАСКЕТБОЛ — Приоритет 1
-    # ==========================================
-    "basketball": {
-        "emoji": "🏀",
-        "name": "Баскетбол",
-        "slug": "basketball",
-        "bot_slug": "basketball",
-        "enabled": True,  # NBA via ESPN free API (no key needed)
-        "api_base": "https://v1.basketball.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/statistics",
-            "h2h":        "/games",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            12:  {"name": "NBA", "flag": "🇺🇸", "country": "USA", "season": "2025-2026", "priority": 1},
-            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 1},
-            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 2},
-            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 2},
-        },
-        "odds_keys": [
-            "basketball_nba",
-            "basketball_euroleague",
-        ],
-        "rss_feeds": [
-            "https://www.championat.com/basketball/rss.xml",
-        ],
-    },
 
-    # ==========================================
-    # 🏐 ВОЛЕЙБОЛ — Приоритет 2
-    # ==========================================
-    "volleyball": {
-        "emoji": "🏐",
-        "name": "Волейбол",
-        "slug": "volleyball",
-        "bot_slug": "volleyball",
-        "enabled": False,  # disabled: api-sports.io free plan blocks current season
-        "api_base": "https://v1.volleyball.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/games/statistics",
-            "h2h":        "/games/h2h",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            78:  {"name": "Суперлига", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
-            37:  {"name": "CEV Champions League", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
-            30:  {"name": "Serie A1", "flag": "🇮🇹", "country": "Италия", "season": 2025, "priority": 2},
-        },
-        "odds_keys": [],
-        "rss_feeds": [],
-    },
+@dataclass
+class H2HData:
+    """История встреч двух команд."""
+    total_games: int = 0
+    home_wins: int = 0
+    away_wins: int = 0
+    draws: int = 0
+    avg_total: float = 0.0
+    last_result: str = ""      # "Сибирь 4-2"
 
-    # ==========================================
-    # 🤾 ГАНДБОЛ — Приоритет 2
-    # ==========================================
-    "handball": {
-        "emoji": "🤾",
-        "name": "Гандбол",
-        "slug": "handball",
-        "bot_slug": "handball",
-        "enabled": False,  # disabled: api-sports.io free plan blocks current season
-        "api_base": "https://v1.handball.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/games/statistics",
-            "h2h":        "/games/h2h",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            35:  {"name": "EHF Champions League", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
-            34:  {"name": "Bundesliga", "flag": "🇩🇪", "country": "Германия", "season": 2025, "priority": 2},
-        },
-        "odds_keys": [],
-        "rss_feeds": [],
-    },
 
-    # ==========================================
-    # 🥊 MMA — Приоритет 2
-    # ==========================================
-    "mma": {
-        "emoji": "🥊",
-        "name": "MMA",
-        "slug": "mma",
-        "bot_slug": "mma",
-        "enabled": True,  # UFC via ESPN free API (no key needed)
-        "api_base": "https://v1.mma.api-sports.io",
-        "endpoints": {
-            "fixtures": "/fights",
-            "h2h":      "/fights/h2h",
-            "standings": "/rankings",
-        },
-        "match_param": "id",
-        "leagues": {
-            1:  {"name": "UFC", "flag": "🇺🇸", "country": "USA", "season": 2025, "priority": 1},
-        },
-        "odds_keys": [
-            "mma_mixed_martial_arts",
-        ],
-        "rss_feeds": [],
-    },
+@dataclass
+class LiveStats:
+    """Данные LIVE — заполняются только во время матча."""
+    shots_home: int = 0
+    shots_away: int = 0
+    faceoffs_home: float = 0.0
+    faceoffs_away: float = 0.0
+    penalties_home: int = 0
+    penalties_away: int = 0
+    powerplay_home: str = ""   # "2/3 (67%)"
+    powerplay_away: str = ""
+    hits_home: int = 0
+    hits_away: int = 0
+    blocked_home: int = 0
+    blocked_away: int = 0
+    period: int = 0
+    time: str = ""             # "08:34"
 
-    # ==========================================
-    # 🏎 ФОРМУЛА-1 — Приоритет 3 (выключен)
-    # ==========================================
-    "formula1": {
-        "emoji": "🏎",
-        "name": "Формула-1",
-        "slug": "formula1",
-        "bot_slug": "formula1",
-        "enabled": False,
-        "api_base": "https://v1.formula-1.api-sports.io",
-        "endpoints": {
-            "fixtures": "/races",
-            "standings": "/rankings/drivers",
-        },
-        "match_param": "id",
-        "leagues": {
-            1: {"name": "Formula 1", "flag": "🏁", "country": "Мир", "season": 2026, "priority": 1},
-        },
-        "odds_keys": [],
-        "rss_feeds": [],
-    },
 
-    # ==========================================
-    # ⚾ БЕЙСБОЛ — Приоритет 3 (выключен)
-    # ==========================================
-    "baseball": {
-        "emoji": "⚾",
-        "name": "Бейсбол",
-        "slug": "baseball",
-        "bot_slug": "baseball",
-        "enabled": False,
-        "api_base": "https://v1.baseball.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/games/statistics",
-            "h2h":        "/games/h2h",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            1:  {"name": "MLB", "flag": "🇺🇸", "country": "USA", "season": 2026, "priority": 1},
-        },
-        "odds_keys": [],
-        "rss_feeds": [],
-    },
+@dataclass
+class TeamInfo:
+    """Информация о команде: травмы, вратарь, усталость."""
+    name: str = ""
+    injuries: List[str] = field(default_factory=list)
+    goalie: str = ""           # "Красотка (save% 92.1)"
+    rest_days: int = 0
+    travel_info: str = ""      # "перелёт из Хабаровска"
 
-    # ==========================================
-    # 🏉 РЕГБИ — Приоритет 3 (выключен)
-    # ==========================================
-    "rugby": {
-        "emoji": "🏉",
-        "name": "Регби",
-        "slug": "rugby",
-        "bot_slug": "rugby",
-        "enabled": False,
-        "api_base": "https://v1.rugby.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "h2h":        "/games/h2h",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            44: {"name": "Six Nations", "flag": "🇪🇺", "country": "Европа", "season": 2026, "priority": 1},
-        },
-        "odds_keys": [],
-        "rss_feeds": [],
-    },
 
-    # ==========================================
-    # 🏈 NFL — Приоритет 3 (выключен)
-    # ==========================================
-    "american-football": {
-        "emoji": "🏈",
-        "name": "Американский футбол",
-        "slug": "american-football",
-        "bot_slug": "american-football",
-        "enabled": False,
-        "api_base": "https://v1.american-football.api-sports.io",
-        "endpoints": {
-            "fixtures":   "/games",
-            "statistics": "/games/statistics",
-            "h2h":        "/games/h2h",
-            "standings":  "/standings",
-        },
-        "match_param": "id",
-        "leagues": {
-            1: {"name": "NFL", "flag": "🇺🇸", "country": "USA", "season": 2025, "priority": 1},
-            2: {"name": "NCAA", "flag": "🇺🇸", "country": "USA", "season": 2025, "priority": 2},
-        },
-        "odds_keys": [
-            "americanfootball_nfl",
-        ],
-        "rss_feeds": [],
-    },
+@dataclass
+class MatchContext:
+    """Полный контекст матча для отправки в LLM."""
+    # Базовое
+    match_id: str = ""
+    home_team: str = ""
+    away_team: str = ""
+    league: str = ""
+    country: str = ""
+    start_time: str = ""
+    status: str = ""           # "NS" / "1P" / "2P" / "3P" / "OT" / "FT"
+    score_home: Optional[int] = None
+    score_away: Optional[int] = None
+
+    # Данные
+    odds: Optional[OddsData] = None
+    home_form: Optional[TeamForm] = None
+    away_form: Optional[TeamForm] = None
+    h2h: Optional[H2HData] = None
+    home_info: Optional[TeamInfo] = None
+    away_info: Optional[TeamInfo] = None
+    live_stats: Optional[LiveStats] = None
+    news: List[Dict[str, str]] = field(default_factory=list)
+
+    def has_odds(self) -> bool:
+        return self.odds is not None and self.odds.home_win > 0
+
+    def has_form(self) -> bool:
+        return self.home_form is not None and self.home_form.last_10 != ""
+
+    def has_h2h(self) -> bool:
+        return self.h2h is not None and self.h2h.total_games > 0
+
+    def has_live_stats(self) -> bool:
+        return self.live_stats is not None and self.live_stats.shots_home > 0
+
+    def data_completeness(self) -> int:
+        """% данных для confidence."""
+        checks = [
+            self.has_odds(),
+            self.has_form(),
+            self.has_h2h(),
+            self.home_info is not None,
+            len(self.news) > 0,
+        ]
+        if self.status not in ("NS", ""):
+            checks.append(self.has_live_stats())
+        filled = sum(checks)
+        return int(filled / len(checks) * 100) if checks else 0
+
+
+# ---------------------------------------------------------------------------
+# In-memory cache (simple TTL dict)
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta
+
+CACHE_TTL = {
+    "odds": timedelta(minutes=5),
+    "form": timedelta(hours=6),
+    "h2h": timedelta(hours=24),
+    "news": timedelta(hours=1),
+    "live_stats": timedelta(seconds=60),
+    "games_today": timedelta(hours=1),
 }
 
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def get_enabled_sports() -> Dict[str, Dict[str, Any]]:
-    """Return only enabled sports."""
-    return {k: v for k, v in SPORTS_CONFIG.items() if v.get("enabled")}
+_cache: Dict[str, Any] = {}
 
 
-def get_sport_labels() -> Dict[str, str]:
-    """Return {slug: 'emoji name'} for enabled sports."""
-    return {k: f"{v['emoji']} {v['name']}" for k, v in get_enabled_sports().items()}
-
-
-def get_default_sports() -> List[str]:
-    """Return list of enabled sport slugs (ordered)."""
-    return list(get_enabled_sports().keys())
-
-
-def get_sport_config(slug: str) -> Optional[Dict[str, Any]]:
-    """Get config for a sport by slug. Also checks aliases."""
-    if slug in SPORTS_CONFIG:
-        return SPORTS_CONFIG[slug]
-    # Alias: "hockey" → "ice-hockey"
-    for key, cfg in SPORTS_CONFIG.items():
-        if slug == cfg.get("slug") or slug in _SPORT_ALIASES.get(key, []):
-            return cfg
+def cache_get(key: str) -> Any:
+    if key in _cache:
+        data, expires = _cache[key]
+        if datetime.utcnow() < expires:
+            return data
+        del _cache[key]
     return None
 
 
-def get_api_base(slug: str) -> Optional[str]:
-    """Get API base URL for a sport."""
-    cfg = get_sport_config(slug)
-    return cfg["api_base"] if cfg else None
+def cache_set(key: str, data: Any, ttl_key: str) -> None:
+    if ttl_key not in CACHE_TTL:
+        return
+    expires = datetime.utcnow() + CACHE_TTL[ttl_key]
+    _cache[key] = (data, expires)
 
 
-def get_leagues(slug: str, max_priority: int = 99) -> Dict[int, Dict[str, Any]]:
-    """Get leagues for a sport, optionally filtered by priority."""
-    cfg = get_sport_config(slug)
-    if not cfg:
-        return {}
-    return {
-        lid: info for lid, info in cfg.get("leagues", {}).items()
-        if info.get("priority", 99) <= max_priority
-    }
+# ---------------------------------------------------------------------------
+# Main collector
+# ---------------------------------------------------------------------------
+
+async def collect_match_data(
+    match_id: str,
+    home_team: str = "",
+    away_team: str = "",
+    league: str = "",
+    country: str = "",
+    start_time: str = "",
+    status: str = "",
+    score_home: Optional[int] = None,
+    score_away: Optional[int] = None,
+    sport_slug: str = "ice-hockey",
+    home_team_id: Optional[int] = None,
+    away_team_id: Optional[int] = None,
+) -> MatchContext:
+    """
+    Main function: collect data from all APIs and build MatchContext.
+    Called before sending to LLM / PRO engine.
+    Never raises — returns partial context on errors.
+    """
+    ctx = MatchContext(
+        match_id=match_id,
+        home_team=home_team,
+        away_team=away_team,
+        league=league,
+        country=country,
+        start_time=start_time,
+        status=status,
+        score_home=score_home,
+        score_away=score_away,
+    )
+
+    # Run all API calls concurrently
+    tasks = []
+
+    # 1. Odds (The Odds API)
+    tasks.append(_collect_odds(ctx, sport_slug))
+
+    # 2. Form + H2H (api-sports.io)
+    if home_team_id and away_team_id:
+        tasks.append(_collect_form(ctx, home_team_id, away_team_id, sport_slug))
+        tasks.append(_collect_h2h(ctx, home_team_id, away_team_id))
+    elif home_team and away_team:
+        tasks.append(_collect_form_by_name(ctx, sport_slug))
+
+    # 3. News (RSS)
+    tasks.append(_collect_news(ctx, sport_slug))
+
+    # 4. Live stats (api-sports, only during match)
+    if status not in ("NS", "FT", ""):
+        tasks.append(_collect_live_stats(ctx, match_id, sport_slug))
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    logger.info(
+        "Data collector: match=%s completeness=%d%% odds=%s form=%s h2h=%s news=%d live=%s",
+        match_id, ctx.data_completeness(),
+        ctx.has_odds(), ctx.has_form(), ctx.has_h2h(),
+        len(ctx.news), ctx.has_live_stats(),
+    )
+
+    return ctx
 
 
-def get_odds_keys(slug: str) -> List[str]:
-    """Get Odds API sport keys for a sport."""
-    cfg = get_sport_config(slug)
-    return cfg.get("odds_keys", []) if cfg else []
+# ---------------------------------------------------------------------------
+# Individual collectors (each never raises)
+# ---------------------------------------------------------------------------
+
+async def _collect_odds(ctx: MatchContext, sport_slug: str) -> None:
+    """Fetch odds from The Odds API."""
+    cache_key = f"odds:{ctx.match_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.odds = cached
+        return
+
+    try:
+        from .odds_client import get_match_odds
+        odds = await get_match_odds(
+            ctx.home_team, ctx.away_team, sport_slug
+        )
+        if odds:
+            ctx.odds = odds
+            cache_set(cache_key, odds, "odds")
+            logger.info("_collect_odds OK: %s hw=%.2f aw=%.2f bk=%s",
+                        ctx.match_id, odds.home_win, odds.away_win, odds.bookmaker)
+        else:
+            logger.warning("_collect_odds: no match found for '%s' vs '%s' sport=%s",
+                           ctx.home_team, ctx.away_team, sport_slug)
+    except Exception:
+        logger.exception("Data collector: odds failed for %s", ctx.match_id)
 
 
-def get_rss_feeds(slug: str) -> List[str]:
-    """Get RSS feed URLs for a sport."""
-    cfg = get_sport_config(slug)
-    return cfg.get("rss_feeds", []) if cfg else []
+async def _collect_form(
+    ctx: MatchContext, home_id: int, away_id: int, sport_slug: str
+) -> None:
+    """Fetch team form from api-sports."""
+    cache_key_h = f"form:{home_id}"
+    cache_key_a = f"form:{away_id}"
+
+    cached_h = cache_get(cache_key_h)
+    cached_a = cache_get(cache_key_a)
+
+    if cached_h and cached_a:
+        ctx.home_form = cached_h
+        ctx.away_form = cached_a
+        logger.info("_collect_form: CACHED home=%d away=%d", home_id, away_id)
+        return
+
+    try:
+        from .stats_client import get_team_form
+        if not cached_h:
+            hf = await get_team_form(home_id, sport_slug)
+            if hf:
+                ctx.home_form = hf
+                cache_set(cache_key_h, hf, "form")
+                logger.info("_collect_form: home=%d → %s", home_id, hf.last_10)
+            else:
+                logger.warning("_collect_form: home=%d returned None", home_id)
+        else:
+            ctx.home_form = cached_h
+
+        if not cached_a:
+            af = await get_team_form(away_id, sport_slug)
+            if af:
+                ctx.away_form = af
+                cache_set(cache_key_a, af, "form")
+                logger.info("_collect_form: away=%d → %s", away_id, af.last_10)
+            else:
+                logger.warning("_collect_form: away=%d returned None", away_id)
+        else:
+            ctx.away_form = cached_a
+    except Exception:
+        logger.exception("Data collector: form failed")
 
 
-def get_match_param(slug: str) -> str:
-    """Get the match ID parameter name for API requests."""
-    cfg = get_sport_config(slug)
-    return cfg.get("match_param", "id") if cfg else "id"
+async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
+    """Fallback: try to find team IDs by name and fetch form + H2H."""
+    try:
+        from .stats_client import search_team_id, get_team_form
+        logger.info("_collect_form_by_name: searching '%s' vs '%s' sport=%s",
+                     ctx.home_team, ctx.away_team, sport_slug)
+        home_id = await search_team_id(ctx.home_team, sport_slug)
+        away_id = await search_team_id(ctx.away_team, sport_slug)
+        if home_id and away_id:
+            logger.info("_collect_form_by_name: found IDs home=%d away=%d → fetching form+h2h",
+                        home_id, away_id)
+            results = await asyncio.gather(
+                _collect_form(ctx, home_id, away_id, sport_slug),
+                _collect_h2h(ctx, home_id, away_id),
+                return_exceptions=True,
+            )
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.warning("_collect_form_by_name: task[%d] failed: %s", i, r)
+        else:
+            logger.warning("_collect_form_by_name: team IDs not found home=%s away=%s",
+                           home_id, away_id)
+    except Exception:
+        logger.exception("Data collector: form_by_name failed")
 
 
-def get_endpoints(slug: str) -> Dict[str, str]:
-    """Get API endpoints for a sport."""
-    cfg = get_sport_config(slug)
-    return cfg.get("endpoints", {}) if cfg else {}
+async def _collect_h2h(ctx: MatchContext, home_id: int, away_id: int) -> None:
+    """Fetch H2H from api-sports."""
+    cache_key = f"h2h:{home_id}:{away_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.h2h = cached
+        logger.info("_collect_h2h: CACHED %d vs %d", home_id, away_id)
+        return
+
+    try:
+        from .stats_client import get_h2h
+        h2h = await get_h2h(home_id, away_id)
+        if h2h:
+            ctx.h2h = h2h
+            cache_set(cache_key, h2h, "h2h")
+            logger.info("_collect_h2h: %d vs %d → total=%d hw=%d aw=%d",
+                        home_id, away_id, h2h.total_games, h2h.home_wins, h2h.away_wins)
+        else:
+            logger.warning("_collect_h2h: %d vs %d returned None", home_id, away_id)
+    except Exception:
+        logger.exception("Data collector: h2h failed")
 
 
-# Sport slug aliases (for backward compatibility)
-_SPORT_ALIASES: Dict[str, List[str]] = {
-    "ice-hockey": ["hockey", "ice_hockey", "icehockey"],
-    "american-football": ["american_football", "nfl"],
-    "formula1": ["f1", "formula-1"],
-    "tennis": ["atp", "wta"],
-    "mma": ["ufc", "mixed-martial-arts"],
-}
+async def _collect_news(ctx: MatchContext, sport_slug: str) -> None:
+    """Fetch news from RSS."""
+    cache_key = f"news:{ctx.home_team}:{ctx.away_team}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.news = cached
+        return
+
+    try:
+        from .news_rss import get_team_news
+        news_h = await get_team_news(ctx.home_team, sport_slug)
+        news_a = await get_team_news(ctx.away_team, sport_slug)
+        ctx.news = (news_h or []) + (news_a or [])
+        if ctx.news:
+            cache_set(cache_key, ctx.news, "news")
+    except Exception:
+        logger.exception("Data collector: news failed")
 
 
-def resolve_sport_slug(raw: str) -> Optional[str]:
-    """Resolve any sport name/alias to canonical slug."""
-    raw = (raw or "").strip().lower()
-    if raw in SPORTS_CONFIG:
-        return raw
-    for key, aliases in _SPORT_ALIASES.items():
-        if raw in aliases:
-            return key
-    return None
+async def _collect_live_stats(
+    ctx: MatchContext, match_id: str, sport_slug: str
+) -> None:
+    """Fetch live stats from api-sports."""
+    cache_key = f"live:{match_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.live_stats = cached
+        return
+
+    try:
+        from .stats_client import get_live_stats
+        stats = await get_live_stats(match_id, sport_slug)
+        if stats:
+            ctx.live_stats = stats
+            cache_set(cache_key, stats, "live_stats")
+    except Exception:
+        logger.exception("Data collector: live_stats failed")
