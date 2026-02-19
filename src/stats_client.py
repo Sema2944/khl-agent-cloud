@@ -68,6 +68,111 @@ async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# Team name normalization: Russian → English for api-sports.io
+# ---------------------------------------------------------------------------
+
+# KHL teams (api-sport.ru Russian names → api-sports.io English names)
+_TEAM_NAME_MAP: Dict[str, str] = {
+    # KHL
+    "динамо москва": "Dynamo Moscow",
+    "динамо мск": "Dynamo Moscow",
+    "динамо м": "Dynamo Moscow",
+    "динамо минск": "Dinamo Minsk",
+    "динамо мн": "Dinamo Minsk",
+    "динамо рига": "Dinamo Riga",
+    "хк сочи": "HC Sochi",
+    "сочи": "HC Sochi",
+    "ак барс": "Ak Bars",
+    "ак барс казань": "Ak Bars",
+    "лада": "Lada",
+    "лада тольятти": "Lada",
+    "ска": "SKA",
+    "ска спб": "SKA",
+    "ска санкт-петербург": "SKA",
+    "цска": "CSKA Moscow",
+    "цска москва": "CSKA Moscow",
+    "спартак": "Spartak Moscow",
+    "спартак москва": "Spartak Moscow",
+    "локомотив": "Lokomotiv Yaroslavl",
+    "локомотив ярославль": "Lokomotiv Yaroslavl",
+    "металлург": "Metallurg Magnitogorsk",
+    "металлург мг": "Metallurg Magnitogorsk",
+    "металлург магнитогорск": "Metallurg Magnitogorsk",
+    "авангард": "Avangard",
+    "авангард омск": "Avangard",
+    "салават юлаев": "Salavat Yulaev",
+    "салават юлаев уфа": "Salavat Yulaev",
+    "трактор": "Traktor",
+    "трактор челябинск": "Traktor",
+    "сибирь": "Sibir",
+    "сибирь новосибирск": "Sibir",
+    "торпедо": "Torpedo",
+    "торпедо нижний новгород": "Torpedo",
+    "торпедо нн": "Torpedo",
+    "нефтехимик": "Neftekhimik",
+    "нефтехимик нижнекамск": "Neftekhimik",
+    "северсталь": "Severstal",
+    "северсталь череповец": "Severstal",
+    "витязь": "Vityaz",
+    "витязь подольск": "Vityaz",
+    "адмирал": "Admiral",
+    "адмирал владивосток": "Admiral",
+    "амур": "Amur",
+    "амур хабаровск": "Amur",
+    "барыс": "Barys",
+    "барыс астана": "Barys",
+    "куньлунь": "Kunlun",
+    "куньлунь ред стар": "Kunlun",
+    "автомобилист": "Avtomobilist",
+    "автомобилист екатеринбург": "Avtomobilist",
+    # RPL football
+    "зенит": "Zenit",
+    "зенит спб": "Zenit",
+    "краснодар": "Krasnodar",
+    "фк краснодар": "Krasnodar",
+    "рубин": "Rubin",
+    "рубин казань": "Rubin",
+    "ростов": "Rostov",
+    "фк ростов": "Rostov",
+    "крылья советов": "Krylya Sovetov",
+    "факел": "Fakel",
+    "факел воронеж": "Fakel",
+    "оренбург": "Orenburg",
+    "фк оренбург": "Orenburg",
+    "ахмат": "Akhmat",
+    "ахмат грозный": "Akhmat Grozny",
+    "урал": "Ural",
+    "урал екатеринбург": "Ural",
+    "пари нн": "Pari NN",
+    "химки": "Khimki",
+    "балтика": "Baltika",
+}
+
+# Prefixes to strip before lookup
+_STRIP_PREFIXES = ("хк ", "фк ", "бк ", "hc ", "fc ", "bc ")
+
+
+def _normalize_team_name(name: str) -> str:
+    """Normalize team name: strip prefixes, lookup mapping."""
+    clean = name.strip()
+    lower = clean.lower()
+
+    # Direct mapping hit
+    if lower in _TEAM_NAME_MAP:
+        return _TEAM_NAME_MAP[lower]
+
+    # Strip prefix and try again
+    for prefix in _STRIP_PREFIXES:
+        if lower.startswith(prefix):
+            stripped = lower[len(prefix):].strip()
+            if stripped in _TEAM_NAME_MAP:
+                return _TEAM_NAME_MAP[stripped]
+
+    # No mapping found — return original (will try search as-is)
+    return clean
+
+
+# ---------------------------------------------------------------------------
 # Team search (universal) with in-memory cache
 # ---------------------------------------------------------------------------
 
@@ -81,7 +186,7 @@ async def resolve_team_id(
 ) -> Optional[int]:
     """
     Resolve team name → api-sports.io team ID with caching.
-    Always searches api-sports.io by name (ignores IDs from other APIs).
+    Normalizes Russian names to English before searching.
     """
     slug = resolve_sport_slug(sport_slug) or sport_slug
     cache_key = f"{slug}:{team_name.lower().strip()}"
@@ -91,7 +196,18 @@ async def resolve_team_id(
         logger.debug("resolve_team_id CACHE HIT: '%s' → %s (%s)", team_name, cached, slug)
         return cached
 
-    tid = await search_team_id(team_name, sport_slug)
+    # Normalize: Russian → English
+    normalized = _normalize_team_name(team_name)
+    if normalized != team_name:
+        logger.info("resolve_team_id: normalized '%s' → '%s'", team_name, normalized)
+
+    tid = await search_team_id(normalized, sport_slug)
+
+    # If normalized name failed, try original as fallback
+    if tid is None and normalized != team_name:
+        logger.info("resolve_team_id: normalized search failed, trying original '%s'", team_name)
+        tid = await search_team_id(team_name, sport_slug)
+
     _team_id_cache[cache_key] = tid
     return tid
 
@@ -100,7 +216,7 @@ async def search_team_id(
     team_name: str,
     sport_slug: str = "ice-hockey",
 ) -> Optional[int]:
-    """Search for team ID by name. Works for any sport with /teams endpoint."""
+    """Search for team ID by name on api-sports.io."""
     slug = resolve_sport_slug(sport_slug) or sport_slug
 
     try:
