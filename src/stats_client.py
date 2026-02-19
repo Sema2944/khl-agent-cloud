@@ -648,3 +648,280 @@ def _safe_float(val: Any) -> float:
         return float(val)
     except (ValueError, TypeError):
         return 0.0
+
+
+# ===========================================================================
+# PRIMARY API (api-sport.ru) — for hockey form/H2H
+# Uses SPORT_API_BASE + SPORT_API_KEY (same as sport_api.py)
+# ===========================================================================
+
+_PRIMARY_BASE = os.getenv("SPORT_API_BASE", "").rstrip("/")
+_PRIMARY_KEY = os.getenv("SPORT_API_KEY", "")
+_PRIMARY_HEADER = os.getenv("SPORT_API_KEY_HEADER", "Authorization")
+_PRIMARY_PREFIX = os.getenv("SPORT_API_KEY_PREFIX", "")
+
+
+def _primary_headers() -> Dict[str, str]:
+    if not _PRIMARY_KEY:
+        return {}
+    val = f"{_PRIMARY_PREFIX}{_PRIMARY_KEY}".strip()
+    return {_PRIMARY_HEADER: val} if val else {}
+
+
+async def _primary_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """GET request to primary API (api-sport.ru)."""
+    if not _PRIMARY_BASE or not _PRIMARY_KEY:
+        logger.debug("primary API not configured (SPORT_API_BASE/SPORT_API_KEY missing)")
+        return None
+
+    url = f"{_PRIMARY_BASE}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(url, headers=_primary_headers(), params=params or {})
+
+            logger.info("primary_get: GET %s → HTTP %d", path, resp.status_code)
+
+            if resp.status_code >= 400:
+                logger.warning("primary_get: %s returned HTTP %d: %s",
+                               path, resp.status_code, (resp.text or "")[:300])
+                return None
+
+            return resp.json()
+    except Exception:
+        logger.exception("primary_get failed: %s", path)
+        return None
+
+
+def _primary_unwrap_list(data: Any) -> List[Dict[str, Any]]:
+    """Unwrap list from api-sport.ru response (handles data/response/results wrappers)."""
+    if isinstance(data, list):
+        return [i for i in data if isinstance(i, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "response", "results", "items", "matches", "events", "list"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return [i for i in v if isinstance(i, dict)]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Hockey form via api-sport.ru
+# ---------------------------------------------------------------------------
+
+async def get_team_form_primary(
+    team_id: int,
+    sport_slug: str = "ice-hockey",
+    last: int = 10,
+) -> Optional[TeamForm]:
+    """
+    Fetch team's last N matches from api-sport.ru and derive form.
+    Uses original api-sport.ru team_id (NOT api-sports.io id).
+    """
+    # Try multiple endpoint patterns
+    sport_paths = [sport_slug, "hockey"]
+    for sport in sport_paths:
+        for pattern in (
+            f"/v2/{sport}/teams/{team_id}/matches",
+            f"/v2/{sport}/team/{team_id}/matches",
+            f"/v2/{sport}/teams/{team_id}/events",
+        ):
+            data = await _primary_get(pattern, {"last": last})
+            if data is None:
+                continue
+            items = _primary_unwrap_list(data)
+            if items:
+                logger.info("get_team_form_primary: %s returned %d matches for team=%d",
+                            pattern, len(items), team_id)
+                return _parse_primary_form(items, team_id)
+
+    logger.warning("get_team_form_primary: no data for team=%d sport=%s", team_id, sport_slug)
+    return None
+
+
+def _parse_primary_form(matches: List[Dict[str, Any]], team_id: int) -> TeamForm:
+    """Parse list of recent matches from api-sport.ru into TeamForm."""
+    form = TeamForm()
+    wins = losses = otl = 0
+    home_w = home_l = away_w = away_l = 0
+    goals_for = goals_against = 0
+    streak_chars = []
+
+    for m in matches:
+        # Extract scores
+        home_team = m.get("homeTeam") or m.get("home_team") or m.get("home") or {}
+        away_team = m.get("awayTeam") or m.get("away_team") or m.get("away") or {}
+
+        h_id = home_team.get("id") if isinstance(home_team, dict) else None
+        a_id = away_team.get("id") if isinstance(away_team, dict) else None
+
+        # Score extraction — multiple formats
+        score = m.get("score") or m.get("scores") or m.get("result") or {}
+        if isinstance(score, str):
+            # "3:2" or "3-2"
+            import re
+            sm = re.match(r"(\d+)\s*[:\-]\s*(\d+)", score)
+            h_score = int(sm.group(1)) if sm else 0
+            a_score = int(sm.group(2)) if sm else 0
+        elif isinstance(score, dict):
+            h_score = _safe_int(
+                score.get("home") if not isinstance(score.get("home"), dict)
+                else score.get("home", {}).get("total", 0)
+            )
+            a_score = _safe_int(
+                score.get("away") if not isinstance(score.get("away"), dict)
+                else score.get("away", {}).get("total", 0)
+            )
+        else:
+            h_score = _safe_int(m.get("homeScore") or m.get("home_score") or 0)
+            a_score = _safe_int(m.get("awayScore") or m.get("away_score") or 0)
+
+        # Determine if this team is home or away
+        is_home = (h_id == team_id) if h_id else True  # fallback: assume first = home
+
+        my_goals = h_score if is_home else a_score
+        opp_goals = a_score if is_home else h_score
+        goals_for += my_goals
+        goals_against += opp_goals
+
+        if my_goals > opp_goals:
+            wins += 1
+            if is_home:
+                home_w += 1
+            else:
+                away_w += 1
+            streak_chars.append("W")
+        elif my_goals < opp_goals:
+            losses += 1
+            if is_home:
+                home_l += 1
+            else:
+                away_l += 1
+            streak_chars.append("L")
+        else:
+            otl += 1
+            streak_chars.append("D")
+
+    total = wins + losses + otl or 1
+    form.wins = wins
+    form.losses = losses
+    form.otl = otl
+    form.goals_per_game = round(goals_for / total, 1)
+    form.goals_against_per_game = round(goals_against / total, 1)
+    form.last_10 = f"{wins}W-{losses}L" + (f"-{otl}OTL" if otl else "")
+    form.home_record = f"{home_w}W-{home_l}L"
+    form.away_record = f"{away_w}W-{away_l}L"
+
+    # Streak
+    if streak_chars:
+        last_char = streak_chars[0]  # most recent match first
+        count = 0
+        for c in streak_chars:
+            if c == last_char:
+                count += 1
+            else:
+                break
+        form.streak = f"{count}{last_char}"
+
+    logger.info("_parse_primary_form: team=%d → %s streak=%s gpg=%.1f gapg=%.1f",
+                team_id, form.last_10, form.streak, form.goals_per_game, form.goals_against_per_game)
+    return form
+
+
+# ---------------------------------------------------------------------------
+# Hockey H2H via api-sport.ru
+# ---------------------------------------------------------------------------
+
+async def get_h2h_primary(
+    team1_id: int,
+    team2_id: int,
+    sport_slug: str = "ice-hockey",
+    last: int = 10,
+) -> Optional[H2HData]:
+    """
+    Fetch H2H from api-sport.ru using original team IDs.
+    """
+    sport_paths = [sport_slug, "hockey"]
+    for sport in sport_paths:
+        for pattern in (
+            f"/v2/{sport}/matches/h2h/{team1_id}/{team2_id}",
+            f"/v2/{sport}/h2h/{team1_id}/{team2_id}",
+            f"/v2/{sport}/events/h2h/{team1_id}/{team2_id}",
+        ):
+            data = await _primary_get(pattern, {"last": last})
+            if data is None:
+                continue
+            items = _primary_unwrap_list(data)
+            if items:
+                logger.info("get_h2h_primary: %s returned %d games for %d vs %d",
+                            pattern, len(items), team1_id, team2_id)
+                return _parse_primary_h2h(items, team1_id, team2_id)
+
+    logger.warning("get_h2h_primary: no data for %d vs %d sport=%s", team1_id, team2_id, sport_slug)
+    return None
+
+
+def _parse_primary_h2h(
+    matches: List[Dict[str, Any]], home_id: int, away_id: int
+) -> H2HData:
+    """Parse H2H matches from api-sport.ru into H2HData."""
+    h2h = H2HData(total_games=len(matches))
+    total_goals = 0
+
+    for m in matches:
+        home_team = m.get("homeTeam") or m.get("home_team") or m.get("home") or {}
+        h_id = home_team.get("id") if isinstance(home_team, dict) else None
+
+        score = m.get("score") or m.get("scores") or m.get("result") or {}
+        if isinstance(score, str):
+            import re
+            sm = re.match(r"(\d+)\s*[:\-]\s*(\d+)", score)
+            h_score = int(sm.group(1)) if sm else 0
+            a_score = int(sm.group(2)) if sm else 0
+        elif isinstance(score, dict):
+            h_score = _safe_int(
+                score.get("home") if not isinstance(score.get("home"), dict)
+                else score.get("home", {}).get("total", 0)
+            )
+            a_score = _safe_int(
+                score.get("away") if not isinstance(score.get("away"), dict)
+                else score.get("away", {}).get("total", 0)
+            )
+        else:
+            h_score = _safe_int(m.get("homeScore") or m.get("home_score") or 0)
+            a_score = _safe_int(m.get("awayScore") or m.get("away_score") or 0)
+
+        total_goals += h_score + a_score
+
+        if h_score > a_score:
+            if h_id == home_id:
+                h2h.home_wins += 1
+            else:
+                h2h.away_wins += 1
+        elif a_score > h_score:
+            if h_id == home_id:
+                h2h.away_wins += 1
+            else:
+                h2h.home_wins += 1
+        else:
+            h2h.draws += 1
+
+    if h2h.total_games > 0:
+        h2h.avg_total = round(total_goals / h2h.total_games, 1)
+
+    # Last result
+    if matches:
+        last_m = matches[0]
+        ht = last_m.get("homeTeam") or last_m.get("home_team") or last_m.get("home") or {}
+        h_name = ht.get("name") or "?" if isinstance(ht, dict) else "?"
+        sc = last_m.get("score") or last_m.get("scores") or ""
+        if isinstance(sc, str):
+            h2h.last_result = f"{h_name} {sc}"
+        else:
+            hs = _safe_int(sc.get("home", 0) if isinstance(sc, dict) else 0)
+            asc = _safe_int(sc.get("away", 0) if isinstance(sc, dict) else 0)
+            h2h.last_result = f"{h_name} {hs}:{asc}"
+
+    logger.info("_parse_primary_h2h: %d vs %d → total=%d hw=%d aw=%d draws=%d avg=%.1f",
+                home_id, away_id, h2h.total_games, h2h.home_wins,
+                h2h.away_wins, h2h.draws, h2h.avg_total)
+    return h2h
