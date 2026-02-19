@@ -646,6 +646,32 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
             "raw": getattr(m, "raw", None),
         }
 
+    # Log odds_base availability in the loaded match list
+    _ob_count = sum(
+        1 for mm in _MATCH_CACHE_BY_USER[user_id].values()
+        if mm.get("odds_base") and isinstance(mm.get("odds_base"), dict)
+    )
+    _ns_count = sum(
+        1 for mm in _MATCH_CACHE_BY_USER[user_id].values()
+        if str(mm.get("status", "")).lower() in ("notstarted", "ns", "not started", "scheduled", "")
+    )
+    logger.info(
+        "matches_by_date: %d total, %d have odds_base (dict), %d are NS/scheduled",
+        len(matches), _ob_count, _ns_count,
+    )
+    # Log first 3 matches with their oddsBase type for debugging
+    for _i, (_mid, _mm) in enumerate(list(_MATCH_CACHE_BY_USER[user_id].items())[:3]):
+        _ob = _mm.get("odds_base")
+        _raw_ob = (_mm.get("raw") or {}).get("oddsBase") if _mm.get("raw") else None
+        logger.info(
+            "MATCH_LIST[%d] id=%s status=%s odds_base=%s raw.oddsBase=%s(%s)",
+            _i, _mid,
+            str(_mm.get("status", ""))[:15],
+            type(_ob).__name__,
+            type(_raw_ob).__name__,
+            repr(_raw_ob)[:120] if _raw_ob else "None",
+        )
+
     return _render_countries(user_id, title, today.isoformat())
 
 
@@ -680,6 +706,7 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
                     "score": getattr(m, "score", ""),
                     "odds_base": getattr(m, "odds_base", None),
                     "country": getattr(m, "country", "") if hasattr(m, "country") else "",
+                    "raw": getattr(m, "raw", None),
                 }
     except Exception:
         logger.exception("_refresh_match_from_day_list failed")
@@ -800,11 +827,11 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                         "status": getattr(d, "status", merged.get("status") or ""),
                         "start_time": getattr(d, "start_time", merged.get("start_time") or ""),
                         "score": getattr(d, "score", merged.get("score") or ""),
-                        "odds_base": getattr(d, "odds_base", merged.get("odds_base")),
+                        "odds_base": getattr(d, "odds_base", None) or merged.get("odds_base"),
                         "country": getattr(d, "country", merged.get("country") or "")
                         if hasattr(d, "country")
                         else merged.get("country") or "",
-                        "raw": getattr(d, "raw", merged.get("raw")),
+                        "raw": getattr(d, "raw", None) or merged.get("raw"),
                     }
                 )
             except Exception:
@@ -814,7 +841,14 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                 day = _extract_date_from_start_time(str(merged.get("start_time") or "")) or _msk_today_date()
                 refreshed = await _refresh_match_from_day_list(sport, match_id, day)
                 if refreshed:
+                    _saved_odds_base = merged.get("odds_base")
+                    _saved_raw = merged.get("raw")
                     merged.update(refreshed)
+                    # Don't overwrite cached odds_base/raw with None
+                    if not merged.get("odds_base") and _saved_odds_base:
+                        merged["odds_base"] = _saved_odds_base
+                    if not merged.get("raw") and _saved_raw:
+                        merged["raw"] = _saved_raw
 
             (_MATCH_CACHE_BY_USER.setdefault(user_id, {}))[match_id] = merged
             return dict(merged, id=match_id)
@@ -1003,9 +1037,17 @@ async def _enrich_match_meta(
             except Exception:
                 logger.info("ODDS_BASE_RAW match=%s keys=%s", _mid, list(_odds_base.keys())[:10])
         else:
-            logger.info("ODDS_BASE_RAW match=%s → None (meta=%s raw_keys=%s)",
-                        _mid, type(match_meta.get("odds_base")).__name__,
-                        [k for k in raw.keys() if "odd" in k.lower()][:5] if raw else [])
+            _raw_ob_val = raw.get("oddsBase")
+            logger.info(
+                "ODDS_BASE_RAW match=%s → None | "
+                "meta.odds_base=%s raw.oddsBase=%s(%s) "
+                "status=%s",
+                _mid,
+                type(match_meta.get("odds_base")).__name__,
+                type(_raw_ob_val).__name__,
+                repr(_raw_ob_val)[:200],
+                str(match_meta.get("status", ""))[:20],
+            )
 
         ctx = await collect_match_data(
             match_id=_mid,
