@@ -219,10 +219,9 @@ async def collect_match_data(
     tasks.append(_collect_odds(ctx, sport_slug, odds_base=odds_base))
 
     # 2. Form + H2H (api-sports.io)
-    if home_team_id and away_team_id:
-        tasks.append(_collect_form(ctx, home_team_id, away_team_id, sport_slug))
-        tasks.append(_collect_h2h(ctx, home_team_id, away_team_id))
-    elif home_team and away_team:
+    # IMPORTANT: Always resolve team IDs by name on api-sports.io.
+    # IDs from other APIs (api-sport.ru, ESPN) are incompatible with api-sports.io.
+    if home_team and away_team:
         tasks.append(_collect_form_by_name(ctx, sport_slug))
 
     # 3. News (RSS)
@@ -350,13 +349,13 @@ async def _collect_form(
 
 
 async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
-    """Fallback: try to find team IDs by name and fetch form + H2H."""
+    """Resolve team IDs by name on api-sports.io, then fetch form + H2H."""
     try:
-        from .stats_client import search_team_id, get_team_form
-        logger.info("_collect_form_by_name: searching '%s' vs '%s' sport=%s",
+        from .stats_client import resolve_team_id
+        logger.info("_collect_form_by_name: resolving '%s' vs '%s' sport=%s",
                      ctx.home_team, ctx.away_team, sport_slug)
-        home_id = await search_team_id(ctx.home_team, sport_slug)
-        away_id = await search_team_id(ctx.away_team, sport_slug)
+        home_id = await resolve_team_id(ctx.home_team, sport_slug)
+        away_id = await resolve_team_id(ctx.away_team, sport_slug)
         if home_id and away_id:
             logger.info("_collect_form_by_name: found IDs home=%d away=%d → fetching form+h2h",
                         home_id, away_id)
