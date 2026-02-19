@@ -270,18 +270,45 @@ async def handle_successful_payment(
         pass
 
     price_label = f"{tariff.price_stars} Stars" if use_stars else f"{tariff.price_rub}₽"
+
+    # Success message with navigation buttons
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
+        [InlineKeyboardButton("📊 Анализ матчей", callback_data="BACK:MATCHES_MENU")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="BACK:MENU")],
+    ])
     await msg.reply_text(
-        f"✅ Оплата прошла!\n\n"
+        f"✅ PRO активирован!\n\n"
         f"Тариф: {tariff.emoji} {tariff.label} ({tariff.days} дн.)\n"
         f"Сумма: {price_label}\n"
         f"PRO активен до: {until_str}\n\n"
-        "Теперь доступны: Охотник, LIVE PRO, расширенная аналитика.\n"
-        "Нажми /start для возврата в меню.",
+        "Что теперь доступно:\n"
+        "🎯 Охотник — Топ-3 придёт завтра утром\n"
+        "🔥 LIVE PRO — уже доступен в анализе матчей\n\n"
+        "💡 Совет: зайди в Охотник чтобы увидеть сегодняшний Топ-3",
+        reply_markup=kb,
     )
     logger.info(
         "Payment OK: user=%s tariff=%s amount=%s %s",
         user_id, tariff.key, amount, currency,
     )
+
+    # Notify admin about new payment
+    try:
+        admin_id = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+        if admin_id and context.bot:
+            username = getattr(update.effective_user, "username", None) or ""
+            admin_text = (
+                f"💰 Новая оплата!\n"
+                f"User: {user_id} (@{username})\n"
+                f"Тариф: {tariff.emoji} {tariff.label} ({tariff.days} дн.)\n"
+                f"Сумма: {price_label}\n"
+                f"Метод: {'Stars' if use_stars else 'ЮKassa'}\n"
+                f"Telegram charge: {sp.telegram_payment_charge_id or '—'}"
+            )
+            await context.bot.send_message(chat_id=admin_id, text=admin_text)
+    except Exception:
+        logger.debug("Failed to notify admin about payment user=%s", user_id)
 
 
 # ---------------------------------------------------------------------------
