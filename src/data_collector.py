@@ -1,492 +1,437 @@
-# src/stats_client.py
+# src/data_collector.py
 """
-Universal api-sports.io client — works for all sports via sports_config.
-https://api-sports.io/documentation
+Data Collector: собирает данные из всех API-источников
+и формирует структурированный MatchContext для LLM.
 
-Env: API_SPORTS_KEY
-Pro tier ($19/mo): all sports, one key.
+Pipeline: Odds API + Sports API + RSS → MatchContext → prompt_builder → LLM
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-import httpx
-
-from .data_collector import H2HData, LiveStats, TeamForm
-from .sports_config import (
-    get_sport_config,
-    get_api_base,
-    get_endpoints,
-    get_leagues,
-    get_match_param,
-    resolve_sport_slug,
-)
 
 logger = logging.getLogger(__name__)
 
-API_KEY = os.getenv("API_SPORTS_KEY", "")
-TIMEOUT = 12.0
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OddsData:
+    """Кэфы и движение линии."""
+    home_win: float = 0.0
+    away_win: float = 0.0
+    draw: Optional[float] = None
+    total_line: float = 0.0
+    total_over: float = 0.0
+    total_under: float = 0.0
+    # Opening odds (для движения линии)
+    home_win_open: Optional[float] = None
+    away_win_open: Optional[float] = None
+    total_over_open: Optional[float] = None
+    # Букмекер-источник
+    bookmaker: str = ""
 
 
-def _headers() -> Dict[str, str]:
-    return {"x-apisports-key": API_KEY}
+@dataclass
+class TeamForm:
+    """Форма команды (последние N матчей)."""
+    wins: int = 0
+    losses: int = 0
+    otl: int = 0
+    last_10: str = ""          # "6W-3L-1OTL"
+    home_record: str = ""      # "8W-2L"
+    away_record: str = ""      # "2W-7L-1OTL"
+    streak: str = ""           # "2W" или "3L"
+    goals_per_game: float = 0.0
+    goals_against_per_game: float = 0.0
+
+
+@dataclass
+class H2HData:
+    """История встреч двух команд."""
+    total_games: int = 0
+    home_wins: int = 0
+    away_wins: int = 0
+    draws: int = 0
+    avg_total: float = 0.0
+    last_result: str = ""      # "Сибирь 4-2"
+
+
+@dataclass
+class LiveStats:
+    """Данные LIVE — заполняются только во время матча."""
+    shots_home: int = 0
+    shots_away: int = 0
+    faceoffs_home: float = 0.0
+    faceoffs_away: float = 0.0
+    penalties_home: int = 0
+    penalties_away: int = 0
+    powerplay_home: str = ""   # "2/3 (67%)"
+    powerplay_away: str = ""
+    hits_home: int = 0
+    hits_away: int = 0
+    blocked_home: int = 0
+    blocked_away: int = 0
+    period: int = 0
+    time: str = ""             # "08:34"
+
+
+@dataclass
+class TeamInfo:
+    """Информация о команде: травмы, вратарь, усталость."""
+    name: str = ""
+    injuries: List[str] = field(default_factory=list)
+    goalie: str = ""           # "Красотка (save% 92.1)"
+    rest_days: int = 0
+    travel_info: str = ""      # "перелёт из Хабаровска"
+
+
+@dataclass
+class MatchContext:
+    """Полный контекст матча для отправки в LLM."""
+    # Базовое
+    match_id: str = ""
+    home_team: str = ""
+    away_team: str = ""
+    league: str = ""
+    country: str = ""
+    start_time: str = ""
+    status: str = ""           # "NS" / "1P" / "2P" / "3P" / "OT" / "FT"
+    score_home: Optional[int] = None
+    score_away: Optional[int] = None
+
+    # Данные
+    odds: Optional[OddsData] = None
+    home_form: Optional[TeamForm] = None
+    away_form: Optional[TeamForm] = None
+    h2h: Optional[H2HData] = None
+    home_info: Optional[TeamInfo] = None
+    away_info: Optional[TeamInfo] = None
+    live_stats: Optional[LiveStats] = None
+    news: List[Dict[str, str]] = field(default_factory=list)
+
+    def has_odds(self) -> bool:
+        return self.odds is not None and self.odds.home_win > 0
+
+    def has_form(self) -> bool:
+        return self.home_form is not None and self.home_form.last_10 != ""
+
+    def has_h2h(self) -> bool:
+        return self.h2h is not None and self.h2h.total_games > 0
+
+    def has_live_stats(self) -> bool:
+        return self.live_stats is not None and self.live_stats.shots_home > 0
+
+    def data_completeness(self) -> int:
+        """% данных для confidence."""
+        checks = [
+            self.has_odds(),
+            self.has_form(),
+            self.has_h2h(),
+            self.home_info is not None,
+            len(self.news) > 0,
+        ]
+        if self.status not in ("NS", ""):
+            checks.append(self.has_live_stats())
+        filled = sum(checks)
+        return int(filled / len(checks) * 100) if checks else 0
 
 
 # ---------------------------------------------------------------------------
-# Universal API request
+# In-memory cache (simple TTL dict)
 # ---------------------------------------------------------------------------
 
-async def _api_get(
-    sport_slug: str,
-    path: str,
-    params: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Universal GET request to api-sports.io for any sport."""
-    if not API_KEY:
-        logger.debug("API_SPORTS_KEY not set, skipping stats fetch")
-        return []
+from datetime import timedelta
 
-    base = get_api_base(sport_slug)
-    if not base:
-        logger.debug("No API base for sport=%s", sport_slug)
-        return []
+CACHE_TTL = {
+    "odds": timedelta(minutes=5),
+    "form": timedelta(hours=6),
+    "h2h": timedelta(hours=24),
+    "news": timedelta(hours=1),
+    "live_stats": timedelta(seconds=60),
+    "games_today": timedelta(hours=1),
+}
 
-    url = f"{base}{path}"
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.get(url, headers=_headers(), params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response") or []
+_cache: Dict[str, Any] = {}
 
 
-# Backward compatibility: hockey-specific shortcut
-async def _hockey_get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return await _api_get("ice-hockey", path, params)
-
-
-# ---------------------------------------------------------------------------
-# Team search (universal)
-# ---------------------------------------------------------------------------
-
-async def search_team_id(
-    team_name: str,
-    sport_slug: str = "ice-hockey",
-) -> Optional[int]:
-    """Search for team ID by name. Works for any sport with /teams endpoint."""
-    slug = resolve_sport_slug(sport_slug) or sport_slug
-
-    try:
-        results = await _api_get(slug, "/teams", {"search": team_name})
-        if results:
-            tid = results[0].get("id")
-            tname = results[0].get("name", "?")
-            logger.info("search_team_id: '%s' → id=%s name='%s' (%s)", team_name, tid, tname, slug)
-            return tid
-
-        # Try shorter name (first word)
-        short = team_name.split()[0] if team_name else ""
-        if short and len(short) >= 3:
-            results = await _api_get(slug, "/teams", {"search": short})
-            if results:
-                tid = results[0].get("id")
-                tname = results[0].get("name", "?")
-                logger.info("search_team_id: '%s' (short='%s') → id=%s name='%s' (%s)",
-                            team_name, short, tid, tname, slug)
-                return tid
-
-        logger.warning("search_team_id: NOT FOUND '%s' (%s)", team_name, slug)
-    except Exception:
-        logger.exception("search_team_id failed for %s (%s)", team_name, slug)
-
+def cache_get(key: str) -> Any:
+    if key in _cache:
+        data, expires = _cache[key]
+        if datetime.utcnow() < expires:
+            return data
+        del _cache[key]
     return None
 
 
-# ---------------------------------------------------------------------------
-# Team form / statistics (universal)
-# ---------------------------------------------------------------------------
-
-async def get_team_form(
-    team_id: int,
-    sport_slug: str = "ice-hockey",
-    league_id: Optional[int] = None,
-) -> Optional[TeamForm]:
-    """Fetch team season statistics and derive form."""
-    slug = resolve_sport_slug(sport_slug) or sport_slug
-    cfg = get_sport_config(slug)
-    if not cfg:
-        logger.debug("get_team_form: no config for %s", slug)
-        return None
-
-    # Default league: first priority-1 league for this sport
-    if league_id is None:
-        leagues = get_leagues(slug, max_priority=1)
-        if leagues:
-            league_id = next(iter(leagues))
-        else:
-            leagues = get_leagues(slug)
-            league_id = next(iter(leagues)) if leagues else None
-    if league_id is None:
-        logger.debug("get_team_form: no league for %s", slug)
-        return None
-
-    # Get season for this league
-    league_info = cfg.get("leagues", {}).get(league_id, {})
-    season = league_info.get("season", 2025)
-
-    # Determine the right endpoint: football uses /teams/statistics, others may differ
-    stats_endpoint = "/teams/statistics"
-
-    try:
-        data = await _api_get(slug, stats_endpoint, {
-            "team": team_id,
-            "league": league_id,
-            "season": season,
-        })
-        if not data:
-            logger.warning("get_team_form: empty response for team=%d league=%d season=%s sport=%s",
-                           team_id, league_id, season, slug)
-            return None
-
-        stats = data[0] if isinstance(data, list) else data
-        logger.info("get_team_form RAW keys: %s (team=%d sport=%s)",
-                     list(stats.keys())[:20] if isinstance(stats, dict) else type(stats).__name__,
-                     team_id, slug)
-        result = _parse_team_form(stats)
-        logger.info("get_team_form PARSED: wins=%d losses=%d last_10=%s home=%s away=%s (team=%d)",
-                     result.wins, result.losses, result.last_10,
-                     result.home_record, result.away_record, team_id)
-        return result
-    except Exception:
-        logger.exception("get_team_form failed for team=%d sport=%s", team_id, slug)
-        return None
-
-
-def _parse_team_form(stats: Dict[str, Any]) -> TeamForm:
-    """Parse api-sports team statistics into TeamForm (universal)."""
-    form = TeamForm()
-
-    # Unwrap nested "statistics" wrapper (hockey/basketball api-sports format)
-    inner = stats
-    if "statistics" in stats and isinstance(stats["statistics"], dict):
-        inner = stats["statistics"]
-
-    # Different sports return stats differently; handle common patterns
-    games = inner.get("games") or inner.get("fixtures") or stats.get("games") or stats.get("fixtures") or {}
-    wins_data = games.get("wins") or {}
-    loses_data = games.get("loses") or games.get("losses") or {}
-
-    # If wins_data is a dict with total/home/away
-    if isinstance(wins_data, dict):
-        form.wins = _safe_int(wins_data.get("total") or wins_data.get("all"))
-        home_w = _safe_int(wins_data.get("home"))
-        away_w = _safe_int(wins_data.get("away"))
-    else:
-        form.wins = _safe_int(wins_data)
-        home_w = 0
-        away_w = 0
-
-    if isinstance(loses_data, dict):
-        form.losses = _safe_int(loses_data.get("total") or loses_data.get("all"))
-        home_l = _safe_int(loses_data.get("home"))
-        away_l = _safe_int(loses_data.get("away"))
-    else:
-        form.losses = _safe_int(loses_data)
-        home_l = 0
-        away_l = 0
-
-    if home_w or home_l:
-        form.home_record = f"{home_w}W-{home_l}L"
-    if away_w or away_l:
-        form.away_record = f"{away_w}W-{away_l}L"
-
-    # Goals / points — also check inside inner
-    goals = inner.get("goals") or stats.get("goals") or {}
-    goals_for = goals.get("for") or {}
-    goals_against = goals.get("against") or {}
-
-    total_games = form.wins + form.losses or 1
-
-    # goals_for can be: int, {"total": int}, {"total": {"total": int}}
-    if isinstance(goals_for, dict):
-        gf_raw = goals_for.get("total")
-        if isinstance(gf_raw, dict):
-            gf = _safe_float(gf_raw.get("total") or gf_raw.get("all"))
-        else:
-            gf = _safe_float(gf_raw)
-    else:
-        gf = _safe_float(goals_for)
-
-    if isinstance(goals_against, dict):
-        ga_raw = goals_against.get("total")
-        if isinstance(ga_raw, dict):
-            ga = _safe_float(ga_raw.get("total") or ga_raw.get("all"))
-        else:
-            ga = _safe_float(ga_raw)
-    else:
-        ga = _safe_float(goals_against)
-
-    form.goals_per_game = round(gf / total_games, 1)
-    form.goals_against_per_game = round(ga / total_games, 1)
-
-    # Form string
-    form.last_10 = f"{form.wins}W-{form.losses}L"
-
-    # Streak from "form" field (some sports return "WWLWW")
-    form_str = inner.get("form") or stats.get("form", "")
-    if form_str and isinstance(form_str, str):
-        streak_char = form_str[-1] if form_str else ""
-        count = 0
-        for c in reversed(form_str):
-            if c == streak_char:
-                count += 1
-            else:
-                break
-        if streak_char and count:
-            form.streak = f"{count}{streak_char}"
-
-    return form
+def cache_set(key: str, data: Any, ttl_key: str) -> None:
+    if ttl_key not in CACHE_TTL:
+        return
+    expires = datetime.utcnow() + CACHE_TTL[ttl_key]
+    _cache[key] = (data, expires)
 
 
 # ---------------------------------------------------------------------------
-# H2H (universal)
+# Main collector
 # ---------------------------------------------------------------------------
 
-async def get_h2h(
-    team1_id: int,
-    team2_id: int,
-    last: int = 10,
-    sport_slug: str = "ice-hockey",
-) -> Optional[H2HData]:
-    """Fetch head-to-head history for any sport."""
-    slug = resolve_sport_slug(sport_slug) or sport_slug
-    endpoints = get_endpoints(slug)
-    h2h_endpoint = endpoints.get("h2h", "/games/h2h")
-
-    try:
-        data = await _api_get(slug, h2h_endpoint, {
-            "h2h": f"{team1_id}-{team2_id}",
-            "last": last,
-        })
-
-        if not data:
-            logger.warning("get_h2h: empty response for %d vs %d (%s)", team1_id, team2_id, slug)
-            return None
-
-        logger.info("get_h2h RAW: %d games returned for %d vs %d, first_keys=%s",
-                     len(data), team1_id, team2_id,
-                     list(data[0].keys())[:15] if data and isinstance(data[0], dict) else "?")
-
-        result = _parse_h2h(data, team1_id, team2_id)
-        logger.info("get_h2h PARSED: total=%d home_w=%d away_w=%d draws=%d avg_total=%.1f",
-                     result.total_games, result.home_wins, result.away_wins,
-                     result.draws, result.avg_total)
-        return result
-    except Exception:
-        logger.exception("get_h2h failed for %d vs %d (%s)", team1_id, team2_id, slug)
-        return None
-
-
-def _parse_h2h(games: List[Dict[str, Any]], home_id: int, away_id: int) -> H2HData:
-    """Parse H2H games list into H2HData."""
-    h2h = H2HData(total_games=len(games))
-    total_goals = 0
-
-    for game in games:
-        teams = game.get("teams") or {}
-        scores = game.get("scores") or game.get("goals") or {}
-
-        home_team = teams.get("home") or {}
-        away_team = teams.get("away") or {}
-
-        # Scores can be nested (football: goals.home) or flat (hockey: scores.home)
-        h_score = _safe_int(
-            scores.get("home") if not isinstance(scores.get("home"), dict)
-            else scores.get("home", {}).get("total", 0)
-        )
-        a_score = _safe_int(
-            scores.get("away") if not isinstance(scores.get("away"), dict)
-            else scores.get("away", {}).get("total", 0)
-        )
-
-        total_goals += h_score + a_score
-
-        game_home_id = home_team.get("id")
-        if h_score > a_score:
-            if game_home_id == home_id:
-                h2h.home_wins += 1
-            else:
-                h2h.away_wins += 1
-        elif a_score > h_score:
-            if game_home_id == home_id:
-                h2h.away_wins += 1
-            else:
-                h2h.home_wins += 1
-        else:
-            h2h.draws += 1
-
-    if h2h.total_games > 0:
-        h2h.avg_total = round(total_goals / h2h.total_games, 1)
-
-    # Last result
-    if games:
-        last_game = games[0]
-        lt = last_game.get("teams") or {}
-        ls = last_game.get("scores") or last_game.get("goals") or {}
-        h_name = (lt.get("home") or {}).get("name", "?")
-        h_s = _safe_int(ls.get("home") if not isinstance(ls.get("home"), dict) else ls.get("home", {}).get("total", 0))
-        a_s = _safe_int(ls.get("away") if not isinstance(ls.get("away"), dict) else ls.get("away", {}).get("total", 0))
-        h2h.last_result = f"{h_name} {h_s}:{a_s}"
-
-    return h2h
-
-
-# ---------------------------------------------------------------------------
-# Live stats (universal)
-# ---------------------------------------------------------------------------
-
-async def get_live_stats(
+async def collect_match_data(
     match_id: str,
+    home_team: str = "",
+    away_team: str = "",
+    league: str = "",
+    country: str = "",
+    start_time: str = "",
+    status: str = "",
+    score_home: Optional[int] = None,
+    score_away: Optional[int] = None,
     sport_slug: str = "ice-hockey",
-) -> Optional[LiveStats]:
-    """Fetch live game statistics for any sport."""
-    slug = resolve_sport_slug(sport_slug) or sport_slug
-    endpoints = get_endpoints(slug)
-    stats_endpoint = endpoints.get("statistics")
-    if not stats_endpoint:
-        return None
+    home_team_id: Optional[int] = None,
+    away_team_id: Optional[int] = None,
+    odds_base: Optional[Dict[str, Any]] = None,
+) -> MatchContext:
+    """
+    Main function: collect data from all APIs and build MatchContext.
+    Called before sending to LLM / PRO engine.
+    Never raises — returns partial context on errors.
+    """
+    ctx = MatchContext(
+        match_id=match_id,
+        home_team=home_team,
+        away_team=away_team,
+        league=league,
+        country=country,
+        start_time=start_time,
+        status=status,
+        score_home=score_home,
+        score_away=score_away,
+    )
 
+    # Run all API calls concurrently
+    tasks = []
+
+    # 1. Odds (The Odds API → odds_base fallback → api-sports.io fallback)
+    tasks.append(_collect_odds(ctx, sport_slug, odds_base=odds_base))
+
+    # 2. Form + H2H (api-sports.io)
+    if home_team_id and away_team_id:
+        tasks.append(_collect_form(ctx, home_team_id, away_team_id, sport_slug))
+        tasks.append(_collect_h2h(ctx, home_team_id, away_team_id))
+    elif home_team and away_team:
+        tasks.append(_collect_form_by_name(ctx, sport_slug))
+
+    # 3. News (RSS)
+    tasks.append(_collect_news(ctx, sport_slug))
+
+    # 4. Live stats (api-sports, only during match)
+    if status not in ("NS", "FT", ""):
+        tasks.append(_collect_live_stats(ctx, match_id, sport_slug))
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    logger.info(
+        "Data collector: match=%s completeness=%d%% odds=%s form=%s h2h=%s news=%d live=%s",
+        match_id, ctx.data_completeness(),
+        ctx.has_odds(), ctx.has_form(), ctx.has_h2h(),
+        len(ctx.news), ctx.has_live_stats(),
+    )
+
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Individual collectors (each never raises)
+# ---------------------------------------------------------------------------
+
+async def _collect_odds(
+    ctx: MatchContext,
+    sport_slug: str,
+    odds_base: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Fetch odds with fallback chain: The Odds API → odds_base → api-sports.io."""
+    cache_key = f"odds:{ctx.match_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.odds = cached
+        return
+
+    # --- Attempt 1: The Odds API ---
     try:
-        game_id = int(match_id)
-    except (ValueError, TypeError):
-        return None
-
-    match_param = get_match_param(slug)
-
-    try:
-        data = await _api_get(slug, stats_endpoint, {match_param: game_id})
-        if not data:
-            return None
-
-        return _parse_live_stats(data)
+        from .odds_client import get_match_odds
+        odds = await get_match_odds(
+            ctx.home_team, ctx.away_team, sport_slug
+        )
+        if odds and odds.home_win > 0:
+            ctx.odds = odds
+            cache_set(cache_key, odds, "odds")
+            logger.info("_collect_odds [TheOddsAPI]: %s hw=%.2f aw=%.2f bk=%s",
+                        ctx.match_id, odds.home_win, odds.away_win, odds.bookmaker)
+            return
     except Exception:
-        logger.exception("get_live_stats failed for %s (%s)", match_id, slug)
-        return None
+        logger.debug("_collect_odds: TheOddsAPI failed for %s", ctx.match_id)
+
+    # --- Attempt 2: Parse odds_base from primary API (api-sport.ru) ---
+    if odds_base and isinstance(odds_base, dict):
+        try:
+            from .odds_client import parse_odds_base
+            odds = parse_odds_base(odds_base)
+            if odds and odds.home_win > 0:
+                ctx.odds = odds
+                cache_set(cache_key, odds, "odds")
+                logger.info("_collect_odds [odds_base]: %s hw=%.2f aw=%.2f",
+                            ctx.match_id, odds.home_win, odds.away_win)
+                return
+        except Exception:
+            logger.debug("_collect_odds: odds_base parse failed for %s", ctx.match_id)
+
+    # --- Attempt 3: api-sports.io /odds or /bets ---
+    try:
+        from .odds_client import get_odds_api_sports
+        odds = await get_odds_api_sports(ctx.match_id, sport_slug)
+        if odds and odds.home_win > 0:
+            ctx.odds = odds
+            cache_set(cache_key, odds, "odds")
+            logger.info("_collect_odds [api-sports]: %s hw=%.2f aw=%.2f",
+                        ctx.match_id, odds.home_win, odds.away_win)
+            return
+    except Exception:
+        logger.debug("_collect_odds: api-sports.io failed for %s", ctx.match_id)
+
+    logger.warning("_collect_odds: ALL sources failed for '%s' vs '%s' sport=%s match=%s",
+                   ctx.home_team, ctx.away_team, sport_slug, ctx.match_id)
 
 
-def _parse_live_stats(data: List[Dict[str, Any]]) -> LiveStats:
-    """Parse api-sports game statistics into LiveStats."""
-    stats = LiveStats()
+async def _collect_form(
+    ctx: MatchContext, home_id: int, away_id: int, sport_slug: str
+) -> None:
+    """Fetch team form from api-sports."""
+    cache_key_h = f"form:{home_id}"
+    cache_key_a = f"form:{away_id}"
 
-    for team_data in data:
-        team_stats = team_data.get("statistics") or {}
+    cached_h = cache_get(cache_key_h)
+    cached_a = cache_get(cache_key_a)
 
-        # Determine home/away by position in list (first = home)
-        is_home = data.index(team_data) == 0
+    if cached_h and cached_a:
+        ctx.home_form = cached_h
+        ctx.away_form = cached_a
+        logger.info("_collect_form: CACHED home=%d away=%d", home_id, away_id)
+        return
 
-        # Handle both hockey and football stat formats
-        shots = team_stats.get("shots_on_goal") or team_stats.get("Total Shots") or team_stats.get("Shots on Goal") or {}
-        shots_total = _safe_int(shots.get("total") if isinstance(shots, dict) else shots)
-
-        penalties = _safe_int(
-            (team_stats.get("penalty_minutes") or {}).get("total")
-            if isinstance(team_stats.get("penalty_minutes"), dict)
-            else team_stats.get("penalty_minutes", 0)
-        )
-
-        faceoffs = team_stats.get("faceoffs_won") or {}
-        faceoffs_pct = _safe_float(
-            faceoffs.get("percentage", "0").replace("%", "")
-            if isinstance(faceoffs, dict) else 0
-        )
-
-        pp = team_stats.get("power_play") or {}
-        pp_total = _safe_int(pp.get("total") if isinstance(pp, dict) else 0)
-        pp_scored = _safe_int(pp.get("scored") if isinstance(pp, dict) else 0)
-        pp_str = f"{pp_scored}/{pp_total}" if pp_total else ""
-
-        hits = _safe_int(
-            (team_stats.get("hits") or {}).get("total")
-            if isinstance(team_stats.get("hits"), dict)
-            else team_stats.get("hits", 0)
-        )
-
-        blocked = _safe_int(
-            (team_stats.get("blocked_shots") or {}).get("total")
-            if isinstance(team_stats.get("blocked_shots"), dict)
-            else team_stats.get("blocked_shots", 0)
-        )
-
-        if is_home:
-            stats.shots_home = shots_total
-            stats.penalties_home = penalties
-            stats.faceoffs_home = faceoffs_pct
-            stats.powerplay_home = pp_str
-            stats.hits_home = hits
-            stats.blocked_home = blocked
+    try:
+        from .stats_client import get_team_form
+        if not cached_h:
+            hf = await get_team_form(home_id, sport_slug)
+            if hf:
+                ctx.home_form = hf
+                cache_set(cache_key_h, hf, "form")
+                logger.info("_collect_form: home=%d → %s", home_id, hf.last_10)
+            else:
+                logger.warning("_collect_form: home=%d returned None", home_id)
         else:
-            stats.shots_away = shots_total
-            stats.penalties_away = penalties
-            stats.faceoffs_away = faceoffs_pct
-            stats.powerplay_away = pp_str
-            stats.hits_away = hits
-            stats.blocked_away = blocked
+            ctx.home_form = cached_h
 
-    return stats
-
-
-# ---------------------------------------------------------------------------
-# Games today (universal)
-# ---------------------------------------------------------------------------
-
-async def get_games_today(
-    league_id: int = 50,
-    sport_slug: str = "ice-hockey",
-) -> List[Dict[str, Any]]:
-    """Fetch all games for today for any sport."""
-    slug = resolve_sport_slug(sport_slug) or sport_slug
-    cfg = get_sport_config(slug)
-    if not cfg:
-        return []
-
-    endpoints = get_endpoints(slug)
-    fixtures_endpoint = endpoints.get("fixtures", "/games")
-
-    # Get season for this league
-    league_info = cfg.get("leagues", {}).get(league_id, {})
-    season = league_info.get("season", 2025)
-
-    try:
-        today = date.today().isoformat()
-        return await _api_get(slug, fixtures_endpoint, {
-            "league": league_id,
-            "season": season,
-            "date": today,
-        })
+        if not cached_a:
+            af = await get_team_form(away_id, sport_slug)
+            if af:
+                ctx.away_form = af
+                cache_set(cache_key_a, af, "form")
+                logger.info("_collect_form: away=%d → %s", away_id, af.last_10)
+            else:
+                logger.warning("_collect_form: away=%d returned None", away_id)
+        else:
+            ctx.away_form = cached_a
     except Exception:
-        logger.exception("get_games_today failed for sport=%s league=%d", slug, league_id)
-        return []
+        logger.exception("Data collector: form failed")
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _safe_int(val: Any) -> int:
-    if val is None:
-        return 0
+async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
+    """Fallback: try to find team IDs by name and fetch form + H2H."""
     try:
-        return int(val)
-    except (ValueError, TypeError):
-        return 0
+        from .stats_client import search_team_id, get_team_form
+        logger.info("_collect_form_by_name: searching '%s' vs '%s' sport=%s",
+                     ctx.home_team, ctx.away_team, sport_slug)
+        home_id = await search_team_id(ctx.home_team, sport_slug)
+        away_id = await search_team_id(ctx.away_team, sport_slug)
+        if home_id and away_id:
+            logger.info("_collect_form_by_name: found IDs home=%d away=%d → fetching form+h2h",
+                        home_id, away_id)
+            results = await asyncio.gather(
+                _collect_form(ctx, home_id, away_id, sport_slug),
+                _collect_h2h(ctx, home_id, away_id),
+                return_exceptions=True,
+            )
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.warning("_collect_form_by_name: task[%d] failed: %s", i, r)
+        else:
+            logger.warning("_collect_form_by_name: team IDs not found home=%s away=%s",
+                           home_id, away_id)
+    except Exception:
+        logger.exception("Data collector: form_by_name failed")
 
 
-def _safe_float(val: Any) -> float:
-    if val is None:
-        return 0.0
+async def _collect_h2h(ctx: MatchContext, home_id: int, away_id: int) -> None:
+    """Fetch H2H from api-sports."""
+    cache_key = f"h2h:{home_id}:{away_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.h2h = cached
+        logger.info("_collect_h2h: CACHED %d vs %d", home_id, away_id)
+        return
+
     try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.0
+        from .stats_client import get_h2h
+        h2h = await get_h2h(home_id, away_id)
+        if h2h:
+            ctx.h2h = h2h
+            cache_set(cache_key, h2h, "h2h")
+            logger.info("_collect_h2h: %d vs %d → total=%d hw=%d aw=%d",
+                        home_id, away_id, h2h.total_games, h2h.home_wins, h2h.away_wins)
+        else:
+            logger.warning("_collect_h2h: %d vs %d returned None", home_id, away_id)
+    except Exception:
+        logger.exception("Data collector: h2h failed")
+
+
+async def _collect_news(ctx: MatchContext, sport_slug: str) -> None:
+    """Fetch news from RSS."""
+    cache_key = f"news:{ctx.home_team}:{ctx.away_team}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.news = cached
+        return
+
+    try:
+        from .news_rss import get_team_news
+        news_h = await get_team_news(ctx.home_team, sport_slug)
+        news_a = await get_team_news(ctx.away_team, sport_slug)
+        ctx.news = (news_h or []) + (news_a or [])
+        if ctx.news:
+            cache_set(cache_key, ctx.news, "news")
+    except Exception:
+        logger.exception("Data collector: news failed")
+
+
+async def _collect_live_stats(
+    ctx: MatchContext, match_id: str, sport_slug: str
+) -> None:
+    """Fetch live stats from api-sports."""
+    cache_key = f"live:{match_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        ctx.live_stats = cached
+        return
+
+    try:
+        from .stats_client import get_live_stats
+        stats = await get_live_stats(match_id, sport_slug)
+        if stats:
+            ctx.live_stats = stats
+            cache_set(cache_key, stats, "live_stats")
+    except Exception:
+        logger.exception("Data collector: live_stats failed")
