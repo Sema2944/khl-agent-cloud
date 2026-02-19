@@ -29,9 +29,13 @@ def _build_sport_map() -> Dict[str, List[str]]:
         return {k: v.get("odds_keys", []) for k, v in get_enabled_sports().items() if v.get("odds_keys")}
     except Exception:
         return {
-            "ice-hockey": ["icehockey_russia_khl", "icehockey_nhl"],
-            "football": ["soccer_epl", "soccer_russia_premier_league"],
+            "ice-hockey": ["icehockey_nhl", "icehockey_sweden_hockey_league", "icehockey_liiga"],
+            "football": ["soccer_epl", "soccer_russia_premier_league", "soccer_spain_la_liga",
+                         "soccer_germany_bundesliga", "soccer_italy_serie_a", "soccer_uefa_champs_league"],
             "basketball": ["basketball_nba", "basketball_euroleague"],
+            "tennis": ["tennis_atp_australian_open", "tennis_atp_french_open", "tennis_atp_us_open",
+                       "tennis_wta_australian_open", "tennis_wta_french_open", "tennis_wta_us_open"],
+            "mma": ["mma_mixed_martial_arts"],
         }
 
 SPORT_MAP: Dict[str, List[str]] = _build_sport_map()
