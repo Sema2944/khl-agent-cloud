@@ -40,10 +40,12 @@ _EST_COST_PER_1K: Dict[str, float] = {
 }
 
 # Timeouts / retries
-# Было 12/8/1 — часто не хватает на большие промпты с oddsBase.
-LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "45.0").strip())
-LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "25.0").strip())
+# DeepSeek генерирует ~10-15 сек, нужен запас на read.
+LLM_TOTAL_TIMEOUT_S = float((os.getenv("LLM_TOTAL_TIMEOUT_S") or "90.0").strip())
+LLM_ATTEMPT_TIMEOUT_S = float((os.getenv("LLM_ATTEMPT_TIMEOUT_S") or "40.0").strip())
 LLM_MAX_RETRIES = int((os.getenv("LLM_MAX_RETRIES") or "2").strip())
+# Минимальный read timeout — DeepSeek отвечает 10-15 сек, нельзя ниже 30
+LLM_MIN_READ_TIMEOUT_S = float((os.getenv("LLM_MIN_READ_TIMEOUT_S") or "30.0").strip())
 
 OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 
@@ -500,10 +502,12 @@ async def _llm_chat_json(
         "max_tokens": int(max_tokens),
     }
 
+    # read timeout — главный: DeepSeek генерирует 10-15 сек
+    # Гарантируем минимум LLM_MIN_READ_TIMEOUT_S (30 сек)
+    read_timeout = max(timeout_s, LLM_MIN_READ_TIMEOUT_S)
     timeout = httpx.Timeout(
-        timeout_s,
         connect=min(10.0, timeout_s),
-        read=timeout_s,
+        read=read_timeout,
         write=min(10.0, timeout_s),
         pool=min(10.0, timeout_s),
     )
@@ -842,7 +846,8 @@ async def analyze_with_llm_cached(
             try:
                 system_prompt = _SYSTEM_PROMPT_LEGACY if schema == "legacy" else _SYSTEM_PROMPT_UI
                 remaining = deadline - time.monotonic()
-                attempt_timeout = min(float(LLM_ATTEMPT_TIMEOUT_S), max(0.5, remaining))
+                # Гарантируем fallback минимум 35 сек (DeepSeek/OpenAI нужно 10-15 сек на генерацию)
+                attempt_timeout = max(35.0, min(float(LLM_ATTEMPT_TIMEOUT_S), remaining))
 
                 obj = await _llm_chat_json(
                     domain_prompt,
