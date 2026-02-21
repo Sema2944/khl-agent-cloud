@@ -420,10 +420,22 @@ async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
     """Resolve team IDs by name on api-sports.io, then fetch form + H2H."""
     try:
         from .stats_client import resolve_team_id
-        logger.info("_collect_form_by_name: resolving '%s' vs '%s' sport=%s",
-                     ctx.home_team, ctx.away_team, sport_slug)
-        home_id = await resolve_team_id(ctx.home_team, sport_slug)
-        away_id = await resolve_team_id(ctx.away_team, sport_slug)
+        from .sports_config import get_leagues
+
+        # Extract league_id from league name for better resolution
+        league_id = None
+        leagues = get_leagues(sport_slug, max_priority=3)
+        if ctx.league:
+            league_lower = ctx.league.lower()
+            for lid, linfo in leagues.items():
+                if linfo.get("name", "").lower() in league_lower or league_lower in linfo.get("name", "").lower():
+                    league_id = lid
+                    break
+
+        logger.info("_collect_form_by_name: resolving '%s' vs '%s' sport=%s league_id=%s",
+                     ctx.home_team, ctx.away_team, sport_slug, league_id)
+        home_id = await resolve_team_id(ctx.home_team, sport_slug, league_id=league_id)
+        away_id = await resolve_team_id(ctx.away_team, sport_slug, league_id=league_id)
         if home_id and away_id:
             logger.info("_collect_form_by_name: found IDs home=%d away=%d → fetching form+h2h",
                         home_id, away_id)

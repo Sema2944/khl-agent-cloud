@@ -669,12 +669,67 @@ class SportAPIClient:
                                             [ev], ev, tour_name, tournament,
                                         )
 
+                                # Strategy 4: groupings — events[].groupings[].competitions[]
+                                # ESPN tennis often nests matches under groupings (rounds/draws)
                                 if not matches_from:
+                                    groupings = ev.get("groupings") or []
+                                    for grp in groupings:
+                                        grp_comps = grp.get("competitions") or []
+                                        grp_obj = grp.get("grouping") or grp
+                                        grp_name = ""
+                                        if isinstance(grp_obj, dict):
+                                            grp_name = (
+                                                grp_obj.get("displayName")
+                                                or grp_obj.get("name")
+                                                or ""
+                                            )
+                                        ntournament = (
+                                            f"{tournament} - {grp_name}"
+                                            if grp_name else tournament
+                                        )
+                                        matches_from.extend(
+                                            self._parse_espn_tennis_comps(
+                                                grp_comps, ev, tour_name, ntournament,
+                                            )
+                                        )
+                                    if groupings and matches_from:
+                                        logger.info(
+                                            "ESPN %s: %d matches via groupings for '%s'",
+                                            tour_name, len(matches_from), tournament,
+                                        )
+
+                                # Strategy 5: leagues[].events[] (another ESPN nesting)
+                                if not matches_from:
+                                    leagues = ev.get("leagues") or []
+                                    for lg in leagues:
+                                        lg_events = lg.get("events") or []
+                                        for lev in lg_events:
+                                            lev_comps = lev.get("competitions") or []
+                                            lev_name = (
+                                                lev.get("name")
+                                                or lev.get("shortName")
+                                                or tournament
+                                            )
+                                            matches_from.extend(
+                                                self._parse_espn_tennis_comps(
+                                                    lev_comps, lev, tour_name, lev_name,
+                                                )
+                                            )
+
+                                if not matches_from:
+                                    # Log detailed structure for debugging
+                                    ev_keys = list(ev.keys())[:15]
+                                    comp0_keys = []
+                                    if comps:
+                                        comp0_keys = list(comps[0].keys())[:15] if isinstance(comps[0], dict) else []
                                     logger.debug(
                                         "ESPN %s: 0 matches from event '%s' "
-                                        "(comps=%d, ev_keys=%s)",
+                                        "(comps=%d, ev_keys=%s, comp0_keys=%s, "
+                                        "has_groupings=%s, has_leagues=%s)",
                                         tour_name, tournament, len(comps),
-                                        list(ev.keys())[:12],
+                                        ev_keys, comp0_keys,
+                                        bool(ev.get("groupings")),
+                                        bool(ev.get("leagues")),
                                     )
 
                                 result.extend(matches_from)
@@ -1339,12 +1394,73 @@ class SportAPIClient:
                         league_id, league_info.get("name", ""), len(items), results_count,
                     )
 
+                    # Season fallback: if 0 results and no errors, try season-1
+                    if not items and not errors:
+                        orig_season = params["season"]
+                        fallback_seasons = []
+                        try:
+                            s = int(orig_season)
+                            fallback_seasons = [s - 1]
+                        except (ValueError, TypeError):
+                            # Handle "2025-2026" → "2024-2025" format
+                            if isinstance(orig_season, str) and "-" in str(orig_season):
+                                parts = str(orig_season).split("-")
+                                try:
+                                    y1 = int(parts[0]) - 1
+                                    y2 = int(parts[1]) - 1
+                                    fallback_seasons = [f"{y1}-{y2}"]
+                                except (ValueError, IndexError):
+                                    pass
+
+                        for fb_season in fallback_seasons:
+                            logger.info(
+                                "api-sports.io: league=%d 0 results for season=%s, "
+                                "trying fallback season=%s",
+                                league_id, orig_season, fb_season,
+                            )
+                            params_fb = dict(params)
+                            params_fb["season"] = fb_season
+                            resp_fb = await client.get(url, headers=headers, params=params_fb)
+                            if resp_fb.status_code == 200:
+                                data_fb = resp_fb.json()
+                                errors_fb = data_fb.get("errors")
+                                if not errors_fb:
+                                    items_fb = data_fb.get("response") or []
+                                    if items_fb:
+                                        items = items_fb
+                                        logger.info(
+                                            "api-sports.io: league=%d season=%s fallback → %d matches",
+                                            league_id, fb_season, len(items),
+                                        )
+                                        break
+                                else:
+                                    logger.info(
+                                        "api-sports.io: league=%d season=%s fallback errors=%s",
+                                        league_id, fb_season, errors_fb,
+                                    )
+
+                    parsed_count = 0
                     for item in items:
                         try:
                             dto = self._parse_api_sports_match(item, sport_slug, league_info)
                             all_matches.append(dto)
+                            parsed_count += 1
                         except Exception:
+                            logger.debug(
+                                "api-sports.io: parse error for item keys=%s",
+                                list(item.keys())[:10] if isinstance(item, dict) else type(item).__name__,
+                            )
                             continue
+
+                    if items and parsed_count == 0:
+                        # Log first item for debugging
+                        first = items[0] if items else {}
+                        logger.warning(
+                            "api-sports.io: league=%d had %d items but 0 parsed. "
+                            "first_item_keys=%s",
+                            league_id, len(items),
+                            list(first.keys())[:15] if isinstance(first, dict) else str(first)[:200],
+                        )
                 except Exception:
                     logger.exception("api-sports.io: error fetching league=%d sport=%s", league_id, sport_slug)
                     continue

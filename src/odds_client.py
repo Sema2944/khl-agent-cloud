@@ -284,8 +284,13 @@ def parse_odds_base(odds_base: Dict[str, Any]) -> Optional[OddsData]:
                 elif cname.upper() in ("X", "DRAW", "Ничья"):
                     odds.draw = codd
 
-        # --- Total Over/Under ---
+        # --- Total Over/Under (full game only, skip quarters/halves) ---
         if any(k in mname for k in ("total", "over", "under", "тотал")):
+            _partial = ("q1", "q2", "q3", "q4", "h1", "h2",
+                        "quarter", "half", "period", "1st", "2nd",
+                        "3rd", "4th", "first", "second", "тайм", "четверть")
+            if any(p in mname for p in _partial):
+                continue
             for ch in choices:
                 if not isinstance(ch, dict):
                     continue
@@ -437,8 +442,14 @@ def _parse_api_sports_odds(response: Any) -> Optional[OddsData]:
                         elif vname in ("draw", "x"):
                             odds.draw = vodd
 
-                # Over/Under / Total
+                # Over/Under / Total — only FULL GAME, skip quarters/halves
                 if any(k in bet_name for k in ("over/under", "total", "goals")):
+                    # Skip partial game bets (quarter, half, period)
+                    _partial = ("q1", "q2", "q3", "q4", "h1", "h2",
+                                "quarter", "half", "period", "1st", "2nd",
+                                "3rd", "4th", "first", "second", "inning")
+                    if any(p in bet_name for p in _partial):
+                        continue
                     for v in values:
                         if not isinstance(v, dict):
                             continue
