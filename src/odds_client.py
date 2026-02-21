@@ -246,16 +246,24 @@ def _fuzzy_team(name_a: str, name_b: str) -> bool:
 # Fallback #1: Parse odds_base from primary API (api-sport.ru)
 # ---------------------------------------------------------------------------
 
-def parse_odds_base(odds_base: Dict[str, Any]) -> Optional[OddsData]:
+def parse_odds_base(odds_base: Any) -> Optional[OddsData]:
     """
-    Convert odds_base from primary API (api-sport.ru) into OddsData.
-    Format: {"markets": [{"name": "1X2", "choices": [{"name": "1", "odd": "1.85"}, ...]}]}
+    Convert odds_base from primary API into OddsData.
+    Supports multiple formats:
+    - dict: {"markets": [{"name": "1X2", "choices": [{"name": "1", "odd": "1.85"}, ...]}]}
+    - list: [{"name": "Full time", "group": "Home/Away", "values": [{"value": "Home", "odd": "1.85"}, ...]}]
     """
-    if not isinstance(odds_base, dict):
+    if isinstance(odds_base, list):
+        # List format: each item is a market directly
+        markets = odds_base
+    elif isinstance(odds_base, dict):
+        markets = odds_base.get("markets")
+        if not isinstance(markets, list) or not markets:
+            return None
+    else:
         return None
 
-    markets = odds_base.get("markets")
-    if not isinstance(markets, list) or not markets:
+    if not markets:
         return None
 
     odds = OddsData(bookmaker="api-sport.ru")
@@ -265,37 +273,44 @@ def parse_odds_base(odds_base: Dict[str, Any]) -> Optional[OddsData]:
             continue
 
         mname = (market.get("name") or "").lower()
-        choices = market.get("choices") or market.get("outcomes") or []
+        mgroup = (market.get("group") or "").lower()
+        choices = (market.get("choices") or market.get("outcomes")
+                   or market.get("values") or market.get("odds") or [])
+
+        # Combine name + group for matching (e.g. name="Full time", group="Home/Away")
+        match_key = f"{mname} {mgroup}"
 
         # --- 1X2 / Moneyline ---
-        if any(k in mname for k in ("1x2", "1 x 2", "moneyline", "match winner", "result")):
+        if any(k in match_key for k in ("1x2", "1 x 2", "moneyline", "match winner",
+                                         "result", "home/away", "full time")):
             for ch in choices:
                 if not isinstance(ch, dict):
                     continue
-                cname = str(ch.get("name") or "").strip()
-                codd = _safe_float(ch.get("odd") or ch.get("price") or ch.get("value"))
+                cname = str(ch.get("name") or ch.get("value") or "").strip()
+                codd = _safe_float(ch.get("odd") or ch.get("price"))
                 if codd <= 0:
                     continue
 
-                if cname in ("1", "W1", "Home", "П1"):
+                cname_upper = cname.upper()
+                if cname in ("1", "W1", "П1") or cname_upper == "HOME":
                     odds.home_win = codd
-                elif cname in ("2", "W2", "Away", "П2"):
+                elif cname in ("2", "W2", "П2") or cname_upper == "AWAY":
                     odds.away_win = codd
-                elif cname.upper() in ("X", "DRAW", "Ничья"):
+                elif cname_upper in ("X", "DRAW", "НИЧЬЯ"):
                     odds.draw = codd
 
         # --- Total Over/Under (full game only, skip quarters/halves) ---
-        if any(k in mname for k in ("total", "over", "under", "тотал")):
+        if any(k in match_key for k in ("total", "over", "under", "тотал", "goals over")):
             _partial = ("q1", "q2", "q3", "q4", "h1", "h2",
                         "quarter", "half", "period", "1st", "2nd",
                         "3rd", "4th", "first", "second", "тайм", "четверть")
-            if any(p in mname for p in _partial):
+            if any(p in match_key for p in _partial):
                 continue
             for ch in choices:
                 if not isinstance(ch, dict):
                     continue
-                cname = str(ch.get("name") or "").strip().lower()
-                codd = _safe_float(ch.get("odd") or ch.get("price") or ch.get("value"))
+                cname = str(ch.get("name") or ch.get("value") or "").strip().lower()
+                codd = _safe_float(ch.get("odd") or ch.get("price"))
                 if codd <= 0:
                     continue
 

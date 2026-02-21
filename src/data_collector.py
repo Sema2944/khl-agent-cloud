@@ -193,7 +193,7 @@ async def collect_match_data(
     sport_slug: str = "ice-hockey",
     home_team_id: Optional[int] = None,
     away_team_id: Optional[int] = None,
-    odds_base: Optional[Dict[str, Any]] = None,
+    odds_base: Optional[Any] = None,  # dict or list
 ) -> MatchContext:
     """
     Main function: collect data from all APIs and build MatchContext.
@@ -252,7 +252,7 @@ async def collect_match_data(
 async def _collect_odds(
     ctx: MatchContext,
     sport_slug: str,
-    odds_base: Optional[Dict[str, Any]] = None,
+    odds_base: Optional[Any] = None,  # dict or list
     league: str = "",
 ) -> None:
     """Fetch odds with fallback chain: The Odds API → odds_base → api-sports.io."""
@@ -283,12 +283,20 @@ async def _collect_odds(
             logger.debug("_collect_odds: TheOddsAPI failed for %s", ctx.match_id)
 
     # --- Attempt 2: Parse odds_base from primary API (api-sport.ru) ---
-    if odds_base and isinstance(odds_base, dict):
+    # odds_base can be dict ({"markets": [...]}) or list ([{"name":"Full time",...}])
+    if odds_base and isinstance(odds_base, (dict, list)):
         try:
             from .odds_client import parse_odds_base
+            # Normalize: if list, wrap into {"markets": list}
+            if isinstance(odds_base, list):
+                logger.info("_collect_odds [odds_base]: list format detected (%d items), wrapping",
+                            len(odds_base))
+                odds_base_normalized = {"markets": odds_base}
+            else:
+                odds_base_normalized = odds_base
             logger.info("_collect_odds [odds_base]: trying parse for %s, keys=%s",
-                        ctx.match_id, list(odds_base.keys())[:10])
-            odds = parse_odds_base(odds_base)
+                        ctx.match_id, list(odds_base_normalized.keys())[:10])
+            odds = parse_odds_base(odds_base_normalized)
             if odds and odds.home_win > 0:
                 ctx.odds = odds
                 cache_set(cache_key, odds, "odds")
@@ -441,7 +449,7 @@ async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
                         home_id, away_id)
             results = await asyncio.gather(
                 _collect_form(ctx, home_id, away_id, sport_slug),
-                _collect_h2h(ctx, home_id, away_id),
+                _collect_h2h(ctx, home_id, away_id, sport_slug),
                 return_exceptions=True,
             )
             for i, r in enumerate(results):
@@ -454,18 +462,18 @@ async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
         logger.exception("Data collector: form_by_name failed")
 
 
-async def _collect_h2h(ctx: MatchContext, home_id: int, away_id: int) -> None:
+async def _collect_h2h(ctx: MatchContext, home_id: int, away_id: int, sport_slug: str = "ice-hockey") -> None:
     """Fetch H2H from api-sports."""
-    cache_key = f"h2h:{home_id}:{away_id}"
+    cache_key = f"h2h:{home_id}:{away_id}:{sport_slug}"
     cached = cache_get(cache_key)
     if cached:
         ctx.h2h = cached
-        logger.info("_collect_h2h: CACHED %d vs %d", home_id, away_id)
+        logger.info("_collect_h2h: CACHED %d vs %d (%s)", home_id, away_id, sport_slug)
         return
 
     try:
         from .stats_client import get_h2h
-        h2h = await get_h2h(home_id, away_id)
+        h2h = await get_h2h(home_id, away_id, sport_slug=sport_slug)
         if h2h:
             ctx.h2h = h2h
             cache_set(cache_key, h2h, "h2h")

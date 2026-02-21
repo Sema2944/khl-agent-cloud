@@ -52,13 +52,13 @@ OPENAI_TEMPERATURE = float((os.getenv("OPENAI_TEMPERATURE") or "0.1").strip())
 # -----------------------------
 # Снижаем токены в LIVE, чтобы не упираться в TPM.
 # Можно тюнить через ENV без деплоя кода.
-LLM_MAX_TOKENS_LEGACY = int((os.getenv("LLM_MAX_TOKENS_LEGACY") or "260").strip())
-LLM_MAX_TOKENS_UI_PRE = int((os.getenv("LLM_MAX_TOKENS_UI_PRE") or "380").strip())
-LLM_MAX_TOKENS_UI_LIVE = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE") or "480").strip())
-LLM_MAX_TOKENS_UI_LIVE_PRO = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE_PRO") or "320").strip())
+LLM_MAX_TOKENS_LEGACY = int((os.getenv("LLM_MAX_TOKENS_LEGACY") or "900").strip())
+LLM_MAX_TOKENS_UI_PRE = int((os.getenv("LLM_MAX_TOKENS_UI_PRE") or "1200").strip())
+LLM_MAX_TOKENS_UI_LIVE = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE") or "1500").strip())
+LLM_MAX_TOKENS_UI_LIVE_PRO = int((os.getenv("LLM_MAX_TOKENS_UI_LIVE_PRO") or "1200").strip())
 
 # Hard safety cap (на случай неверных ENV)
-LLM_MAX_TOKENS_HARD_CAP = int((os.getenv("LLM_MAX_TOKENS_HARD_CAP") or "520").strip())
+LLM_MAX_TOKENS_HARD_CAP = int((os.getenv("LLM_MAX_TOKENS_HARD_CAP") or "3000").strip())
 
 
 # Safety throttles (Telegram-friendly) — лёгкая локальная защита
@@ -525,10 +525,89 @@ async def _llm_chat_json(
     logger.info("LLM gateway: provider=%s model=%s tokens=%d est_cost=$%.4f",
                 provider, model, total_tokens, est_cost)
 
-    obj = json.loads(content)
+    obj = _safe_json_loads(content)
     if not isinstance(obj, dict):
         raise ValueError("model JSON root is not an object")
     return obj
+
+
+def _safe_json_loads(text: str) -> Any:
+    """Parse JSON with repair for truncated/malformed responses from LLM."""
+    text = text.strip()
+    # Remove markdown code fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json) and last line (```)
+        if lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        else:
+            lines = lines[1:]
+        text = "\n".join(lines).strip()
+
+    # Try normal parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as original_err:
+        logger.warning("JSON parse failed, attempting repair: %s (first 200 chars: %s)",
+                       original_err, text[:200])
+
+    # Repair attempt 1: close unclosed strings and brackets
+    repaired = text
+    # Count unmatched quotes (ignore escaped ones)
+    in_string = False
+    for i, ch in enumerate(repaired):
+        if ch == '"' and (i == 0 or repaired[i - 1] != '\\'):
+            in_string = not in_string
+    if in_string:
+        repaired += '"'
+
+    # Close unclosed brackets/braces
+    stack = []
+    in_str = False
+    for i, ch in enumerate(repaired):
+        if ch == '"' and (i == 0 or repaired[i - 1] != '\\'):
+            in_str = not in_str
+        if in_str:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch == '}' and stack and stack[-1] == '{':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1] == '[':
+            stack.pop()
+
+    # Close in reverse order
+    for bracket in reversed(stack):
+        repaired += '}' if bracket == '{' else ']'
+
+    try:
+        obj = json.loads(repaired)
+        logger.info("JSON repair SUCCESS (closed %d brackets)", len(stack))
+        return obj
+    except json.JSONDecodeError:
+        pass
+
+    # Repair attempt 2: truncate to last complete key-value pair
+    # Find last complete "key": value pattern
+    last_brace = repaired.rfind('}')
+    if last_brace > 0:
+        candidate = repaired[:last_brace + 1]
+        # Try closing any remaining open brackets
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # Repair attempt 3: extract JSON object from content
+    import re
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"JSON repair failed, raw text (first 300 chars): {text[:300]}")
 
 
 # Backward compat alias
@@ -793,8 +872,12 @@ async def analyze_with_llm_cached(
                             "last_error": None,
                         }, {}
             except Exception as fb_err:
-                logger.warning("Fallback %s also failed: %s", fallback_provider, fb_err)
-                last_error = f"fallback_{fallback_provider}_failed:{type(fb_err).__name__}"
+                logger.error(
+                    "Fallback %s also failed: %s: %s",
+                    fallback_provider, type(fb_err).__name__, fb_err,
+                    exc_info=True,
+                )
+                last_error = f"fallback_{fallback_provider}_failed:{type(fb_err).__name__}:{fb_err}"
 
         return None, {"provider": active_provider, "attempts": attempts, "used_fallback": True, "last_error": last_error}, {}
 

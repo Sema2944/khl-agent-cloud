@@ -70,7 +70,7 @@ class MatchDTO:
     start_time: str
     score: str = ""
     country: str = ""
-    odds_base: Optional[Dict[str, Any]] = None
+    odds_base: Optional[Any] = None  # dict or list
 
     # NEW: чтобы видеть реально что пришло
     raw: Optional[Dict[str, Any]] = None
@@ -422,7 +422,7 @@ class SportAPIClient:
             start_time=str(start_time or "").strip(),
             score=str(score or "").strip(),
             country=str(country or "").strip() or "Other",
-            odds_base=odds_base if isinstance(odds_base, dict) else None,
+            odds_base=odds_base if isinstance(odds_base, (dict, list)) else None,
 
             # NEW:
             raw=raw,        # ← вот это главное

@@ -649,14 +649,14 @@ async def _format_matches_today_api(user_id: int, sport_slug: str) -> str:
     # Log odds_base availability in the loaded match list
     _ob_count = sum(
         1 for mm in _MATCH_CACHE_BY_USER[user_id].values()
-        if mm.get("odds_base") and isinstance(mm.get("odds_base"), dict)
+        if mm.get("odds_base") and isinstance(mm.get("odds_base"), (dict, list))
     )
     _ns_count = sum(
         1 for mm in _MATCH_CACHE_BY_USER[user_id].values()
         if str(mm.get("status", "")).lower() in ("notstarted", "ns", "not started", "scheduled", "")
     )
     logger.info(
-        "matches_by_date: %d total, %d have odds_base (dict), %d are NS/scheduled",
+        "matches_by_date: %d total, %d have odds_base (dict/list), %d are NS/scheduled",
         len(matches), _ob_count, _ns_count,
     )
     # Log first 3 matches with their oddsBase type for debugging
@@ -1025,17 +1025,18 @@ async def _enrich_match_meta(
 
         # Extract odds_base: try match_meta.odds_base first, then raw.oddsBase
         _odds_base = match_meta.get("odds_base")
-        if not _odds_base or not isinstance(_odds_base, dict):
+        if not _odds_base or not isinstance(_odds_base, (dict, list)):
             _odds_base = raw.get("oddsBase") or raw.get("odds_base") or raw.get("odds")
-        if _odds_base and isinstance(_odds_base, dict):
+        if _odds_base and isinstance(_odds_base, (dict, list)):
             import json as _json
             try:
                 _ob_str = _json.dumps(_odds_base, ensure_ascii=False, default=str)
-                logger.info("ODDS_BASE_RAW match=%s type=%s keys=%s JSON=%.800s",
+                logger.info("ODDS_BASE_RAW match=%s type=%s len_or_keys=%s JSON=%.800s",
                             _mid, type(_odds_base).__name__,
-                            list(_odds_base.keys())[:10], _ob_str)
+                            list(_odds_base.keys())[:10] if isinstance(_odds_base, dict) else len(_odds_base),
+                            _ob_str)
             except Exception:
-                logger.info("ODDS_BASE_RAW match=%s keys=%s", _mid, list(_odds_base.keys())[:10])
+                logger.info("ODDS_BASE_RAW match=%s type=%s", _mid, type(_odds_base).__name__)
         else:
             _raw_ob_val = raw.get("oddsBase")
             logger.info(
