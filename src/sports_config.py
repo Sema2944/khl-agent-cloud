@@ -160,10 +160,10 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            12:  {"name": "NBA", "flag": "🇺🇸", "country": "USA", "season": "2025-2026", "priority": 1},
-            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 1},
-            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 2},
-            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 2},
+            12:  {"name": "NBA", "flag": "🇺🇸", "country": "USA", "season": "2024-2025", "priority": 1},
+            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": "2024-2025", "priority": 1},
+            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": "2024-2025", "priority": 2},
+            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": "2024-2025", "priority": 2},
         },
         "odds_keys": [
             "basketball_nba",

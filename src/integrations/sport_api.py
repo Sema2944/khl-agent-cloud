@@ -926,6 +926,20 @@ class SportAPIClient:
         # ── Football: api-sports.io (paid $99 all-sports) ──
         if sport_slug == "football":
             try:
+                # Log config for debugging
+                try:
+                    from ..sports_config import get_sport_config, get_leagues
+                    _fcfg = get_sport_config("football")
+                    _fleagues = get_leagues("football", max_priority=3)
+                    _seasons = {lid: li.get("season") for lid, li in _fleagues.items()}
+                    logger.info(
+                        "Football config: api_base=%s match_param=%s seasons=%s",
+                        (_fcfg or {}).get("api_base", "?"),
+                        (_fcfg or {}).get("match_param", "?"),
+                        _seasons,
+                    )
+                except Exception:
+                    pass
                 matches = await self._fallback_api_sports(sport_slug, day)
                 logger.info("SportAPI football (api-sports.io): n=%d", len(matches))
                 return matches
