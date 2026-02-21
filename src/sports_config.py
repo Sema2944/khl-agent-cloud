@@ -36,31 +36,32 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",              # ?id=123 (api-sports.io v3 football)
         "leagues": {
+            # api-sports.io football: season = год начала (2025-26 сезон = season 2025)
             # Россия
-            235: {"name": "РПЛ", "flag": "🇷🇺", "country": "Россия", "season": 2024, "priority": 1},
-            237: {"name": "Кубок России", "flag": "🇷🇺", "country": "Россия", "season": 2024, "priority": 2},
+            235: {"name": "РПЛ", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
+            237: {"name": "Кубок России", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
             # Англия
-            39:  {"name": "Premier League", "flag": "🏴", "country": "Англия", "season": 2024, "priority": 1},
-            45:  {"name": "FA Cup", "flag": "🏴", "country": "Англия", "season": 2024, "priority": 2},
+            39:  {"name": "Premier League", "flag": "🏴", "country": "Англия", "season": 2025, "priority": 1},
+            45:  {"name": "FA Cup", "flag": "🏴", "country": "Англия", "season": 2025, "priority": 2},
             # Испания
-            140: {"name": "La Liga", "flag": "🇪🇸", "country": "Испания", "season": 2024, "priority": 1},
-            143: {"name": "Copa del Rey", "flag": "🇪🇸", "country": "Испания", "season": 2024, "priority": 2},
+            140: {"name": "La Liga", "flag": "🇪🇸", "country": "Испания", "season": 2025, "priority": 1},
+            143: {"name": "Copa del Rey", "flag": "🇪🇸", "country": "Испания", "season": 2025, "priority": 2},
             # Германия
-            78:  {"name": "Bundesliga", "flag": "🇩🇪", "country": "Германия", "season": 2024, "priority": 1},
+            78:  {"name": "Bundesliga", "flag": "🇩🇪", "country": "Германия", "season": 2025, "priority": 1},
             # Италия
-            135: {"name": "Serie A", "flag": "🇮🇹", "country": "Италия", "season": 2024, "priority": 1},
+            135: {"name": "Serie A", "flag": "🇮🇹", "country": "Италия", "season": 2025, "priority": 1},
             # Франция
-            61:  {"name": "Ligue 1", "flag": "🇫🇷", "country": "Франция", "season": 2024, "priority": 1},
+            61:  {"name": "Ligue 1", "flag": "🇫🇷", "country": "Франция", "season": 2025, "priority": 1},
             # Еврокубки
-            2:   {"name": "Лига Чемпионов", "flag": "🇪🇺", "country": "Европа", "season": 2024, "priority": 1},
-            3:   {"name": "Лига Европы", "flag": "🇪🇺", "country": "Европа", "season": 2024, "priority": 1},
-            848: {"name": "Лига Конференций", "flag": "🇪🇺", "country": "Европа", "season": 2024, "priority": 2},
+            2:   {"name": "Лига Чемпионов", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
+            3:   {"name": "Лига Европы", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
+            848: {"name": "Лига Конференций", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
             # Турция
-            203: {"name": "Super Lig", "flag": "🇹🇷", "country": "Турция", "season": 2024, "priority": 2},
+            203: {"name": "Super Lig", "flag": "🇹🇷", "country": "Турция", "season": 2025, "priority": 2},
             # Португалия
-            94:  {"name": "Primeira Liga", "flag": "🇵🇹", "country": "Португалия", "season": 2024, "priority": 2},
+            94:  {"name": "Primeira Liga", "flag": "🇵🇹", "country": "Португалия", "season": 2025, "priority": 2},
             # Нидерланды
-            88:  {"name": "Eredivisie", "flag": "🇳🇱", "country": "Нидерланды", "season": 2024, "priority": 2},
+            88:  {"name": "Eredivisie", "flag": "🇳🇱", "country": "Нидерланды", "season": 2025, "priority": 2},
         },
         # Odds API sport keys
         "odds_keys": [

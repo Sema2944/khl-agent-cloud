@@ -1349,11 +1349,16 @@ class SportAPIClient:
             for league_id, league_info in leagues.items():
                 try:
                     url = f"{api_base}{fixtures_ep}"
-                    cfg_season = league_info.get("season", 2024)
+                    cfg_season = league_info.get("season", 2025)
 
                     # Use cached season if we already know which one works
-                    cached_season = self._league_season_cache.get(league_id)
-                    season = cached_season if cached_season is not None else cfg_season
+                    # Football: always use config season (year of season start, e.g. 2025 for 2025-26)
+                    if sport_slug == "football":
+                        season = cfg_season
+                        cached_season = None
+                    else:
+                        cached_season = self._league_season_cache.get(league_id)
+                        season = cached_season if cached_season is not None else cfg_season
 
                     params = {
                         "league": league_id,
@@ -1388,8 +1393,9 @@ class SportAPIClient:
                     errors = data.get("errors")
 
                     # Season fallback: try season-1 if errors or 0 results
+                    # SKIP for football — season is always correct (year of season start)
                     # Only do fallback if we haven't already cached a season
-                    if (errors or not items) and cached_season is None:
+                    if (errors or not items) and cached_season is None and sport_slug != "football":
                         # Build fallback season
                         fb_season = None
                         try:
