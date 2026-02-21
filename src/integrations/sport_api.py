@@ -1288,6 +1288,9 @@ class SportAPIClient:
 
         raise SportAPIError(f"match_odds failed: {sport_slug}/{match_id}: {last_err}")
 
+    # Cache: league_id → working season (avoids double requests on fallback)
+    _league_season_cache: Dict[int, Any] = {}
+
     async def _fallback_api_sports(self, sport_slug: str, day: date) -> List[MatchDTO]:
         """
         Fetch matches from api-sports.io.
@@ -1332,15 +1335,22 @@ class SportAPIClient:
             for league_id, league_info in leagues.items():
                 try:
                     url = f"{api_base}{fixtures_ep}"
+                    cfg_season = league_info.get("season", 2024)
+
+                    # Use cached season if we already know which one works
+                    cached_season = self._league_season_cache.get(league_id)
+                    season = cached_season if cached_season is not None else cfg_season
+
                     params = {
                         "league": league_id,
-                        "season": league_info.get("season", 2025),
+                        "season": season,
                         "date": day_s,
                         "timezone": "Europe/Moscow",
                     }
                     logger.info(
-                        "api-sports.io: GET %s league=%s season=%s date=%s",
-                        url, league_id, params["season"], day_s,
+                        "api-sports.io: GET %s league=%s season=%s date=%s%s",
+                        url, league_id, season, day_s,
+                        " (cached)" if cached_season is not None else "",
                     )
                     resp = await client.get(url, headers=headers, params=params)
 
@@ -1361,62 +1371,29 @@ class SportAPIClient:
 
                     data = resp.json()
                     items = data.get("response") or []
-                    # Log errors array if present (api-sports.io sends errors here)
                     errors = data.get("errors")
-                    if errors:
-                        logger.warning(
-                            "api-sports.io: league=%d errors=%s",
-                            league_id, errors,
-                        )
-                        # Free plan fallback: retry with season 2024
-                        err_msg = str(errors)
-                        if "Free plans" in err_msg and "season" in err_msg:
-                            logger.info(
-                                "api-sports.io: retrying league=%d with season=2024 (free plan fallback)",
-                                league_id,
-                            )
-                            params2 = dict(params)
-                            params2["season"] = 2024
-                            resp2 = await client.get(url, headers=headers, params=params2)
-                            if resp2.status_code == 200:
-                                data2 = resp2.json()
-                                errors2 = data2.get("errors")
-                                if not errors2:
-                                    items = data2.get("response") or []
-                                    logger.info(
-                                        "api-sports.io: league=%d season=2024 fallback → %d matches",
-                                        league_id, len(items),
-                                    )
 
-                    results_count = data.get("results", 0)
-                    logger.info(
-                        "api-sports.io: league=%d (%s) → %d matches (results=%s)",
-                        league_id, league_info.get("name", ""), len(items), results_count,
-                    )
-
-                    # Season fallback: if 0 results and no errors, try season-1
-                    if not items and not errors:
-                        orig_season = params["season"]
-                        fallback_seasons = []
+                    # Season fallback: try season-1 if errors or 0 results
+                    # Only do fallback if we haven't already cached a season
+                    if (errors or not items) and cached_season is None:
+                        # Build fallback season
+                        fb_season = None
                         try:
-                            s = int(orig_season)
-                            fallback_seasons = [s - 1]
+                            fb_season = int(cfg_season) - 1
                         except (ValueError, TypeError):
-                            # Handle "2025-2026" → "2024-2025" format
-                            if isinstance(orig_season, str) and "-" in str(orig_season):
-                                parts = str(orig_season).split("-")
+                            if isinstance(cfg_season, str) and "-" in cfg_season:
+                                parts = cfg_season.split("-")
                                 try:
-                                    y1 = int(parts[0]) - 1
-                                    y2 = int(parts[1]) - 1
-                                    fallback_seasons = [f"{y1}-{y2}"]
+                                    fb_season = f"{int(parts[0]) - 1}-{int(parts[1]) - 1}"
                                 except (ValueError, IndexError):
                                     pass
 
-                        for fb_season in fallback_seasons:
+                        if fb_season is not None:
                             logger.info(
-                                "api-sports.io: league=%d 0 results for season=%s, "
-                                "trying fallback season=%s",
-                                league_id, orig_season, fb_season,
+                                "api-sports.io: league=%d season=%s → %s, trying season=%s",
+                                league_id, season,
+                                f"errors={errors}" if errors else "0 results",
+                                fb_season,
                             )
                             params_fb = dict(params)
                             params_fb["season"] = fb_season
@@ -1424,20 +1401,28 @@ class SportAPIClient:
                             if resp_fb.status_code == 200:
                                 data_fb = resp_fb.json()
                                 errors_fb = data_fb.get("errors")
-                                if not errors_fb:
-                                    items_fb = data_fb.get("response") or []
-                                    if items_fb:
-                                        items = items_fb
-                                        logger.info(
-                                            "api-sports.io: league=%d season=%s fallback → %d matches",
-                                            league_id, fb_season, len(items),
-                                        )
-                                        break
-                                else:
+                                items_fb = data_fb.get("response") or []
+                                if not errors_fb and items_fb:
+                                    items = items_fb
+                                    # Cache the working season
+                                    self._league_season_cache[league_id] = fb_season
                                     logger.info(
-                                        "api-sports.io: league=%d season=%s fallback errors=%s",
-                                        league_id, fb_season, errors_fb,
+                                        "api-sports.io: league=%d season=%s fallback → %d matches (cached)",
+                                        league_id, fb_season, len(items),
                                     )
+                                elif not errors_fb and not items_fb:
+                                    # Neither season has matches today — cache original to avoid retry
+                                    self._league_season_cache[league_id] = season
+                        elif errors:
+                            logger.warning("api-sports.io: league=%d errors=%s", league_id, errors)
+                    elif items and cached_season is None:
+                        # First success — cache the season
+                        self._league_season_cache[league_id] = season
+
+                    logger.info(
+                        "api-sports.io: league=%d (%s) → %d matches",
+                        league_id, league_info.get("name", ""), len(items),
+                    )
 
                     parsed_count = 0
                     for item in items:

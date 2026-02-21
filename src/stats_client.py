@@ -205,29 +205,46 @@ async def _load_league_teams(
         return _league_teams_cache[league_id]
 
     slug = resolve_sport_slug(sport_slug) or sport_slug
+
+    # Try configured season first, then season-1 as fallback
+    seasons_to_try = [season]
     try:
-        data = await _api_get(slug, "/teams", {"league": league_id, "season": season})
-        if not data:
-            logger.warning("_load_league_teams: empty response for league=%d season=%s sport=%s",
-                           league_id, season, slug)
-            return {}
+        s = int(season)
+        seasons_to_try.append(s - 1)
+    except (ValueError, TypeError):
+        pass
 
-        mapping: Dict[str, int] = {}
-        for item in data:
-            if not isinstance(item, dict):
+    for try_season in seasons_to_try:
+        try:
+            data = await _api_get(slug, "/teams", {"league": league_id, "season": try_season})
+            if not data:
+                if try_season == season:
+                    logger.info("_load_league_teams: league=%d season=%s → 0 teams, trying fallback",
+                                league_id, try_season)
                 continue
-            tid = item.get("id")
-            name = item.get("name", "")
-            if tid and name:
-                mapping[name.lower().strip()] = int(tid)
 
-        _league_teams_cache[league_id] = mapping
-        logger.info("_load_league_teams: league=%d → %d teams cached (%s)",
-                     league_id, len(mapping), slug)
-        return mapping
-    except Exception:
-        logger.exception("_load_league_teams failed for league=%d sport=%s", league_id, slug)
-        return {}
+            mapping: Dict[str, int] = {}
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                # api-sports.io wraps team data: {"team": {"id":..., "name":...}}
+                team_obj = item.get("team") or item
+                tid = team_obj.get("id")
+                name = team_obj.get("name", "")
+                if tid and name:
+                    mapping[name.lower().strip()] = int(tid)
+
+            if mapping:
+                _league_teams_cache[league_id] = mapping
+                logger.info("_load_league_teams: league=%d season=%s → %d teams cached (%s)",
+                             league_id, try_season, len(mapping), slug)
+                return mapping
+        except Exception:
+            logger.exception("_load_league_teams failed for league=%d season=%s sport=%s",
+                             league_id, try_season, slug)
+
+    logger.warning("_load_league_teams: league=%d → 0 teams after all seasons tried", league_id)
+    return {}
 
 
 def _find_in_league_cache(team_name: str, league_mapping: Dict[str, int]) -> Optional[int]:
