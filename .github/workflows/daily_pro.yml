@@ -1,0 +1,23 @@
+name: Daily Pro Job
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+
+jobs:
+  daily-pro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show repo commit
+        run: |
+          git rev-parse HEAD
+          echo "===== workflow file in repo ====="
+          sed -n '1,120p' .github/workflows/daily_pro.yml
+
+      - name: Call Daily Pro endpoint (direct)
+        run: |
+          echo 'RUNNING CURL WITH HARD URL'
+          curl -sS -X POST "https://khl-agent-api-9dw6.onrender.com/jobs/daily-pro?key=m7Qp9F3LxA2ZK8rD5WvC4HnS6TYeJUBG" --data ""
