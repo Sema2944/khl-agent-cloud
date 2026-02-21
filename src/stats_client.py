@@ -413,11 +413,13 @@ async def get_team_form(
     league_info = cfg.get("leagues", {}).get(league_id, {})
     season = league_info.get("season", 2025)
 
-    # Basketball/MMA: no /teams/statistics endpoint → use last N games
-    # Football/Hockey: use /teams/statistics
+    # Basketball/MMA/Football: use last N games to compute form
+    # (Basketball/MMA: no /teams/statistics endpoint;
+    #  Football: /fixtures/statistics needs fixture_id not team_id)
+    # Hockey: use /teams/statistics
     endpoints = cfg.get("endpoints", {})
 
-    if slug in ("basketball", "mma"):
+    if slug in ("basketball", "mma", "football"):
         # Fetch last 10 games and compute W/L
         fixtures_ep = endpoints.get("fixtures", "/games")
         try:
@@ -687,6 +689,7 @@ async def get_h2h(
     team2_id: int,
     last: int = 10,
     sport_slug: str = "ice-hockey",
+    league_id: Optional[int] = None,
 ) -> Optional[H2HData]:
     """Fetch head-to-head history for any sport."""
     slug = resolve_sport_slug(sport_slug) or sport_slug
@@ -694,10 +697,26 @@ async def get_h2h(
     h2h_endpoint = endpoints.get("h2h", "/games/h2h")
 
     try:
-        # Basketball: don't send 'last' param (not supported by basketball api)
+        # Basketball/MMA: don't send 'last' param (not supported), add season instead
         params: Dict[str, Any] = {"h2h": f"{team1_id}-{team2_id}"}
-        if slug not in ("basketball", "mma"):
+        if slug not in ("basketball", "mma", "football"):
             params["last"] = last
+        else:
+            # Add season for basketball/MMA/football to get results
+            cfg = get_sport_config(slug)
+            if cfg and league_id:
+                league_info = cfg.get("leagues", {}).get(league_id, {})
+                season = league_info.get("season")
+                if season:
+                    params["season"] = season
+            elif cfg:
+                # Use first priority-1 league season
+                leagues = get_leagues(slug, max_priority=1)
+                if leagues:
+                    first_league = next(iter(leagues.values()))
+                    season = first_league.get("season")
+                    if season:
+                        params["season"] = season
 
         logger.info("get_h2h: GET %s params=%s (%s)", h2h_endpoint, params, slug)
         data = await _api_get(slug, h2h_endpoint, params)

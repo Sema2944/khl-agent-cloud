@@ -93,15 +93,18 @@ def _compact_match_btn_title(title: str, score: str, status: str) -> str:
     sc = (score or "").strip()
     st = (status or "").strip().lower()
 
-    is_live = st in {"live", "inprogress", "in_progress"}
-    is_done = st in {"finished", "ended"}
-    is_ns = st in {"notstarted", "not_started", "scheduled"}
+    is_live = st in {"live", "inprogress", "in_progress", "ht"}
+    is_done = any(x in st for x in ("finished", "ended", "ft", "final", "ret", "w/o"))
+    is_ns = st in {"notstarted", "not_started", "scheduled", "ns", ""}
+    is_postponed = st in {"postponed", "pst", "canc", "canceled", "cancelled"}
 
     prefix = ""
     if is_live:
-        prefix = "🟢 "
+        prefix = "🔴 "
     elif is_done:
         prefix = "✅ "
+    elif is_postponed:
+        prefix = "⏸ "
     elif is_ns:
         prefix = "⏳ "
 

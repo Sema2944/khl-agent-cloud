@@ -194,6 +194,7 @@ async def collect_match_data(
     home_team_id: Optional[int] = None,
     away_team_id: Optional[int] = None,
     odds_base: Optional[Any] = None,  # dict or list
+    league_id: Optional[int] = None,
 ) -> MatchContext:
     """
     Main function: collect data from all APIs and build MatchContext.
@@ -216,7 +217,7 @@ async def collect_match_data(
     tasks = []
 
     # 1. Odds (The Odds API → odds_base fallback → api-sports.io fallback)
-    tasks.append(_collect_odds(ctx, sport_slug, odds_base=odds_base, league=league))
+    tasks.append(_collect_odds(ctx, sport_slug, odds_base=odds_base, league=league, league_id=league_id))
 
     # 2. Form + H2H
     # Hockey: use api-sport.ru with original team IDs (api-sports.io doesn't cover KHL)
@@ -224,7 +225,7 @@ async def collect_match_data(
     if sport_slug in ("ice-hockey", "hockey") and home_team_id and away_team_id:
         tasks.append(_collect_form_primary(ctx, home_team_id, away_team_id, sport_slug))
     elif home_team and away_team:
-        tasks.append(_collect_form_by_name(ctx, sport_slug))
+        tasks.append(_collect_form_by_name(ctx, sport_slug, league_id=league_id))
 
     # 3. News (RSS)
     tasks.append(_collect_news(ctx, sport_slug))
@@ -254,6 +255,7 @@ async def _collect_odds(
     sport_slug: str,
     odds_base: Optional[Any] = None,  # dict or list
     league: str = "",
+    league_id: Optional[int] = None,
 ) -> None:
     """Fetch odds with fallback chain: The Odds API → odds_base → api-sports.io."""
     cache_key = f"odds:{ctx.match_id}"
@@ -271,7 +273,8 @@ async def _collect_odds(
         try:
             from .odds_client import get_match_odds
             odds = await get_match_odds(
-                ctx.home_team, ctx.away_team, sport_slug
+                ctx.home_team, ctx.away_team, sport_slug,
+                league_id=league_id,
             )
             if odds and odds.home_win > 0:
                 ctx.odds = odds
@@ -331,7 +334,8 @@ async def _collect_odds(
 
 
 async def _collect_form(
-    ctx: MatchContext, home_id: int, away_id: int, sport_slug: str
+    ctx: MatchContext, home_id: int, away_id: int, sport_slug: str,
+    league_id: Optional[int] = None,
 ) -> None:
     """Fetch team form from api-sports."""
     cache_key_h = f"form:{home_id}"
@@ -349,7 +353,7 @@ async def _collect_form(
     try:
         from .stats_client import get_team_form
         if not cached_h:
-            hf = await get_team_form(home_id, sport_slug)
+            hf = await get_team_form(home_id, sport_slug, league_id=league_id)
             if hf:
                 ctx.home_form = hf
                 cache_set(cache_key_h, hf, "form")
@@ -360,7 +364,7 @@ async def _collect_form(
             ctx.home_form = cached_h
 
         if not cached_a:
-            af = await get_team_form(away_id, sport_slug)
+            af = await get_team_form(away_id, sport_slug, league_id=league_id)
             if af:
                 ctx.away_form = af
                 cache_set(cache_key_a, af, "form")
@@ -424,31 +428,33 @@ async def _collect_form_primary(
         logger.exception("Data collector: form_primary failed for home=%d away=%d", home_id, away_id)
 
 
-async def _collect_form_by_name(ctx: MatchContext, sport_slug: str) -> None:
+async def _collect_form_by_name(
+    ctx: MatchContext, sport_slug: str, league_id: Optional[int] = None,
+) -> None:
     """Resolve team IDs by name on api-sports.io, then fetch form + H2H."""
     try:
         from .stats_client import resolve_team_id
         from .sports_config import get_leagues
 
-        # Extract league_id from league name for better resolution
-        league_id = None
-        leagues = get_leagues(sport_slug, max_priority=3)
-        if ctx.league:
-            league_lower = ctx.league.lower()
-            for lid, linfo in leagues.items():
-                if linfo.get("name", "").lower() in league_lower or league_lower in linfo.get("name", "").lower():
-                    league_id = lid
-                    break
+        # Use provided league_id (from raw match data), or guess from league name
+        if league_id is None:
+            leagues = get_leagues(sport_slug, max_priority=3)
+            if ctx.league:
+                league_lower = ctx.league.lower()
+                for lid, linfo in leagues.items():
+                    if linfo.get("name", "").lower() in league_lower or league_lower in linfo.get("name", "").lower():
+                        league_id = lid
+                        break
 
         logger.info("_collect_form_by_name: resolving '%s' vs '%s' sport=%s league_id=%s",
                      ctx.home_team, ctx.away_team, sport_slug, league_id)
         home_id = await resolve_team_id(ctx.home_team, sport_slug, league_id=league_id)
         away_id = await resolve_team_id(ctx.away_team, sport_slug, league_id=league_id)
         if home_id and away_id:
-            logger.info("_collect_form_by_name: found IDs home=%d away=%d → fetching form+h2h",
-                        home_id, away_id)
+            logger.info("_collect_form_by_name: found IDs home=%d away=%d league_id=%s → fetching form+h2h",
+                        home_id, away_id, league_id)
             results = await asyncio.gather(
-                _collect_form(ctx, home_id, away_id, sport_slug),
+                _collect_form(ctx, home_id, away_id, sport_slug, league_id=league_id),
                 _collect_h2h(ctx, home_id, away_id, sport_slug),
                 return_exceptions=True,
             )

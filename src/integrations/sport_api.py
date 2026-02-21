@@ -740,7 +740,11 @@ class SportAPIClient:
                         logger.exception("ESPN %s: request failed", tour_name)
                         continue
 
-            logger.info("ESPN Tennis: total %d matches (ATP+WTA)", len(result))
+            # Filter: only show NS (scheduled) and LIVE matches, not finished
+            total_before = len(result)
+            result = [m for m in result if m.status in ("NS", "LIVE", "HT", "")]
+            logger.info("ESPN Tennis: total %d matches (ATP+WTA), %d after filtering (NS/LIVE only)",
+                        total_before, len(result))
             return result
 
         except Exception:
@@ -807,6 +811,38 @@ class SportAPIClient:
 
                             start_time = comp.get("date") or ev.get("date") or ""
 
+                            # Card type from competition
+                            card_type = ""
+                            comp_type = comp.get("type") or {}
+                            if isinstance(comp_type, dict):
+                                card_type = comp_type.get("text") or comp_type.get("abbreviation") or ""
+                            # Also try notes for weight class
+                            notes = comp.get("notes") or []
+                            weight_class = ""
+                            if isinstance(notes, list) and notes:
+                                for note in notes:
+                                    if isinstance(note, dict):
+                                        weight_class = note.get("text") or note.get("headline") or ""
+                                        if weight_class:
+                                            break
+                                    elif isinstance(note, str):
+                                        weight_class = note
+                                        break
+
+                            # Build title with card type prefix
+                            card_prefix = ""
+                            if card_type:
+                                ct = card_type.lower()
+                                if "main" in ct:
+                                    card_prefix = "Main"
+                                elif "prelim" in ct and "early" in ct:
+                                    card_prefix = "Early"
+                                elif "prelim" in ct:
+                                    card_prefix = "Prelim"
+                            fight_title = f"{names[0]} vs {names[1]}"
+                            if card_prefix:
+                                fight_title = f"{card_prefix} | {fight_title}"
+
                             # Winner info
                             score = ""
                             for c in competitors:
@@ -818,7 +854,7 @@ class SportAPIClient:
                             result.append(MatchDTO(
                                 id=mid,
                                 sport_slug="mma",
-                                title=f"{names[0]} vs {names[1]}",
+                                title=fight_title,
                                 league=card_name,
                                 status=status,
                                 start_time=start_time,
@@ -829,7 +865,21 @@ class SportAPIClient:
                     except Exception:
                         continue
 
-                logger.info("ESPN MMA: parsed %d fights", len(result))
+                # Sort: LIVE first, then NS (upcoming), then FT (finished)
+                def _mma_sort_key(m: MatchDTO) -> int:
+                    s = (m.status or "").upper()
+                    if s == "LIVE":
+                        return 0
+                    if s in ("NS", ""):
+                        return 1
+                    return 2  # FT, PST, etc.
+                result.sort(key=_mma_sort_key)
+
+                # Filter out finished fights from the list (keep only NS/LIVE)
+                total_before = len(result)
+                result = [m for m in result if m.status in ("NS", "LIVE", "")]
+                logger.info("ESPN MMA: parsed %d fights, %d after filter (NS/LIVE)",
+                            total_before, len(result))
                 return result
 
         except Exception:
@@ -1164,6 +1214,125 @@ class SportAPIClient:
                 continue
         return None
 
+    async def _fetch_mma_espn_details(self, match_id: str) -> Optional[MatchDTO]:
+        """Fetch single MMA fight details from ESPN.
+
+        MMA fights come from ESPN scoreboard with ESPN IDs.
+        Try summary API first, then fall back to scoreboard search.
+        """
+        # Strategy 1: ESPN event summary
+        for league in ("ufc",):
+            try:
+                url = f"https://site.api.espn.com/apis/site/v2/sports/mma/{league}/event"
+                params = {"event": match_id}
+
+                async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                    resp = await client.get(url, params=params)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        # Try to parse competitions from the event
+                        competitions = data.get("competitions") or []
+                        if not competitions:
+                            # Try nested structure
+                            event_obj = data.get("event") or data
+                            competitions = event_obj.get("competitions") or []
+                        if not competitions:
+                            header = data.get("header") or {}
+                            competitions = header.get("competitions") or []
+
+                        for comp in competitions:
+                            if str(comp.get("id")) == str(match_id):
+                                return self._parse_mma_espn_competition(comp, data)
+
+                        # If event has only one competition, use it
+                        if len(competitions) == 1:
+                            return self._parse_mma_espn_competition(competitions[0], data)
+
+            except Exception:
+                logger.debug("ESPN MMA event API failed for %s", match_id)
+
+        # Strategy 2: Search in today's scoreboard
+        try:
+            from datetime import date as _date
+            today = _date.today()
+            matches = await self._fetch_mma_espn(today)
+            for m in matches:
+                if str(m.id) == str(match_id):
+                    logger.info("ESPN MMA match_details: found %s in scoreboard", match_id)
+                    return m
+        except Exception:
+            logger.debug("ESPN MMA scoreboard search failed for %s", match_id)
+
+        return None
+
+    def _parse_mma_espn_competition(self, comp: dict, full_data: dict) -> Optional[MatchDTO]:
+        """Parse a single MMA competition from ESPN data into MatchDTO."""
+        try:
+            mid = str(comp.get("id") or "unknown")
+            competitors = comp.get("competitors") or []
+            if len(competitors) < 2:
+                return None
+
+            names = []
+            records = []
+            for c in competitors:
+                athlete = c.get("athlete") or {}
+                name = (
+                    athlete.get("shortName")
+                    or athlete.get("displayName")
+                    or athlete.get("name")
+                    or "TBD"
+                )
+                names.append(name)
+                record = athlete.get("record") or ""
+                records.append(record)
+
+            status_obj = comp.get("status") or {}
+            status_type = status_obj.get("type") or {}
+            status_name = status_type.get("name") or ""
+            status_map = {
+                "STATUS_SCHEDULED": "NS",
+                "STATUS_IN_PROGRESS": "LIVE",
+                "STATUS_FINAL": "FT",
+                "STATUS_POSTPONED": "PST",
+                "STATUS_CANCELED": "CANC",
+            }
+            status = status_map.get(status_name, status_name)
+
+            start_time = comp.get("date") or ""
+
+            # Card name from event
+            card_name = ""
+            if isinstance(full_data, dict):
+                card_name = full_data.get("name") or full_data.get("shortName") or ""
+                if not card_name:
+                    header = full_data.get("header") or {}
+                    card_name = header.get("name") or ""
+
+            score = ""
+            for c in competitors:
+                if c.get("winner"):
+                    athlete = c.get("athlete") or {}
+                    score = "W: " + (athlete.get("shortName") or "")
+                    break
+
+            league = card_name or "UFC"
+
+            return MatchDTO(
+                id=mid,
+                sport_slug="mma",
+                title=f"{names[0]} vs {names[1]}",
+                league=league,
+                status=status,
+                start_time=start_time,
+                score=score,
+                country="USA",
+                raw=full_data,
+            )
+        except Exception:
+            logger.exception("_parse_mma_espn_competition failed")
+            return None
+
     async def match_details(self, sport_slug: str, match_id: str) -> MatchDTO:
         sport_slug = (sport_slug or "").strip().lower()
         match_id = str(match_id or "").strip()
@@ -1182,6 +1351,26 @@ class SportAPIClient:
                 last_err = e
                 logger.warning("ESPN Tennis match_details failed for %s: %s", match_id, e)
             raise SportAPIError(f"match_details failed: tennis/{match_id}: {last_err}")
+
+        # ── MMA: use ESPN (ESPN IDs don't exist in api-sports.io) ──
+        if sport_slug == "mma":
+            try:
+                dto = await self._fetch_mma_espn_details(match_id)
+                if dto:
+                    return dto
+            except Exception as e:
+                last_err = e
+                logger.warning("ESPN MMA match_details failed for %s: %s", match_id, e)
+
+            # Fallback: try api-sports.io in case it's an api-sports ID
+            try:
+                dto = await self._fallback_match_details(sport_slug, match_id)
+                if dto:
+                    return dto
+            except Exception as e:
+                last_err = e
+
+            raise SportAPIError(f"match_details failed: mma/{match_id}: {last_err}")
 
         # ── For non-hockey sports: use api-sports.io directly ──
         if not self._is_primary_api_sport(sport_slug):

@@ -1021,6 +1021,22 @@ async def _enrich_match_meta(
                 if isinstance(fa, dict) and not away_team_id:
                     away_team_id = fa.get("id")
 
+        # Extract league_id from raw data (api-sports.io includes league.id)
+        league_id = None
+        league_obj = raw.get("league") or {}
+        if isinstance(league_obj, dict):
+            league_id = league_obj.get("id")
+        if not league_id:
+            # Football: fixture.league.id
+            fixture_league = (raw.get("fixture") or {}).get("league") or {}
+            if isinstance(fixture_league, dict):
+                league_id = fixture_league.get("id")
+        if league_id is not None:
+            try:
+                league_id = int(league_id)
+            except (ValueError, TypeError):
+                league_id = None
+
         _mid = str(match_meta.get("id") or match_meta.get("match_id") or "")
 
         # Extract odds_base: try match_meta.odds_base first, then raw.oddsBase
@@ -1062,6 +1078,7 @@ async def _enrich_match_meta(
             home_team_id=home_team_id,
             away_team_id=away_team_id,
             odds_base=_odds_base,
+            league_id=league_id,
         )
 
         enriched_text = build_enriched_context_text(ctx)
@@ -1552,7 +1569,7 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
         parts = norm.split()
         if parts:
             last = parts[-1].strip()
-            if last in {"ice-hockey", "hockey", "football", "basketball", "tennis", "table-tennis", "esports"}:
+            if last in {"ice-hockey", "hockey", "football", "basketball", "tennis", "table-tennis", "esports", "mma", "volleyball", "handball", "baseball"}:
                 sport_slug = "ice-hockey" if last == "hockey" else last
         try:
             _ACTIVE_SPORT_BY_USER[user_id] = sport_slug

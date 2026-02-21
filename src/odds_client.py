@@ -96,23 +96,54 @@ async def get_odds_for_sport(sport_key: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+# Mapping: api-sports.io league_id → The Odds API sport key
+# This allows us to query ONLY the relevant league, saving API quota
+_LEAGUE_TO_ODDS_KEY: Dict[int, str] = {
+    # Football
+    235: "soccer_russia_premier_league",
+    39:  "soccer_epl",
+    140: "soccer_spain_la_liga",
+    78:  "soccer_germany_bundesliga",
+    135: "soccer_italy_serie_a",
+    61:  "soccer_france_ligue_one",
+    2:   "soccer_uefa_champs_league",
+    3:   "soccer_uefa_europa_league",
+    # Hockey
+    57:  "icehockey_nhl",
+    56:  "icehockey_sweden_hockey_league",
+    51:  "icehockey_liiga",
+    # Basketball
+    12:  "basketball_nba",
+    120: "basketball_euroleague",
+    # MMA
+    1:   "mma_mixed_martial_arts",
+}
+
+
 async def get_match_odds(
     home_team: str,
     away_team: str,
     sport_slug: str = "ice-hockey",
+    league_id: Optional[int] = None,
 ) -> Optional[OddsData]:
     """
     Find odds for a specific match by team names.
-    Tries all sport keys mapped to the slug.
+    If league_id is provided, only queries that specific league's odds key.
+    Otherwise tries all sport keys mapped to the slug.
     Returns OddsData or None.
     """
     if not API_KEY:
         return None
 
-    sport_keys = SPORT_MAP.get(sport_slug, [])
-    if not sport_keys:
-        # Try the slug directly as API key
-        sport_keys = [sport_slug]
+    # Optimization: if league_id is known, only query that specific key
+    if league_id and league_id in _LEAGUE_TO_ODDS_KEY:
+        sport_keys = [_LEAGUE_TO_ODDS_KEY[league_id]]
+        logger.info("get_match_odds: using league-specific key: league=%d → %s",
+                     league_id, sport_keys[0])
+    else:
+        sport_keys = SPORT_MAP.get(sport_slug, [])
+        if not sport_keys:
+            sport_keys = [sport_slug]
 
     home_lower = home_team.lower().strip()
     away_lower = away_team.lower().strip()
