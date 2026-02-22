@@ -11,6 +11,9 @@ from .db import SessionLocal
 
 logger = logging.getLogger(__name__)
 
+# Owner / admin IDs — всегда имеют PRO-доступ без проверки БД
+OWNER_IDS: set = {5027679117}  # Sema2944
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -33,11 +36,15 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
 def is_pro(user_id: int) -> bool:
     """
     True если:
+      - user_id в OWNER_IDS (всегда PRO)
       - users.is_premium = true
       - и (premium_until is null или premium_until > now_utc)
     """
     if not user_id:
         return False
+
+    if user_id in OWNER_IDS:
+        return True
 
     session = SessionLocal()
     try:
