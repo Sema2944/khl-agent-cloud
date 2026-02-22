@@ -79,7 +79,8 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("⚽ Футбол"), KeyboardButton("🏀 Баскетбол")],
         [KeyboardButton("🏒 Хоккей"), KeyboardButton("🎾 Теннис")],
-        [KeyboardButton("🥊 MMA"), KeyboardButton("🌟 PRO")],
+        [KeyboardButton("🥊 MMA"), KeyboardButton("🔴 LIVE")],
+        [KeyboardButton("🌟 PRO")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -93,6 +94,78 @@ _REPLY_SPORT_MAP = {
     "🎾 Теннис": "tennis",
     "🥊 MMA": "mma",
 }
+
+# ---------------------------------------------------------------------------
+# Global LIVE matches cache (shared across all users, 45s TTL)
+# ---------------------------------------------------------------------------
+_ALL_LIVE_CACHE: Optional[tuple] = None  # (timestamp, live_dict, upcoming_list)
+_ALL_LIVE_TTL = 45
+
+_LIVE_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "mma"]
+
+_LIVE_STATUS_KEYWORDS = {"live", "1h", "2h", "ht", "3h", "ot", "so", "in progress",
+                          "inprogress", "in_progress", "playing", "p1", "p2", "p3",
+                          "q1", "q2", "q3", "q4", "et", "bt", "s1", "s2", "s3",
+                          "r1", "r2", "r3", "r4", "r5"}
+
+
+def _is_live_status(status: str) -> bool:
+    s = (status or "").strip().lower()
+    return s in _LIVE_STATUS_KEYWORDS or "live" in s or "inprogress" in s.replace("_", "")
+
+
+async def _fetch_all_live_matches() -> tuple:
+    """Fetch all LIVE matches across all sports. Returns (by_sport, upcoming).
+    Uses 45s global cache to avoid hammering API.
+    """
+    import time as _time
+    global _ALL_LIVE_CACHE
+
+    now = _time.time()
+    if _ALL_LIVE_CACHE:
+        ts, cached_live, cached_upcoming = _ALL_LIVE_CACHE
+        if now - ts < _ALL_LIVE_TTL:
+            return cached_live, cached_upcoming
+
+    from ..integrations.sport_api import SportAPIClient
+
+    today = datetime.now(MSK).date()
+    api = SportAPIClient()
+
+    # Parallel fetch for all sports
+    tasks = [api.matches_by_date(sport, today) for sport in _LIVE_SPORTS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    by_sport: Dict[str, list] = {}
+    all_upcoming: list = []
+
+    for sport, result in zip(_LIVE_SPORTS, results):
+        if isinstance(result, Exception):
+            logger.warning("LIVE fetch failed for %s: %s", sport, result)
+            continue
+        if not result:
+            continue
+
+        live = []
+        for m in result:
+            status = str(getattr(m, "status", "") or "").strip()
+            if _is_live_status(status):
+                live.append(m)
+            else:
+                # Collect not-started for "upcoming" fallback
+                s_lower = status.lower()
+                if s_lower in {"notstarted", "ns", "not started", "scheduled", ""}:
+                    all_upcoming.append(m)
+
+        if live:
+            by_sport[sport] = live
+
+    # Sort upcoming by start_time, take first 5
+    all_upcoming.sort(key=lambda m: str(getattr(m, "start_time", "") or ""))
+    upcoming_5 = all_upcoming[:5]
+
+    _ALL_LIVE_CACHE = (now, by_sport, upcoming_5)
+    return by_sport, upcoming_5
 
 
 def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
@@ -880,6 +953,125 @@ async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(txt, reply_markup=kb)
 
 
+# ---------------------------------------------------------------------------
+# 🔴 LIVE — all in-progress matches across all sports (PRO only)
+# ---------------------------------------------------------------------------
+_LIVE_SPORT_EMOJI = {
+    "ice-hockey": "🏒",
+    "football": "⚽",
+    "basketball": "🏀",
+    "tennis": "🎾",
+    "mma": "🥊",
+}
+
+_LIVE_SPORT_TITLE = {
+    "ice-hockey": "Хоккей",
+    "football": "Футбол",
+    "basketball": "Баскетбол",
+    "tennis": "Теннис",
+    "mma": "MMA",
+}
+
+
+async def _handle_live_button(update: Update, user_id: int) -> None:
+    """Show all LIVE matches across all sports. PRO-only feature."""
+
+    # --- PRO paywall ---
+    user_is_pro = False
+    try:
+        user_is_pro = is_pro(user_id)
+    except Exception:
+        pass
+    in_trial = _is_in_hunter_trial(user_id)
+
+    if not user_is_pro and not in_trial:
+        await update.message.reply_text(
+            "🔴 LIVE — только для PRO-подписчиков\n\n"
+            "Смотри идущие матчи в реальном времени\n"
+            "с AI-аналитикой, статистикой и коэффициентами.\n\n"
+            "🌟 Оформи PRO — от 299₽/неделю",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
+                [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:trial")],
+            ]),
+        )
+        return
+
+    # --- Fetch live matches ---
+    try:
+        by_sport, upcoming = await _fetch_all_live_matches()
+    except Exception:
+        logger.exception("_fetch_all_live_matches failed")
+        await update.message.reply_text(
+            "⚠️ Не удалось загрузить LIVE-матчи. Попробуй позже.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return
+
+    # --- No live matches → show upcoming ---
+    if not by_sport:
+        lines = ["🔴 LIVE матчи\n\nСейчас нет идущих матчей.\n"]
+        if upcoming:
+            lines.append("⏰ Ближайшие матчи:")
+            for m in upcoming:
+                emoji = _LIVE_SPORT_EMOJI.get(m.sport_slug, "🏆")
+                start = (m.start_time or "")[:5]  # HH:MM
+                title = (m.title or "Матч")[:40]
+                league = (m.league or "")[:20]
+                lines.append(f"  {emoji} {start} {title} ({league})")
+        lines.append("\n🔔 Подпишись на PRO — получай уведомления о начале матчей!")
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Обновить", callback_data="LIVE:REFRESH")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+            ]),
+        )
+        return
+
+    # --- Build LIVE matches message ---
+    text = "🔴 LIVE матчи сейчас\n━━━━━━━━━━━━━━━━━━\n"
+    buttons: List[List[InlineKeyboardButton]] = []
+
+    for sport in _LIVE_SPORTS:
+        matches = by_sport.get(sport)
+        if not matches:
+            continue
+        emoji = _LIVE_SPORT_EMOJI.get(sport, "🏆")
+        sport_title = _LIVE_SPORT_TITLE.get(sport, sport)
+        text += f"\n{emoji} {sport_title}:\n"
+
+        for m in matches[:5]:
+            title = (m.title or "Матч")[:35]
+            score = (m.score or "?:?")
+            league = (m.league or "")[:15]
+            status = (m.status or "").strip()
+
+            text += f"  🔴 {title} {score}"
+            if league:
+                text += f" ({league})"
+            text += "\n"
+
+            # Inline button
+            btn_label = f"🔴 {title} {score}"
+            if len(btn_label) > 55:
+                btn_label = btn_label[:54] + "…"
+            buttons.append([InlineKeyboardButton(
+                btn_label,
+                callback_data=f"MATCH:{sport}:{m.id}",
+            )])
+
+    text += "\nНажми на матч для анализа 👇"
+
+    buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="LIVE:REFRESH")])
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+
+    await update.message.reply_text(
+        _truncate_tg(text),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -889,6 +1081,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text_raw.lower().strip()
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
+
+    # --- Reply keyboard: 🔴 LIVE button ---
+    if text_raw.strip() == "🔴 LIVE":
+        await _handle_live_button(update, user_id)
+        return
 
     # --- Reply keyboard: sport buttons ---
     sport_slug = _REPLY_SPORT_MAP.get(text_raw.strip())
@@ -1325,6 +1522,105 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.edit_message_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # LIVE:REFRESH — re-fetch and update LIVE matches inline
+    if data == "LIVE:REFRESH":
+        user_is_pro = False
+        try:
+            user_is_pro = is_pro(user_id)
+        except Exception:
+            pass
+        in_trial = _is_in_hunter_trial(user_id)
+
+        if not user_is_pro and not in_trial:
+            try:
+                await q.edit_message_text(
+                    "🔴 LIVE — только для PRO-подписчиков\n\n"
+                    "Смотри идущие матчи в реальном времени\n"
+                    "с AI-аналитикой, статистикой и коэффициентами.\n\n"
+                    "🌟 Оформи PRO — от 299₽/неделю",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
+                        [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:trial")],
+                    ]),
+                )
+            except Exception:
+                pass
+            return
+
+        # Force cache refresh by resetting it
+        global _ALL_LIVE_CACHE
+        _ALL_LIVE_CACHE = None
+
+        try:
+            by_sport, upcoming = await _fetch_all_live_matches()
+        except Exception:
+            logger.exception("LIVE:REFRESH failed")
+            return
+
+        if not by_sport:
+            lines = ["🔴 LIVE матчи\n\nСейчас нет идущих матчей.\n"]
+            if upcoming:
+                lines.append("⏰ Ближайшие матчи:")
+                for m in upcoming:
+                    emoji = _LIVE_SPORT_EMOJI.get(m.sport_slug, "🏆")
+                    start = (m.start_time or "")[:5]
+                    title = (m.title or "Матч")[:40]
+                    league = (m.league or "")[:20]
+                    lines.append(f"  {emoji} {start} {title} ({league})")
+            lines.append("\n🔔 Подпишись на PRO — получай уведомления о начале матчей!")
+            try:
+                await q.edit_message_text(
+                    "\n".join(lines),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Обновить", callback_data="LIVE:REFRESH")],
+                        [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+                    ]),
+                )
+            except Exception:
+                pass
+            return
+
+        text = "🔴 LIVE матчи сейчас\n━━━━━━━━━━━━━━━━━━\n"
+        buttons: List[List[InlineKeyboardButton]] = []
+
+        for sport in _LIVE_SPORTS:
+            matches = by_sport.get(sport)
+            if not matches:
+                continue
+            emoji = _LIVE_SPORT_EMOJI.get(sport, "🏆")
+            sport_title = _LIVE_SPORT_TITLE.get(sport, sport)
+            text += f"\n{emoji} {sport_title}:\n"
+
+            for m in matches[:5]:
+                title = (m.title or "Матч")[:35]
+                score = (m.score or "?:?")
+                league = (m.league or "")[:15]
+                text += f"  🔴 {title} {score}"
+                if league:
+                    text += f" ({league})"
+                text += "\n"
+
+                btn_label = f"🔴 {title} {score}"
+                if len(btn_label) > 55:
+                    btn_label = btn_label[:54] + "…"
+                buttons.append([InlineKeyboardButton(
+                    btn_label,
+                    callback_data=f"MATCH:{sport}:{m.id}",
+                )])
+
+        text += "\nНажми на матч для анализа 👇"
+        buttons.append([InlineKeyboardButton("🔄 Обновить", callback_data="LIVE:REFRESH")])
+        buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+
+        try:
+            await q.edit_message_text(
+                _truncate_tg(text),
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception:
+            pass
         return
 
     # MATCH open
