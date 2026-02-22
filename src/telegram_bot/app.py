@@ -191,6 +191,31 @@ def _short_key(s: str, n: int = 10) -> str:
     return h[:n]
 
 
+def _extract_hhmm(start_time: str) -> str:
+    """Extract 'HH:MM' from any time format: '19:30', '2026-02-22T19:30:00', etc."""
+    if not start_time:
+        return ""
+    m = re.search(r"(\d{1,2}):(\d{2})", str(start_time))
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return ""
+
+
+def _truncate_at_sentence(text: str, limit: int = 200) -> str:
+    """Truncate text at the last complete sentence within limit."""
+    if not text or len(text) <= limit:
+        return text
+    chunk = text[:limit]
+    for sep in [". ", "! ", "? "]:
+        idx = chunk.rfind(sep)
+        if idx > 0:
+            return chunk[:idx + 1]
+    idx = chunk.rfind(".")
+    if idx > limit // 2:
+        return chunk[:idx + 1]
+    return chunk.rstrip() + "…"
+
+
 def _compact_match_btn_title(title: str, score: str, status: str) -> str:
     t = (title or "").strip() or "Матч"
     sc = (score or "").strip()
@@ -344,9 +369,9 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
         emoji = _HUNTER_SPORT_EMOJI.get(sport, "🏆")
         title = (p.get("title") or "Матч")[:50]
         league = p.get("league", "")
-        start = (p.get("start_time", "") or "")[:5]
+        start = _extract_hhmm(p.get("start_time", ""))
         rec = p.get("recommendation", "")
-        summary = (p.get("analysis_text") or "")[:200]
+        summary = _truncate_at_sentence(p.get("analysis_text") or "", 200)
 
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"{i}️⃣ {emoji} {title}")
@@ -1143,7 +1168,7 @@ async def _handle_live_button(update: Update, user_id: int) -> None:
             lines.append("⏰ Ближайшие матчи:")
             for m in upcoming:
                 emoji = _LIVE_SPORT_EMOJI.get(m.sport_slug, "🏆")
-                start = (m.start_time or "")[:5]  # HH:MM
+                start = _extract_hhmm(m.start_time or "")  # HH:MM
                 title = (m.title or "Матч")[:40]
                 league = (m.league or "")[:20]
                 lines.append(f"  {emoji} {start} {title} ({league})")
@@ -1748,7 +1773,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 lines.append("⏰ Ближайшие матчи:")
                 for m in upcoming:
                     emoji = _LIVE_SPORT_EMOJI.get(m.sport_slug, "🏆")
-                    start = (m.start_time or "")[:5]
+                    start = _extract_hhmm(m.start_time or "")
                     title = (m.title or "Матч")[:40]
                     league = (m.league or "")[:20]
                     lines.append(f"  {emoji} {start} {title} ({league})")

@@ -308,7 +308,7 @@ class SportAPIClient:
             logger.info("SportAPI init: base=%r timeout=%.1f", self.base, self.timeout_s)
 
     # 404s on these path patterns are expected (many leagues lack these endpoints)
-    _SILENT_404_KEYWORDS = ("statistics", "lineups", "stats", "incidents", "events")
+    _SILENT_404_KEYWORDS = ("statistics", "lineups", "stats", "incidents", "events", "odds")
 
     async def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base}{path}"

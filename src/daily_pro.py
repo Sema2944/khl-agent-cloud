@@ -76,13 +76,38 @@ def _safe_float(v: Any) -> float:
         return 0.0
 
 
-def _extract_hour_msk(start_time: str) -> Optional[int]:
-    """Extract hour (MSK) from start_time string like '19:30' or '2026-02-22T19:30:00'."""
+def _truncate_at_sentence(text: str, limit: int = 200) -> str:
+    """Truncate text at the last complete sentence within limit."""
+    if not text or len(text) <= limit:
+        return text
+    chunk = text[:limit]
+    # Find last sentence-ending punctuation
+    for sep in [". ", "! ", "? "]:
+        idx = chunk.rfind(sep)
+        if idx > 0:
+            return chunk[:idx + 1]
+    # No sentence break — try just a period at end
+    idx = chunk.rfind(".")
+    if idx > limit // 2:
+        return chunk[:idx + 1]
+    return chunk.rstrip() + "…"
+
+
+def _extract_hhmm(start_time: str) -> str:
+    """Extract 'HH:MM' from any time format: '19:30', '2026-02-22T19:30:00+03:00', etc."""
     if not start_time:
-        return None
-    m = re.search(r"(\d{1,2}):(\d{2})", start_time)
+        return ""
+    m = re.search(r"(\d{1,2}):(\d{2})", str(start_time))
     if m:
-        return int(m.group(1))
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return ""
+
+
+def _extract_hour_msk(start_time: str) -> Optional[int]:
+    """Extract hour (MSK) from start_time string."""
+    hhmm = _extract_hhmm(start_time)
+    if hhmm:
+        return int(hhmm.split(":")[0])
     return None
 
 
@@ -380,9 +405,14 @@ def _build_express(top3: List[Dict[str, Any]], pick_date: date) -> Dict[str, Any
     for p in top3:
         rec = p.get("recommendation", "")
         odds = _safe_float(p.get("rec_odds", 0))
-        title_short = (p.get("title") or "").split(" — ")[0][:15]
+        # Smart title: "Chelsea — Burnley" → "Chelsea-Burnley", truncate if needed
+        parts = (p.get("title") or "Матч").split(" — ")
+        if len(parts) == 2:
+            title_short = f"{parts[0].strip()[:12]}-{parts[1].strip()[:12]}"
+        else:
+            title_short = (p.get("title") or "")[:25]
         if rec:
-            legs.append(f"{rec} ({title_short})")
+            legs.append(f"{rec} {title_short}")
             if odds > 1.0:
                 total_odds *= odds
 
@@ -472,10 +502,10 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
         emoji = SPORT_EMOJI.get(sport, "🏆")
         title = p.get("title", "Матч")
         league = p.get("league", "")
-        start = (p.get("start_time", "") or "")[:5]  # HH:MM
+        start = _extract_hhmm(p.get("start_time", ""))
         rec = p.get("recommendation", "")
         rec_odds = _safe_float(p.get("rec_odds", 0))
-        summary = (p.get("analysis_text") or "")[:200]
+        summary = _truncate_at_sentence(p.get("analysis_text") or "", 200)
 
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"{i}️⃣ {emoji} {title}")
@@ -651,18 +681,30 @@ async def run_daily_hunter(bot=None) -> None:
     # 6. Rank by AI confidence
     scored.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
-    # 7. Diversify: max 2 per sport
+    # 7. Diversify: max 2 per sport, but always try to get 3
     top3: List[Dict[str, Any]] = []
     sport_count: Dict[str, int] = defaultdict(int)
+    used_ids: set = set()
 
     for m in scored:
         sport = m.get("sport_slug", "")
         if sport_count[sport] >= 2:
             continue
         top3.append(m)
+        used_ids.add(m.get("match_id"))
         sport_count[sport] += 1
         if len(top3) == 3:
             break
+
+    # Fallback: if < 3 after diversification, fill from remaining (ignore sport limit)
+    if len(top3) < 3:
+        for m in scored:
+            if m.get("match_id") in used_ids:
+                continue
+            top3.append(m)
+            used_ids.add(m.get("match_id"))
+            if len(top3) == 3:
+                break
 
     if not top3:
         logger.warning("Hunter: no picks with confidence after AI analysis")
