@@ -283,7 +283,7 @@ def _is_in_hunter_trial(user_id: int) -> bool:
 
 
 def _get_today_picks() -> list:
-    """Fetch today's daily picks from DB."""
+    """Fetch today's daily picks from DB (v2 with odds, start_time, recommendation)."""
     try:
         from sqlmodel import Session as SMSession
         from sqlalchemy import text
@@ -292,7 +292,12 @@ def _get_today_picks() -> list:
         today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
         with SMSession(engine) as s:
             rows = s.exec(
-                text("SELECT match_id, sport_slug, title, league, confidence, analysis_text, pick_type FROM daily_picks WHERE pick_date = :d ORDER BY pick_type, confidence DESC"),
+                text(
+                    "SELECT match_id, sport_slug, title, league, confidence, "
+                    "analysis_text, pick_type, "
+                    "COALESCE(start_time, ''), COALESCE(odds_json, ''), COALESCE(recommendation, '') "
+                    "FROM daily_picks WHERE pick_date = :d ORDER BY pick_type, confidence DESC"
+                ),
                 params={"d": today},
             ).all()
             return [
@@ -300,6 +305,9 @@ def _get_today_picks() -> list:
                     "match_id": r[0], "sport_slug": r[1], "title": r[2],
                     "league": r[3], "confidence": r[4], "analysis_text": r[5],
                     "pick_type": r[6],
+                    "start_time": r[7] if len(r) > 7 else "",
+                    "odds_json": r[8] if len(r) > 8 else "",
+                    "recommendation": r[9] if len(r) > 9 else "",
                 }
                 for r in rows
             ]
@@ -308,8 +316,104 @@ def _get_today_picks() -> list:
         return []
 
 
+_HUNTER_SPORT_EMOJI = {
+    "football": "⚽", "ice-hockey": "🏒", "basketball": "🏀",
+    "tennis": "🎾", "mma": "🥊",
+}
+
+
+def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
+    """Format hunter picks in the rich v2 format."""
+    import json as _json
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    top3 = [p for p in picks if p.get("pick_type") == "top3"]
+    express = [p for p in picks if p.get("pick_type") == "express"]
+
+    today = _dt.now(_ZI("Europe/Moscow")).date()
+    lines = [
+        "🎯 Охотник — Топ матчи дня",
+        f"{today.strftime('%d.%m.%Y')} | Подобрано AI",
+        "",
+    ]
+
+    for i, p in enumerate(top3[:3], 1):
+        conf = int(float(p.get("confidence", 0)) * 100)
+        sport = p.get("sport_slug", "")
+        emoji = _HUNTER_SPORT_EMOJI.get(sport, "🏆")
+        title = (p.get("title") or "Матч")[:50]
+        league = p.get("league", "")
+        start = (p.get("start_time", "") or "")[:5]
+        rec = p.get("recommendation", "")
+        summary = (p.get("analysis_text") or "")[:200]
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"{i}️⃣ {emoji} {title}")
+
+        # League + time
+        lt = ""
+        if league:
+            lt = f"   🏆 {league}"
+        if start:
+            lt += f" | {start} MSK" if lt else f"   {start} MSK"
+        if lt:
+            lines.append(lt)
+
+        # Odds
+        odds_data = {}
+        ojson = p.get("odds_json", "")
+        if ojson:
+            try:
+                odds_data = _json.loads(ojson)
+            except Exception:
+                pass
+        if odds_data:
+            parts = []
+            if odds_data.get("home"):
+                parts.append(f"П1: {odds_data['home']}")
+            if odds_data.get("draw"):
+                parts.append(f"X: {odds_data['draw']}")
+            if odds_data.get("away"):
+                parts.append(f"П2: {odds_data['away']}")
+            if parts:
+                lines.append(f"   💰 {' | '.join(parts)}")
+
+        # Recommendation
+        if rec:
+            lines.append(f"   🎯 {rec}")
+
+        # Summary
+        if summary:
+            lines.append(f"   💡 {summary}")
+
+        lines.append(f"   ✅ Уверенность: {conf}%")
+        lines.append("")
+
+    # Express
+    if express:
+        ep = express[0]
+        express_text = ep.get("analysis_text", "")
+        express_rec = ep.get("recommendation", "")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        header = "⚡ Экспресс дня"
+        if express_rec:
+            header += f" ({express_rec})"
+        lines.append(header)
+        if express_text:
+            lines.append(f"  {express_text}")
+        lines.append("")
+
+    if in_trial:
+        lines.append("🎁 Пробный период (3 дня)")
+        lines.append("")
+
+    lines.append("ℹ️ Аналитический материал, не является прогнозом.")
+    return "\n".join(lines)
+
+
 async def _handle_hunter(q, user_id: int):
-    """Show hunter screen — FREE or PRO version."""
+    """Show hunter screen — FREE or PRO version (v2 rich format)."""
     user_is_pro = False
     try:
         user_is_pro = is_pro(user_id)
@@ -321,7 +425,6 @@ async def _handle_hunter(q, user_id: int):
     if user_is_pro or in_trial:
         picks = _get_today_picks()
         top3 = [p for p in picks if p.get("pick_type") == "top3"]
-        express = [p for p in picks if p.get("pick_type") == "express"]
 
         if not top3:
             txt = HUNTER_NOT_READY_TEXT
@@ -329,30 +432,17 @@ async def _handle_hunter(q, user_id: int):
                 [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
             ])
         else:
-            lines = ["🎯 Охотник — Топ матчи дня\n"]
+            txt = _format_hunter_picks_text(picks, in_trial=in_trial and not user_is_pro)
             rows = []
-            for i, p in enumerate(top3[:3], 1):
-                conf = int(float(p.get("confidence", 0)) * 100)
-                title = (p.get("title") or "Матч")[:50]
-                lines.append(f"{i}. {title} ({conf}%)")
-                summary = (p.get("analysis_text") or "")[:200]
-                if summary:
-                    lines.append(f"   {summary}\n")
+            for p in top3[:3]:
+                title = (p.get("title") or "Матч")[:30]
                 mid = p.get("match_id", "")
+                sport = p.get("sport_slug", "ice-hockey")
                 rows.append([InlineKeyboardButton(
-                    f"🔍 Подробнее: {title[:30]}",
-                    callback_data=f"HUNTER:DETAIL:{mid}"
+                    f"🔍 {title}",
+                    callback_data=f"MATCH:{sport}:{mid}"
                 )])
-
-            if express:
-                lines.append("⚡ ЭКСПРЕСС ДНЯ")
-                for ep in express[:1]:
-                    lines.append(ep.get("analysis_text", "")[:200])
-
-            txt = "\n".join(lines)
-            if in_trial and not user_is_pro:
-                txt += "\n\n🎁 Пробный период (3 дня)"
-            rows.append([InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")])
+            rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
             kb = InlineKeyboardMarkup(rows)
     else:
         txt = HUNTER_FREE_TEXT
@@ -363,9 +453,9 @@ async def _handle_hunter(q, user_id: int):
         ])
 
     try:
-        await q.edit_message_text(txt, reply_markup=kb)
+        await q.edit_message_text(_truncate_tg(txt), reply_markup=kb)
     except Exception:
-        await q.message.reply_text(txt, reply_markup=kb)
+        await q.message.reply_text(_truncate_tg(txt), reply_markup=kb)
 
 
 async def _handle_hunter_detail(q, user_id: int, match_id: str):
@@ -903,11 +993,10 @@ async def handle_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /hunter — показать экран Охотника."""
+    """Команда /hunter — показать экран Охотника (v2 rich format)."""
     if not update.message:
         return
     user_id = update.effective_user.id if update.effective_user else 0
-    # Reuse the inline hunter screen by sending a new message
     user_is_pro = False
     try:
         user_is_pro = is_pro(user_id)
@@ -924,23 +1013,16 @@ async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
             ])
         else:
-            lines = ["🎯 Охотник — Топ матчи дня\n"]
+            txt = _format_hunter_picks_text(picks, in_trial=in_trial and not user_is_pro)
             rows = []
-            for i, p in enumerate(top3[:3], 1):
-                conf = int(float(p.get("confidence", 0)) * 100)
-                title = (p.get("title") or "Матч")[:50]
-                lines.append(f"{i}. {title} ({conf}%)")
-                summary = (p.get("analysis_text") or "")[:200]
-                if summary:
-                    lines.append(f"   {summary}\n")
+            for p in top3[:3]:
+                title = (p.get("title") or "Матч")[:30]
                 mid = p.get("match_id", "")
+                sport = p.get("sport_slug", "ice-hockey")
                 rows.append([InlineKeyboardButton(
-                    f"🔍 Подробнее: {title[:30]}",
-                    callback_data=f"HUNTER:DETAIL:{mid}"
+                    f"🔍 {title}",
+                    callback_data=f"MATCH:{sport}:{mid}"
                 )])
-            txt = "\n".join(lines)
-            if in_trial and not user_is_pro:
-                txt += "\n\n🎁 Пробный период (3 дня)"
             rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
             kb = InlineKeyboardMarkup(rows)
     else:
@@ -950,7 +1032,7 @@ async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
             [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
         ])
-    await update.message.reply_text(txt, reply_markup=kb)
+    await update.message.reply_text(_truncate_tg(txt), reply_markup=kb)
 
 
 # ---------------------------------------------------------------------------

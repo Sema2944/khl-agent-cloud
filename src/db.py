@@ -158,6 +158,10 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_daily_picks_date ON daily_picks (pick_date)"""))
 
+        # Hunter v2: new columns for odds, start time, recommendation
+        for col, typ in [("start_time", "TEXT DEFAULT ''"), ("odds_json", "TEXT DEFAULT ''"), ("recommendation", "TEXT DEFAULT ''")]:
+            conn.execute(text(f"ALTER TABLE daily_picks ADD COLUMN IF NOT EXISTS {col} {typ}"))
+
         # P1: match_cache (structured data from APIs)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS match_cache (

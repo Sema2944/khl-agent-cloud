@@ -129,4 +129,7 @@ class DailyPick(SQLModel, table=True):
     confidence: float = Field(default=0.0)
     analysis_text: str = Field(default="")
     pick_type: str = Field(default="top3")  # "top3" | "express"
+    start_time: str = Field(default="")
+    odds_json: str = Field(default="")          # JSON: {"home": 1.65, "draw": 3.80, "away": 5.20}
+    recommendation: str = Field(default="")     # "П1 + ТБ 2.5"
     created_at: datetime = Field(default_factory=datetime.utcnow)
