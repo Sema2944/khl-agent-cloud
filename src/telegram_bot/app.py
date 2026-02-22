@@ -141,12 +141,21 @@ def _text_buy_pro(user_id: int) -> str:
         return tariff_text()
     except Exception:
         return (
-            "⭐ PRO режим\n\n"
-            "Что входит:\n"
-            "🎯 Охотник: Топ-3 + Экспресс каждое утро автоматически\n"
-            "🔥 LIVE PRO: MCI + импульс + сценарии + confidence\n\n"
-            "Инструмент, а не прогноз.\n\n"
-            "Нажми кнопку ниже, чтобы оформить."
+            "🌟 Betly PRO — AI-аналитика спорта\n\n"
+            "Что включено в PRO:\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🎯 Охотник — Топ-3 события дня каждое утро\n"
+            "📊 Экспресс дня — собранный AI экспресс\n"
+            "⚡ LIVE PRO — аналитика в реальном времени\n"
+            "📈 Расширенная статистика и H2H\n"
+            "🔔 Push-уведомления о результатах\n\n"
+            "Тарифы:\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📅 Неделя — 299 ₽\n"
+            "📅 Месяц — 799 ₽ (экономия 25%)\n"
+            "📅 Сезон — 4 990 ₽ (экономия 40%)\n\n"
+            "✅ Отмена в любой момент\n"
+            "✅ Оплата картой прямо в Telegram"
         )
 
 
@@ -246,7 +255,7 @@ async def _handle_hunter(q, user_id: int):
         txt = HUNTER_FREE_TEXT
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Посмотреть пример", callback_data="HUNTER:EXAMPLE")],
-            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
             [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
         ])
 
@@ -297,7 +306,7 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
         [InlineKeyboardButton("📊 Анализ матчей", callback_data="MENU:MATCHES")],
-        [InlineKeyboardButton("⭐ PRO режим", callback_data="MENU:PREMIUM")],
+        [InlineKeyboardButton("🌟 PRO", callback_data="MENU:PREMIUM")],
         [InlineKeyboardButton("👤 Профиль", callback_data="MENU:PROFILE")],
         [InlineKeyboardButton("ℹ️ О боте", callback_data="MENU:ABOUT")],
     ]
@@ -776,6 +785,14 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(ONBOARDING_WELCOME, reply_markup=kb)
 
 
+async def handle_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /pro — показать экран PRO-подписки."""
+    if not update.message:
+        return
+    txt = _text_buy_pro(update.effective_user.id if update.effective_user else 0)
+    await update.message.reply_text(txt, reply_markup=kb_buy_pro())
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -860,6 +877,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
+    # PRO:<tariff_key> — временная заглушка (до подключения ЮKassa)
+    if data.startswith("PRO:") and data != "PRO:TRIAL":
+        tariff_key = data.split(":", 1)[1].strip().lower()
+        try:
+            from .payments import pro_stub_text, kb_pro_stub
+            txt = pro_stub_text(tariff_key)
+            kb = kb_pro_stub()
+        except Exception:
+            txt = "💳 Подключение оплаты в процессе.\nОплата станет доступна в ближайшее время!"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="MENU:PREMIUM")]])
+        try:
+            await q.edit_message_text(txt, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=kb)
+        return
+
+    # PRO:TRIAL — активация бесплатного пробного периода
+    if data == "PRO:TRIAL":
+        trial_ok = False
+        try:
+            from ..user_store import get_user_by_tg_id
+            from datetime import timedelta, timezone as tz
+            u = get_user_by_tg_id(user_id)
+            already_tried = u and getattr(u, 'trial_started_at', None)
+            if already_tried:
+                txt = "ℹ️ Пробный период уже был использован.\n\nОформи PRO, чтобы продолжить!"
+            else:
+                from ..pro_db import grant_pro
+                grant_pro(user_id, days=3)
+                # Mark trial start
+                try:
+                    from sqlalchemy import text as sa_text
+                    from ..db import SessionLocal
+                    session = SessionLocal()
+                    try:
+                        session.exec(
+                            sa_text("UPDATE users SET trial_started_at = NOW() WHERE tg_user_id = :uid"),
+                            params={"uid": user_id},
+                        )
+                        session.commit()
+                    finally:
+                        session.close()
+                except Exception:
+                    logger.exception("Failed to set trial_started_at")
+                txt = "🎁 Пробный период активирован!\n\n3 дня полного PRO-доступа.\n\nПопробуй Охотника — топ матчи дня уже ждут!"
+                trial_ok = True
+        except Exception:
+            logger.exception("PRO:TRIAL failed")
+            txt = "⚠️ Не удалось активировать пробный период. Попробуй позже."
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")] if trial_ok else [],
+            [InlineKeyboardButton("⬅️ Назад к тарифам", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+        ])
+        # Filter empty rows
+        kb = InlineKeyboardMarkup([r for r in kb.inline_keyboard if r])
+        try:
+            await q.edit_message_text(txt, reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=kb)
+        return
+
     # PAY:<tariff_key> — send invoice for selected tariff
     if data.startswith("PAY:"):
         tariff_key = data.split(":", 1)[1].strip().lower()
@@ -908,7 +988,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # HUNTER:EXAMPLE
     if data == "HUNTER:EXAMPLE":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Оформить PRO", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="MENU:HUNTER")],
         ])
         try:
@@ -1221,6 +1301,7 @@ def create_application() -> Application:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("pro", handle_pro))
 
     # Payments: pre-checkout + successful payment
     try:

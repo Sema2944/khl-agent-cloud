@@ -65,38 +65,57 @@ TARIFFS: Dict[str, Tariff] = {
 # UI: tariff selection screen
 # ---------------------------------------------------------------------------
 def tariff_text() -> str:
-    use_stars = _use_stars()
-    lines = [
-        "⭐ PRO доступ — Выбери тариф\n",
-        "Что входит в PRO:",
-        "• Охотник — AI-подборка лучших матчей каждый день",
-        "• LIVE PRO — детальный анализ по ходу матча",
-        "• Расширенная аналитика с данными API",
-        "",
-    ]
-    for t in TARIFFS.values():
-        if use_stars:
-            lines.append(f"{t.emoji} {t.label} ({t.days} дн.) — {t.price_stars} Stars")
-        else:
-            lines.append(f"{t.emoji} {t.label} ({t.days} дн.) — {t.price_rub}₽")
-    lines.append("")
-    lines.append("Выбери тариф ниже 👇")
-    return "\n".join(lines)
+    return (
+        "🌟 Betly PRO — AI-аналитика спорта\n\n"
+        "Что включено в PRO:\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎯 Охотник — Топ-3 события дня каждое утро\n"
+        "📊 Экспресс дня — собранный AI экспресс\n"
+        "⚡ LIVE PRO — аналитика в реальном времени\n"
+        "📈 Расширенная статистика и H2H\n"
+        "🔔 Push-уведомления о результатах\n\n"
+        "Тарифы:\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📅 Неделя — 299 ₽\n"
+        "📅 Месяц — 799 ₽ (экономия 25%)\n"
+        "📅 Сезон — 4 990 ₽ (экономия 40%)\n\n"
+        "✅ Отмена в любой момент\n"
+        "✅ Оплата картой прямо в Telegram"
+    )
 
 
 def kb_tariffs() -> InlineKeyboardMarkup:
-    use_stars = _use_stars()
-    rows: List[List[InlineKeyboardButton]] = []
-    for t in TARIFFS.values():
-        price = f"{t.price_stars} ⭐" if use_stars else f"{t.price_rub}₽"
-        rows.append([
-            InlineKeyboardButton(
-                f"{t.emoji} {t.label} — {price}",
-                callback_data=f"PAY:{t.key}",
-            )
-        ])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")])
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("📅 Неделя — 299 ₽", callback_data="PRO:week")],
+        [InlineKeyboardButton("📅 Месяц — 799 ₽ ⭐ Популярный", callback_data="PRO:month")],
+        [InlineKeyboardButton("📅 Сезон — 4 990 ₽ 🔥 -40%", callback_data="PRO:season")],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="BACK:MENU")],
+    ]
     return InlineKeyboardMarkup(rows)
+
+
+def pro_stub_text(tariff_key: str) -> str:
+    """Временная заглушка при нажатии на тариф (до подключения ЮKassa)."""
+    tariff = TARIFFS.get(tariff_key)
+    if not tariff:
+        name = "PRO"
+        price = ""
+    else:
+        name = f"PRO {tariff.label}"
+        price = f" ({tariff.price_rub} ₽)"
+    return (
+        "💳 Подключение оплаты в процессе.\n\n"
+        f"Тариф: {name}{price}\n"
+        "Оплата станет доступна в ближайшее время!\n\n"
+        "Хотите получить бесплатный пробный период на 3 дня?"
+    )
+
+
+def kb_pro_stub() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Попробовать бесплатно 3 дня", callback_data="PRO:TRIAL")],
+        [InlineKeyboardButton("⬅️ Назад к тарифам", callback_data="MENU:PREMIUM")],
+    ])
 
 
 # ---------------------------------------------------------------------------
