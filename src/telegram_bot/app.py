@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 
 from ..db import get_session
-from ..pro_db import is_pro
+from ..pro_db import is_pro, OWNER_IDS
 from ..ui_text import (
     MAIN_MENU_TEXT, ONBOARDING_WELCOME, ONBOARDING_HOW_IT_WORKS,
     HUNTER_FREE_TEXT, HUNTER_EXAMPLE_TEXT, HUNTER_NOT_READY_TEXT,
@@ -1035,6 +1035,50 @@ async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(_truncate_tg(txt), reply_markup=kb)
 
 
+async def handle_hunter_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /hunter_refresh — принудительная перегенерация (только OWNER_IDS)."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    await update.message.reply_text("🔄 Перегенерирую Охотника... Это займёт 1-2 минуты.")
+
+    try:
+        from ..daily_pro import run_daily_hunter
+        await run_daily_hunter(bot=None)
+    except Exception:
+        logger.exception("hunter_refresh failed")
+        await update.message.reply_text("❌ Ошибка при генерации. Смотри логи.")
+        return
+
+    # Show fresh picks
+    picks = _get_today_picks()
+    top3 = [p for p in picks if p.get("pick_type") == "top3"]
+    if not top3:
+        await update.message.reply_text("⚠️ Пайплайн отработал, но пиков нет (нет подходящих матчей).")
+        return
+
+    txt = _format_hunter_picks_text(picks)
+    rows = []
+    for p in top3[:3]:
+        title = (p.get("title") or "Матч")[:30]
+        mid = p.get("match_id", "")
+        sport = p.get("sport_slug", "ice-hockey")
+        rows.append([InlineKeyboardButton(
+            f"🔍 {title}",
+            callback_data=f"MATCH:{sport}:{mid}"
+        )])
+    rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+    await update.message.reply_text(
+        f"✅ Охотник перегенерирован!\n\n{_truncate_tg(txt)}",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 🔴 LIVE — all in-progress matches across all sports (PRO only)
 # ---------------------------------------------------------------------------
@@ -1816,6 +1860,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("pro", handle_pro))
     app.add_handler(CommandHandler("hunter", handle_hunter))
+    app.add_handler(CommandHandler("hunter_refresh", handle_hunter_refresh))
 
     # Payments: pre-checkout + successful payment
     try:
