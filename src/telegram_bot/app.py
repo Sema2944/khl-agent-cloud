@@ -1023,6 +1023,8 @@ async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     f"🔍 {title}",
                     callback_data=f"MATCH:{sport}:{mid}"
                 )])
+            if user_id in OWNER_IDS:
+                rows.append([InlineKeyboardButton("🔄 Перегенерировать", callback_data="HUNTER:REFRESH")])
             rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
             kb = InlineKeyboardMarkup(rows)
     else:
@@ -1436,6 +1438,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.edit_message_text(HUNTER_EXAMPLE_TEXT, reply_markup=kb)
         except Exception:
             await q.message.reply_text(HUNTER_EXAMPLE_TEXT, reply_markup=kb)
+        return
+
+    # HUNTER:REFRESH — admin-only inline regeneration
+    if data == "HUNTER:REFRESH":
+        if user_id not in OWNER_IDS:
+            return
+
+        try:
+            await q.edit_message_text("🔄 Перегенерирую Охотника... 1-2 минуты.")
+        except Exception:
+            pass
+
+        try:
+            from ..daily_pro import run_daily_hunter
+            await run_daily_hunter(bot=None)
+        except Exception:
+            logger.exception("HUNTER:REFRESH failed")
+            try:
+                await q.edit_message_text("❌ Ошибка при генерации. Смотри логи.")
+            except Exception:
+                pass
+            return
+
+        picks = _get_today_picks()
+        top3 = [p for p in picks if p.get("pick_type") == "top3"]
+        if not top3:
+            try:
+                await q.edit_message_text("⚠️ Пайплайн отработал, но пиков нет.")
+            except Exception:
+                pass
+            return
+
+        txt = "✅ Перегенерировано!\n\n" + _format_hunter_picks_text(picks)
+        rows = []
+        for p in top3[:3]:
+            title = (p.get("title") or "Матч")[:30]
+            mid = p.get("match_id", "")
+            sport = p.get("sport_slug", "ice-hockey")
+            rows.append([InlineKeyboardButton(
+                f"🔍 {title}",
+                callback_data=f"MATCH:{sport}:{mid}"
+            )])
+        rows.append([InlineKeyboardButton("🔄 Перегенерировать", callback_data="HUNTER:REFRESH")])
+        rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+
+        try:
+            await q.edit_message_text(
+                _truncate_tg(txt),
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        except Exception:
+            await q.message.reply_text(
+                _truncate_tg(txt),
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
         return
 
     # HUNTER:DETAIL:<match_id>
