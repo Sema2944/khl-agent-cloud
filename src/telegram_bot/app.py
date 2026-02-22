@@ -12,7 +12,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -63,6 +70,29 @@ except Exception:
         "basketball": "🏀 Баскетбол",
     }
     DEFAULT_SPORTS = ["ice-hockey", "football", "basketball"]
+
+
+# ---------------------------------------------------------------------------
+# Persistent reply keyboard (always visible at bottom of Telegram chat)
+# ---------------------------------------------------------------------------
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("⚽ Футбол"), KeyboardButton("🏀 Баскетбол")],
+        [KeyboardButton("🏒 Хоккей"), KeyboardButton("🎾 Теннис")],
+        [KeyboardButton("🥊 MMA"), KeyboardButton("🌟 PRO")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Map reply keyboard button text → sport API slug
+_REPLY_SPORT_MAP = {
+    "⚽ Футбол": "football",
+    "🏀 Баскетбол": "basketball",
+    "🏒 Хоккей": "ice-hockey",
+    "🎾 Теннис": "tennis",
+    "🥊 MMA": "mma",
+}
 
 
 def _truncate_tg(text: str, limit: int = TG_TEXT_LIMIT) -> str:
@@ -774,7 +804,13 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.exception("handle_start: onboarding check failed")
 
     if seen:
-        await update.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        await update.message.reply_text(
+            "Выбери спорт 👇\n\n"
+            "Или используй меню:\n"
+            "🎯 /hunter — топ матчи дня\n"
+            "🌟 /pro — PRO подписка",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
         return
 
     # Show onboarding for new users
@@ -793,6 +829,57 @@ async def handle_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(txt, reply_markup=kb_buy_pro())
 
 
+async def handle_hunter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /hunter — показать экран Охотника."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    # Reuse the inline hunter screen by sending a new message
+    user_is_pro = False
+    try:
+        user_is_pro = is_pro(user_id)
+    except Exception:
+        pass
+    in_trial = _is_in_hunter_trial(user_id)
+
+    if user_is_pro or in_trial:
+        picks = _get_today_picks()
+        top3 = [p for p in picks if p.get("pick_type") == "top3"]
+        if not top3:
+            txt = HUNTER_NOT_READY_TEXT
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
+            ])
+        else:
+            lines = ["🎯 Охотник — Топ матчи дня\n"]
+            rows = []
+            for i, p in enumerate(top3[:3], 1):
+                conf = int(float(p.get("confidence", 0)) * 100)
+                title = (p.get("title") or "Матч")[:50]
+                lines.append(f"{i}. {title} ({conf}%)")
+                summary = (p.get("analysis_text") or "")[:200]
+                if summary:
+                    lines.append(f"   {summary}\n")
+                mid = p.get("match_id", "")
+                rows.append([InlineKeyboardButton(
+                    f"🔍 Подробнее: {title[:30]}",
+                    callback_data=f"HUNTER:DETAIL:{mid}"
+                )])
+            txt = "\n".join(lines)
+            if in_trial and not user_is_pro:
+                txt += "\n\n🎁 Пробный период (3 дня)"
+            rows.append([InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")])
+            kb = InlineKeyboardMarkup(rows)
+    else:
+        txt = HUNTER_FREE_TEXT
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Посмотреть пример", callback_data="HUNTER:EXAMPLE")],
+            [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+        ])
+    await update.message.reply_text(txt, reply_markup=kb)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
@@ -802,6 +889,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text_raw.lower().strip()
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
+
+    # --- Reply keyboard: sport buttons ---
+    sport_slug = _REPLY_SPORT_MAP.get(text_raw.strip())
+    if sport_slug:
+        if not _is_allowed_sport(user_id, sport_slug):
+            title = SPORT_LABELS.get(sport_slug, sport_slug)
+            await update.message.reply_text(
+                f"🔒 {title} недоступен по твоему тарифу.",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+            return
+        text, kb = await _render_sport_nav_root(user_id, sport_slug)
+        txt = _truncate_tg(text)
+        await update.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # --- Reply keyboard: PRO button ---
+    if text_raw.strip() == "🌟 PRO":
+        txt = _truncate_tg(_text_buy_pro(user_id))
+        await update.message.reply_text(
+            _safe_markdown(txt),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_buy_pro(),
+        )
+        return
 
     # быстрый вход в матчи
     if "матчи сегодня" in norm:
@@ -963,10 +1075,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         except Exception:
             logger.exception("set_user_seen_intro failed")
+        # Remove inline buttons from onboarding message
         try:
-            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+            await q.edit_message_text(MAIN_MENU_TEXT)
         except Exception:
-            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+            pass
+        # Send new message with persistent reply keyboard
+        await q.message.reply_text(
+            "Выбери спорт 👇",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
         return
 
     # ONBOARD:HELP
@@ -1319,6 +1437,7 @@ def create_application() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("pro", handle_pro))
+    app.add_handler(CommandHandler("hunter", handle_hunter))
 
     # Payments: pre-checkout + successful payment
     try:
@@ -1364,6 +1483,16 @@ async def telegram_startup() -> None:
         logger.info("Telegram webhook set: %s (ok=%s)", webhook_url, ok)
     except Exception:
         logger.exception("Failed to set webhook")
+
+    # Register bot commands (visible in Telegram menu button)
+    try:
+        await _telegram_app.bot.set_my_commands([
+            BotCommand("start", "Главное меню"),
+            BotCommand("hunter", "🎯 Охотник — топ матчи дня"),
+            BotCommand("pro", "🌟 PRO подписка"),
+        ])
+    except Exception:
+        logger.exception("Failed to set bot commands")
 
 
 async def telegram_shutdown() -> None:
