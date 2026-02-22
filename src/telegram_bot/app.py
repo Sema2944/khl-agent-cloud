@@ -1282,6 +1282,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Telegram handler error", exc_info=context.error)
+
+    # Alert admin about the error
+    if context.error:
+        try:
+            from ..alerting import send_alert
+            uid = None
+            uname = None
+            if isinstance(update, Update) and update.effective_user:
+                uid = update.effective_user.id
+                uname = getattr(update.effective_user, "username", None)
+            await send_alert(
+                "ERROR", "telegram_handler", context.error,
+                user_id=uid, username=uname,
+            )
+        except Exception:
+            pass
+
     try:
         if isinstance(update, Update) and update.effective_chat:
             await context.bot.send_message(
@@ -1327,6 +1344,13 @@ async def telegram_startup() -> None:
 
     await _telegram_app.initialize()
     await _telegram_app.start()
+
+    # Init alerting system
+    try:
+        from ..alerting import init_alerting
+        init_alerting(_telegram_app.bot)
+    except Exception:
+        logger.exception("Failed to init alerting")
 
     webhook_url = WEBHOOK_URL
     if not webhook_url:

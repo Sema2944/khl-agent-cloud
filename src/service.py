@@ -215,6 +215,15 @@ async def on_startup():
     except Exception as e:
         logger.exception("Telegram startup failed: %s", e)
 
+    # Send startup notification to admin
+    try:
+        from .alerting import send_startup_message
+        from .telegram_bot.app import _telegram_app
+        if _telegram_app:
+            await send_startup_message(_telegram_app.bot)
+    except Exception:
+        logger.exception("Failed to send startup message")
+
     # Hunter scheduler (asyncio background task)
     try:
         import asyncio

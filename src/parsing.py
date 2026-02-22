@@ -834,8 +834,17 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                         "raw": getattr(d, "raw", None) or merged.get("raw"),
                     }
                 )
-            except Exception:
+            except Exception as _md_err:
                 logger.exception("match_details refresh failed; will try day-list refresh")
+                try:
+                    from .alerting import send_alert
+                    import asyncio
+                    asyncio.ensure_future(send_alert(
+                        "WARNING", "parsing.match_details_refresh", _md_err,
+                        user_id=user_id, context={"match_id": match_id, "sport": sport},
+                    ))
+                except Exception:
+                    pass
 
             if (not str(merged.get("score") or "").strip()) or (not str(merged.get("status") or "").strip()):
                 day = _extract_date_from_start_time(str(merged.get("start_time") or "")) or _msk_today_date()
@@ -882,8 +891,17 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                 "country": getattr(d, "country", "") if hasattr(d, "country") else "",
                 "raw": getattr(d, "raw", None),
             }
-        except Exception:
+        except Exception as _cm_err:
             logger.exception("match_details on cache miss failed; will try day-list refresh")
+            try:
+                from .alerting import send_alert
+                import asyncio
+                asyncio.ensure_future(send_alert(
+                    "WARNING", "parsing.match_details_cache_miss", _cm_err,
+                    user_id=user_id, context={"match_id": match_id, "sport": sport},
+                ))
+            except Exception:
+                pass
 
         refreshed = await _refresh_match_from_day_list(sport, match_id, _msk_today_date())
         if refreshed:
@@ -1547,6 +1565,11 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 return await _run_ui_llm(user_id, match_id, mode, action)
             except Exception as e:
                 logger.exception("ui command failed")
+                try:
+                    from .alerting import send_alert
+                    await send_alert("ERROR", "parsing.ui_command", e, user_id=user_id, context={"match_id": match_id, "mode": mode, "action": action})
+                except Exception:
+                    pass
                 return f"⚠️ Ошибка UI: {type(e).__name__}: {str(e)[:160]}"
         return "⚠️ Формат: UI:<match_id>:<pre|live>:<overview|pro|refresh|markets>"
 
@@ -1561,6 +1584,11 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
                 return await _run_ui_llm(user_id, match_id, mode, action)
             except Exception as e:
                 logger.exception("ui command failed")
+                try:
+                    from .alerting import send_alert
+                    await send_alert("ERROR", "parsing.ui_command", e, user_id=user_id, context={"match_id": match_id, "mode": mode, "action": action})
+                except Exception:
+                    pass
                 return f"⚠️ Ошибка UI: {type(e).__name__}: {str(e)[:160]}"
         return "⚠️ Формат: ui match <match_id> <pre|live> <overview|pro|refresh|markets>"
 
@@ -1576,6 +1604,11 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
             return await _format_matches_today_api(user_id, sport_slug)
         except Exception as e:
             logger.exception("format matches today failed")
+            try:
+                from .alerting import send_alert
+                await send_alert("ERROR", "parsing.format_matches_today", e, user_id=user_id, context={"sport": sport_slug})
+            except Exception:
+                pass
             return f"⚠️ Не удалось получить матчи: {type(e).__name__}: {str(e)[:200]}"
 
     c = _parse_nav_country(raw)
@@ -1640,6 +1673,11 @@ async def run_dialog_agent(user_id: int, text: str) -> str:
 
         except Exception as e:
             logger.exception("match details failed")
+            try:
+                from .alerting import send_alert
+                await send_alert("ERROR", "parsing.match_details_main", e, user_id=user_id, context={"match_id": match_id, "sport": sport_slug})
+            except Exception:
+                pass
             return f"⚠️ Не удалось открыть матч {match_id}: {type(e).__name__}: {str(e)[:200]}"
 
     try:

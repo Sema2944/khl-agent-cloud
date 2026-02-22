@@ -315,7 +315,17 @@ class SportAPIClient:
 
         if r.status_code >= 400:
             txt = (r.text or "")[:800]
-            raise SportAPIError(f"HTTP {r.status_code}: {txt}")
+            err = SportAPIError(f"HTTP {r.status_code}: {txt}")
+            try:
+                from ..alerting import send_alert
+                import asyncio
+                asyncio.ensure_future(send_alert(
+                    "ERROR", "sport_api._get_json", err,
+                    context={"url": url, "status": r.status_code},
+                ))
+            except Exception:
+                pass
+            raise err
 
         try:
             return r.json()
@@ -1061,7 +1071,17 @@ class SportAPIClient:
                 last_err = fb_err
 
             if last_err:
-                raise SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
+                final_err = SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
+                try:
+                    from ..alerting import send_alert
+                    import asyncio
+                    asyncio.ensure_future(send_alert(
+                        "ERROR", "sport_api.matches_by_date", final_err,
+                        context={"sport": sport_slug, "date": day_s},
+                    ))
+                except Exception:
+                    pass
+                raise final_err
             raise SportAPIError(f"matches_by_date: no matches for {sport_slug} on {day_s} (check API_SPORTS_KEY)")
 
         # ── Hockey: try primary API first (api-sport.ru) ──

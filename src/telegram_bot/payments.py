@@ -252,8 +252,28 @@ async def handle_successful_payment(
         ok = grant_pro(user_id, days=tariff.days)
         if not ok:
             logger.error("grant_pro failed for user=%s after payment", user_id)
-    except Exception:
+            try:
+                from ..alerting import send_alert
+                await send_alert(
+                    "CRITICAL", "payments.grant_pro",
+                    RuntimeError(f"grant_pro returned False for user={user_id}"),
+                    user_id=user_id,
+                    context={"tariff": tariff.key, "days": tariff.days},
+                )
+            except Exception:
+                pass
+    except Exception as _gp_err:
         logger.exception("grant_pro error after payment user=%s", user_id)
+        try:
+            from ..alerting import send_alert
+            await send_alert(
+                "CRITICAL", "payments.grant_pro",
+                _gp_err,
+                user_id=user_id,
+                context={"tariff": tariff.key, "days": tariff.days, "payload": payload},
+            )
+        except Exception:
+            pass
 
     # Determine payment info for logging
     use_stars = _use_stars()
