@@ -66,6 +66,110 @@ _LIVE_SNAPSHOT_BY_MATCH: Dict[str, Dict[str, Any]] = {}
 # Used to avoid re-sending identical text when provider data didn't change.
 _LIVE_RENDER_BY_MATCH: Dict[tuple, str] = {}
 
+# LIVE data cache: {f"{sport}:{match_id}" → (timestamp, extras_data)}
+_LIVE_DATA_CACHE: Dict[str, tuple] = {}
+_LIVE_DATA_CACHE_TTL = 60  # seconds
+
+# User refresh cooldown: {user_id → last_refresh_timestamp}
+_USER_REFRESH_COOLDOWN: Dict[int, float] = {}
+_REFRESH_COOLDOWN_S = 30  # seconds
+
+# LIVE status strings (uppercase normalized)
+_LIVE_STATUSES = {
+    # Hockey
+    "P1", "P2", "P3", "OT", "BT",
+    # Football
+    "1H", "2H", "HT", "ET", "P",
+    # Basketball
+    "Q1", "Q2", "Q3", "Q4",
+    # MMA
+    "IN_PROGRESS", "R1", "R2", "R3", "R4", "R5",
+    # Tennis
+    "S1", "S2", "S3", "S4", "S5",
+    # Generic
+    "INPROGRESS", "LIVE",
+}
+
+
+def _is_live_match(status: str) -> bool:
+    """Detect if match is currently in progress."""
+    s = (status or "").strip().upper()
+    return s in _LIVE_STATUSES or "live" in s.lower() or "inprogress" in s.lower().replace("_", "")
+
+
+async def _fetch_live_extras(sport: str, match_id: str) -> Dict[str, Any]:
+    """Fetch LIVE statistics/events with 60s cache."""
+    key = f"{sport}:{match_id}"
+    now = time.time()
+
+    cached = _LIVE_DATA_CACHE.get(key)
+    if cached:
+        ts, data = cached
+        if now - ts < _LIVE_DATA_CACHE_TTL:
+            return data
+
+    try:
+        from .integrations.sport_api import SportAPIClient
+        api = SportAPIClient()
+        extras = await api.match_extras(sport, match_id)
+        _LIVE_DATA_CACHE[key] = (now, extras)
+        logger.info("LIVE extras fetched: sport=%s match=%s sources=%d",
+                     sport, match_id, len((extras or {}).get("sources", {})))
+        return extras
+    except Exception:
+        logger.exception("_fetch_live_extras failed sport=%s match=%s", sport, match_id)
+        return {}
+
+
+def _merge_extras_into_raw(raw: Dict[str, Any], extras: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge match_extras() results into raw dict for feature extraction."""
+    sources = extras.get("sources") or {}
+    stats_merged = False
+    events_merged = False
+
+    for path, data in sources.items():
+        if not data:
+            continue
+
+        # Statistics endpoint responses
+        if not stats_merged and ("statistics" in path or "stats" in path):
+            stats = None
+            if isinstance(data, dict):
+                # Unwrap: {data: [...]} or {response: [...]} or {statistics: [...]}
+                for k in ("data", "response", "statistics", "stats", "results"):
+                    v = data.get(k)
+                    if isinstance(v, (dict, list)):
+                        stats = v
+                        break
+                if stats is None and any(k in data for k in ("shotsOnGoal", "shots", "penalties")):
+                    stats = data  # direct stats object
+            elif isinstance(data, list):
+                stats = data
+
+            if stats is not None:
+                raw["statistics"] = stats
+                stats_merged = True
+                logger.info("LIVE stats merged from %s type=%s", path, type(stats).__name__)
+
+        # Events/incidents endpoint responses
+        if not events_merged and ("events" in path or "incidents" in path):
+            events = None
+            if isinstance(data, dict):
+                for k in ("data", "response", "events", "incidents", "results"):
+                    v = data.get(k)
+                    if isinstance(v, list):
+                        events = v
+                        break
+            elif isinstance(data, list):
+                events = data
+
+            if events is not None:
+                raw["events"] = events
+                events_merged = True
+                logger.info("LIVE events merged from %s count=%d", path, len(events))
+
+    return raw
+
 # Human-friendly sport labels used in UI texts (expand freely).
 API_SPORTS_LABELS: Dict[str, str] = {
     'ice-hockey': '🏒 Хоккей',
@@ -1397,11 +1501,36 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
         mode = "pre"
     if action not in {"overview", "pro", "refresh"}:
         action = "overview"
-    if action == "refresh":
-        action = "overview"
+
+    is_refresh = action == "refresh"
 
     match_meta = await _get_match_context(user_id, match_id)
     sport_slug = str(match_meta.get("sport") or "ice-hockey").strip().lower()
+
+    # ── Handle refresh: cooldown + cache invalidation ──
+    if is_refresh:
+        now_ts = time.time()
+        last_refresh = _USER_REFRESH_COOLDOWN.get(user_id, 0)
+        if now_ts - last_refresh < _REFRESH_COOLDOWN_S:
+            remaining = int(_REFRESH_COOLDOWN_S - (now_ts - last_refresh))
+            return f"⏳ Подожди {remaining} сек перед обновлением."
+        _USER_REFRESH_COOLDOWN[user_id] = now_ts
+        # Clear caches to force fresh data
+        _LIVE_DATA_CACHE.pop(f"{sport_slug}:{match_id}", None)
+        _LIVE_RENDER_BY_MATCH.pop((match_id, "overview"), None)
+        _LIVE_RENDER_BY_MATCH.pop((match_id, "pro"), None)
+        action = "overview"
+
+    # ── Fetch LIVE extras (statistics, events) for live matches ──
+    status_raw = str(match_meta.get("status") or "").strip()
+    if mode == "live" and _is_live_match(status_raw):
+        extras = await _fetch_live_extras(sport_slug, match_id)
+        if extras and extras.get("sources"):
+            raw = match_meta.get("raw") or {}
+            if not isinstance(raw, dict):
+                raw = {}
+            raw = _merge_extras_into_raw(dict(raw), extras)
+            match_meta["raw"] = raw
 
     # ── Enrich with external data (Odds API + Sports API + RSS) ──
     match_meta = await _enrich_match_meta(match_meta, sport_slug, mode)

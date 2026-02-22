@@ -6,11 +6,18 @@ Produces the formatted LIVE PRO block — no LLM required.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _DISCLAIMER = "ℹ️ Аналитический материал."
+
+try:
+    from zoneinfo import ZoneInfo
+    _MSK = ZoneInfo("Europe/Moscow")
+except Exception:
+    _MSK = None
 
 
 def render_pro_message(
@@ -23,41 +30,59 @@ def render_pro_message(
     Never raises — returns fallback on error.
     """
     try:
-        lines = []
-
-        # ── Header ──────────────────────────────────────────
-        lines.append("🟢 LIVE PRO")
-        lines.append("")
+        lines: List[str] = []
 
         teams = snapshot.get("teams") or {}
         home = teams.get("home") or "Хозяева"
         away = teams.get("away") or "Гости"
-        lines.append(f"{home} — {away}")
+        clock = snapshot.get("clock") or {}
+        score = snapshot.get("score") or {}
+        stats = snapshot.get("stats") or {}
+
+        # ── Header with period/time ──────────────────────────
+        header_parts = ["🟢 LIVE PRO"]
+        period = clock.get("period")
+        minute = clock.get("minute")
+        if period:
+            header_parts.append(f"П{period}")
+        if minute is not None:
+            header_parts.append(f"{minute}'")
+        lines.append(" | ".join(header_parts))
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Score line ──────────────────────────────────────
+        s_h = score.get("home")
+        s_a = score.get("away")
+        score_txt = f"{s_h}:{s_a}" if (s_h is not None and s_a is not None) else "–:–"
+        lines.append(f"🏒 {home} {score_txt} {away}")
 
         league = snapshot.get("league") or ""
         country = snapshot.get("country") or ""
         league_line = " • ".join(p for p in [league, country] if p)
         if league_line:
-            lines.append(league_line)
-
-        status_line = _render_status(snapshot)
-        if status_line:
-            lines.append(status_line)
+            lines.append(f"   {league_line}")
 
         # ── Rule 1: confidence < 2 → insufficient data message ──
         conf = signals.get("confidence") or {}
         conf_val = conf.get("value", 1)
         if conf_val < 2:
+            # Still show whatever stats/events we have
+            _render_stats_section(lines, stats)
+            _render_events_section(lines, snapshot.get("events") or [])
+
             lines.append("")
             lines.append("⚠️ Недостаточно данных для полного анализа.")
-            lines.append("")
-            lines.append("LIVE PRO требует бросков и/или коэффициентов.")
-            lines.append("Данные обновятся по ходу матча — попробуй позже.")
-            lines.append("")
-            lines.append("👉 Пока посмотри PRE-анализ (доступен до матча и во время).")
+            lines.append("Данные обновятся по ходу матча — нажми 🔄")
             lines.append("")
             lines.append(_DISCLAIMER)
+            _render_timestamp(lines)
             return "\n".join(lines)
+
+        # ── 📊 Статистика матча ────────────────────────────
+        _render_stats_section(lines, stats)
+
+        # ── ⚡ События ──────────────────────────────────────
+        _render_events_section(lines, snapshot.get("events") or [])
 
         # ── 📊 Control (MCI) ────────────────────────────────
         mci = signals.get("mci") or {}
@@ -73,7 +98,6 @@ def render_pro_message(
             lines.append(bullet)
 
         # ── 📈 Pressure / Momentum ───────────────────────────
-        stats = snapshot.get("stats") or {}
         shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
         shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
         momentum = signals.get("momentum") or {}
@@ -100,8 +124,20 @@ def render_pro_message(
 
         if ml_h is not None and ml_a is not None:
             lines.append("")
-            lines.append("📉 Market")
-            lines.append(f"• ML: Хозяева {ml_h} / Гости {ml_a}")
+            lines.append("📈 Коэффициенты LIVE")
+            lines.append(f"  П1: {ml_h}  |  П2: {ml_a}")
+
+            # Total
+            odds = snapshot.get("odds") or {}
+            t_line = odds.get("total_line")
+            t_over = odds.get("total_over")
+            t_under = odds.get("total_under")
+            if t_line is not None:
+                parts = [f"  ТБ {t_line}: {t_over or '—'}"]
+                if t_under is not None:
+                    parts.append(f"ТМ {t_line}: {t_under}")
+                lines.append("  |  ".join(parts))
+
             if market_status and market_status not in ("нет данных", "стабильно"):
                 drift_line = f"• Drift: {market_status}"
                 if market_explain:
@@ -168,12 +204,85 @@ def render_pro_message(
         # ── Footer ───────────────────────────────────────────
         lines.append("")
         lines.append(_DISCLAIMER)
+        _render_timestamp(lines)
 
         return "\n".join(lines)
 
     except Exception:
         logger.exception("render_pro_message failed")
         return "🟢 LIVE PRO\n\nОшибка отрисовки — попробуй позже.\n\nℹ️ Аналитический материал."
+
+
+# ---------------------------------------------------------------------------
+# Section renderers
+# ---------------------------------------------------------------------------
+
+def _render_stats_section(lines: List[str], stats: Dict[str, Any]) -> None:
+    """Render statistics table (shots, penalties, powerplay, etc.)."""
+    stat_lines = []
+
+    shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
+    shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
+    if shots_h is not None and shots_a is not None:
+        dominant = ""
+        if shots_h > shots_a * 1.3:
+            dominant = " (хозяева давят)"
+        elif shots_a > shots_h * 1.3:
+            dominant = " (гости давят)"
+        stat_lines.append(f"  Броски:     {shots_h} — {shots_a}{dominant}")
+
+    pen_h = stats.get("penalties_home")
+    pen_a = stats.get("penalties_away")
+    if pen_h is not None and pen_a is not None:
+        stat_lines.append(f"  Удаления:   {pen_h} — {pen_a}")
+
+    pp_h = stats.get("pp_home")
+    pp_a = stats.get("pp_away")
+    if pp_h is not None and pp_a is not None:
+        stat_lines.append(f"  Большинство: {pp_h} — {pp_a}")
+
+    # Football-specific
+    poss_h = stats.get("possession_home")
+    poss_a = stats.get("possession_away")
+    if poss_h is not None and poss_a is not None:
+        stat_lines.append(f"  Владение:   {poss_h}% — {poss_a}%")
+
+    corners_h = stats.get("corners_home")
+    corners_a = stats.get("corners_away")
+    if corners_h is not None and corners_a is not None:
+        stat_lines.append(f"  Угловые:    {corners_h} — {corners_a}")
+
+    xg_h = stats.get("xg_home")
+    xg_a = stats.get("xg_away")
+    if xg_h is not None and xg_a is not None:
+        stat_lines.append(f"  xG:         {xg_h} — {xg_a}")
+
+    if stat_lines:
+        lines.append("")
+        lines.append("📊 Статистика матча:")
+        lines.extend(stat_lines)
+
+
+def _render_events_section(lines: List[str], events: list) -> None:
+    """Render recent events section."""
+    if not events:
+        return
+    lines.append("")
+    lines.append("⚡ Последние события:")
+    for ev in events[:5]:
+        lines.append(f"  {ev}")
+
+
+def _render_timestamp(lines: List[str]) -> None:
+    """Add MSK timestamp to footer."""
+    try:
+        if _MSK:
+            now_msk = datetime.now(_MSK)
+        else:
+            now_msk = datetime.utcnow()
+        lines.append(f"⏱ Обновлено: {now_msk.strftime('%H:%M')} MSK")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

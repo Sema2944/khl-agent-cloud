@@ -95,6 +95,7 @@ def build_snapshot(
         score = _build_score(raw, match_meta)
         stats = _build_stats(raw)
         odds = _build_odds(odds_raw, raw)
+        events = _extract_events(raw, home, away)
 
         # Provider keys for debug
         keys_present = list(raw.keys())[:30] if isinstance(raw, dict) else []
@@ -110,6 +111,7 @@ def build_snapshot(
             "score": score,
             "stats": stats,
             "odds": odds,
+            "events": events,
             "meta": {
                 "provider_keys_present": keys_present,
                 "fetched_at_ts": int(time.time()),
@@ -450,5 +452,128 @@ def _empty_snapshot(match_meta: Dict[str, Any]) -> Dict[str, Any]:
                                     "dangerous_attacks_home", "dangerous_attacks_away", "corners_home", "corners_away")},
         "odds": {k: None for k in ("ml_home", "ml_away", "draw", "total_line", "total_over", "total_under",
                                    "hcp_line_home", "hcp_odds_home", "hcp_line_away", "hcp_odds_away")},
+        "events": [],
         "meta": {"provider_keys_present": [], "fetched_at_ts": int(time.time())},
     }
+
+
+# ---------------------------------------------------------------------------
+# Events extraction
+# ---------------------------------------------------------------------------
+
+def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "") -> list:
+    """
+    Parse events/incidents from raw API data.
+    Returns list of formatted event strings (most recent first), max 8.
+    """
+    try:
+        events_raw = raw.get("events") or raw.get("incidents") or []
+        if not isinstance(events_raw, list):
+            return []
+
+        parsed = []
+        for ev in events_raw:
+            if not isinstance(ev, dict):
+                continue
+
+            # Extract minute
+            minute = _i(
+                ev.get("minute") or ev.get("time") or ev.get("matchTime")
+                or _dig(ev, "time", "minute") or ev.get("clock")
+            )
+
+            # Extract event type
+            ev_type = str(
+                ev.get("type") or ev.get("incidentType") or ev.get("eventType")
+                or ev.get("name") or ""
+            ).strip().lower()
+
+            # Extract team info
+            team_raw = str(
+                ev.get("team") or ev.get("teamName")
+                or _dig(ev, "team", "name") or ""
+            ).strip()
+            # Resolve home/away labels
+            team_side = str(ev.get("teamSide") or ev.get("side") or "").lower()
+            if not team_raw and team_side:
+                if "home" in team_side:
+                    team_raw = home_name or "Хозяева"
+                elif "away" in team_side:
+                    team_raw = away_name or "Гости"
+
+            # Extract player
+            player = str(
+                ev.get("player") or ev.get("playerName")
+                or _dig(ev, "player", "name") or _dig(ev, "player", "shortName")
+                or ""
+            ).strip()
+
+            # Extract detail (penalty minutes, assist, etc.)
+            detail = str(
+                ev.get("detail") or ev.get("description") or ev.get("comment")
+                or ev.get("reason") or ""
+            ).strip()
+
+            # Format event line
+            emoji = _event_emoji(ev_type)
+            type_label = _event_label(ev_type)
+
+            parts = []
+            if minute is not None:
+                parts.append(f"{minute}'")
+            parts.append(f"{emoji} {type_label}")
+            if team_raw:
+                parts.append(f"— {team_raw}")
+            if player:
+                parts.append(f"({player})")
+            if detail:
+                parts.append(f"[{detail[:40]}]")
+
+            line = " ".join(parts)
+            parsed.append({"minute": minute or 0, "line": line})
+
+        # Sort by minute descending (most recent first)
+        parsed.sort(key=lambda x: x["minute"], reverse=True)
+        return [p["line"] for p in parsed[:8]]
+
+    except Exception:
+        logger.exception("_extract_events failed")
+        return []
+
+
+def _event_emoji(ev_type: str) -> str:
+    t = (ev_type or "").lower()
+    if "goal" in t or "гол" in t:
+        return "🏒"
+    if "penalt" in t or "удален" in t or "штраф" in t:
+        return "🟡"
+    if "card" in t:
+        if "red" in t:
+            return "🟥"
+        return "🟨"
+    if "subst" in t or "замен" in t:
+        return "🔄"
+    if "shot" in t or "бросок" in t:
+        return "🏒"
+    if "period" in t or "half" in t or "quarter" in t:
+        return "⏱"
+    return "▪️"
+
+
+def _event_label(ev_type: str) -> str:
+    t = (ev_type or "").lower()
+    if "goal" in t or "гол" in t:
+        return "Гол"
+    if "penalt" in t or "удален" in t:
+        return "Удаление"
+    if "yellow" in t or "жёлт" in t:
+        return "ЖК"
+    if "red" in t or "красн" in t:
+        return "КК"
+    if "subst" in t or "замен" in t:
+        return "Замена"
+    if "shot" in t or "бросок" in t:
+        return "Бросок"
+    if "period" in t:
+        return "Период"
+    return ev_type.capitalize()[:20] if ev_type else "Событие"
