@@ -307,6 +307,9 @@ class SportAPIClient:
         except Exception:
             logger.info("SportAPI init: base=%r timeout=%.1f", self.base, self.timeout_s)
 
+    # 404s on these path patterns are expected (many leagues lack these endpoints)
+    _SILENT_404_KEYWORDS = ("statistics", "lineups", "stats", "incidents")
+
     async def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base}{path}"
         timeout = httpx.Timeout(self.timeout_s)
@@ -316,15 +319,21 @@ class SportAPIClient:
         if r.status_code >= 400:
             txt = (r.text or "")[:800]
             err = SportAPIError(f"HTTP {r.status_code}: {txt}")
-            try:
-                from ..alerting import send_alert
-                import asyncio
-                asyncio.ensure_future(send_alert(
-                    "ERROR", "sport_api._get_json", err,
-                    context={"url": url, "status": r.status_code},
-                ))
-            except Exception:
-                pass
+            # Don't alert on expected 404s (statistics/lineups for leagues that lack them)
+            is_silent = (
+                r.status_code == 404
+                and any(kw in path.lower() for kw in self._SILENT_404_KEYWORDS)
+            )
+            if not is_silent:
+                try:
+                    from ..alerting import send_alert
+                    import asyncio
+                    asyncio.ensure_future(send_alert(
+                        "ERROR", "sport_api._get_json", err,
+                        context={"url": url, "status": r.status_code},
+                    ))
+                except Exception:
+                    pass
             raise err
 
         try:

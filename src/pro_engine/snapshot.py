@@ -466,6 +466,9 @@ def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "
     Parse events/incidents from raw API data.
     Returns list of formatted event strings (most recent first), max 8.
     """
+    _SKIP_EVENT_TYPES = {"period", "period_start", "period_end", "whistle",
+                          "periodstart", "periodend", "half", "halfstart", "halfend"}
+
     try:
         events_raw = raw.get("events") or raw.get("incidents") or []
         if not isinstance(events_raw, list):
@@ -488,6 +491,10 @@ def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "
                 or ev.get("name") or ""
             ).strip().lower()
 
+            # Skip period/whistle noise events
+            if ev_type.replace("_", "").replace("-", "") in _SKIP_EVENT_TYPES:
+                continue
+
             # Extract team info
             team_raw = str(
                 ev.get("team") or ev.get("teamName")
@@ -500,6 +507,11 @@ def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "
                     team_raw = home_name or "Хозяева"
                 elif "away" in team_side:
                     team_raw = away_name or "Гости"
+            # Replace literal "home"/"away" with real team names
+            if team_raw.lower() == "home":
+                team_raw = home_name or "Хозяева"
+            elif team_raw.lower() == "away":
+                team_raw = away_name or "Гости"
 
             # Extract player
             player = str(

@@ -50,12 +50,15 @@ def compute_signals(
         prev_stats = (prev_snapshot or {}).get("stats") or {}
         prev_odds = (prev_snapshot or {}).get("odds") or {}
 
+        has_events = bool(snapshot.get("events"))
+
         signals = {
             "mci": _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a),
             "momentum": _compute_momentum(shots_h, shots_a, prev_stats),
             "market": _compute_market(ml_h, ml_a, prev_odds, shots_h, shots_a),
             "risk": _compute_risk(shots_h, shots_a, ml_h, ml_a, score_h, score_a, period, minute, pen_h, pen_a, prev_odds),
-            "confidence": _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute),
+            "confidence": _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute,
+                                               score_h=score_h, score_a=score_a, has_events=has_events),
             "data_flags": _data_flags(shots_h, shots_a, ml_h, ml_a, period, pen_h, pen_a),
         }
 
@@ -302,11 +305,14 @@ def _compute_risk(
 # Confidence 1..5
 # ---------------------------------------------------------------------------
 
-def _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute) -> Dict[str, Any]:
+def _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute,
+                         score_h=None, score_a=None, has_events: bool = False) -> Dict[str, Any]:
     has_shots = shots_h is not None and shots_a is not None
     has_odds = ml_h is not None and ml_a is not None
     has_clock = period is not None
-    inputs = [x for x, f in [("shots", has_shots), ("odds", has_odds), ("clock", has_clock)] if f]
+    has_score = score_h is not None and score_a is not None
+    inputs = [x for x, f in [("shots", has_shots), ("odds", has_odds), ("clock", has_clock),
+                               ("score", has_score), ("events", has_events)] if f]
 
     if has_shots and has_odds and has_clock:
         value, explain = 5, "shots + odds + clock"
@@ -316,6 +322,12 @@ def _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute) -> Dict[st
         value, explain = 4, "shots + odds (нет времени)"
     elif has_shots:
         value, explain = 3, "только броски"
+    elif has_score and has_events and has_clock:
+        value, explain = 3, "счёт + события + время (нет бросков)"
+    elif has_score and has_clock:
+        value, explain = 2, "счёт + время (нет бросков и коэффициентов)"
+    elif has_score and has_events:
+        value, explain = 2, "счёт + события (нет бросков)"
     elif has_odds:
         value, explain = 2, "только коэффициенты"
     else:
