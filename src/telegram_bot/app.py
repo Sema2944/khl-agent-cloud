@@ -2098,6 +2098,10 @@ async def telegram_shutdown() -> None:
 # ============================================================
 telegram_router = APIRouter()
 
+# Deduplication: Telegram may retry webhooks — skip already-processed update_ids
+_seen_update_ids: set = set()
+_SEEN_MAX = 500  # keep last N to avoid memory growth
+
 
 @telegram_router.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
@@ -2106,6 +2110,19 @@ async def telegram_webhook(request: Request):
     if _telegram_app is None:
         logger.error("Telegram webhook received, but PTB app is not initialized (_telegram_app is None)")
         return JSONResponse({"ok": False, "error": "ptb_not_initialized"}, status_code=503)
+
+    # Deduplicate: skip if we already processed this update_id
+    update_id = payload.get("update_id")
+    if update_id is not None:
+        if update_id in _seen_update_ids:
+            logger.debug("Skipping duplicate update_id=%s", update_id)
+            return JSONResponse({"ok": True})
+        _seen_update_ids.add(update_id)
+        # Trim set to avoid unbounded growth
+        if len(_seen_update_ids) > _SEEN_MAX:
+            # Remove oldest entries (approx — sets are unordered, but update_ids are monotonic)
+            to_remove = sorted(_seen_update_ids)[:_SEEN_MAX // 2]
+            _seen_update_ids.difference_update(to_remove)
 
     try:
         upd = Update.de_json(payload, _telegram_app.bot)

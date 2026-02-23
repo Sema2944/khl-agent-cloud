@@ -495,11 +495,15 @@ def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "
             if ev_type.replace("_", "").replace("-", "") in _SKIP_EVENT_TYPES:
                 continue
 
-            # Extract team info
-            team_raw = str(
-                ev.get("team") or ev.get("teamName")
-                or _dig(ev, "team", "name") or ""
-            ).strip()
+            # Extract team info (may be dict or string)
+            _team_val = ev.get("team")
+            if isinstance(_team_val, dict):
+                team_raw = str(_team_val.get("name") or _team_val.get("shortName") or "").strip()
+            else:
+                team_raw = str(
+                    _team_val or ev.get("teamName")
+                    or _dig(ev, "team", "name") or ""
+                ).strip()
             # Resolve home/away labels
             team_side = str(ev.get("teamSide") or ev.get("side") or "").lower()
             if not team_raw and team_side:
@@ -513,12 +517,16 @@ def _extract_events(raw: Dict[str, Any], home_name: str = "", away_name: str = "
             elif team_raw.lower() == "away":
                 team_raw = away_name or "Гости"
 
-            # Extract player
-            player = str(
-                ev.get("player") or ev.get("playerName")
-                or _dig(ev, "player", "name") or _dig(ev, "player", "shortName")
-                or ""
-            ).strip()
+            # Extract player (may be dict or string)
+            _player_val = ev.get("player")
+            if isinstance(_player_val, dict):
+                player = str(_player_val.get("name") or _player_val.get("shortName") or "").strip()
+            else:
+                player = str(
+                    _player_val or ev.get("playerName")
+                    or _dig(ev, "player", "name") or _dig(ev, "player", "shortName")
+                    or ""
+                ).strip()
 
             # Extract detail (penalty minutes, assist, etc.)
             detail = str(
