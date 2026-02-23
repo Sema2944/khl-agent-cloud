@@ -62,21 +62,9 @@ def render_pro_message(
         if league_line:
             lines.append(f"   {league_line}")
 
-        # ── Rule 1: confidence < 2 → insufficient data message ──
+        # ── Confidence ──
         conf = signals.get("confidence") or {}
         conf_val = conf.get("value", 1)
-        if conf_val < 2:
-            # Still show whatever stats/events we have
-            _render_stats_section(lines, stats)
-            _render_events_section(lines, snapshot.get("events") or [])
-
-            lines.append("")
-            lines.append("⚠️ Недостаточно данных для полного анализа.")
-            lines.append("Данные обновятся по ходу матча — нажми 🔄")
-            lines.append("")
-            lines.append(_DISCLAIMER)
-            _render_timestamp(lines)
-            return "\n".join(lines)
 
         # ── 📊 Статистика матча ────────────────────────────
         _render_stats_section(lines, stats)
@@ -200,6 +188,11 @@ def render_pro_message(
             data_parts.append("✗ " + ", ".join(miss))
         if data_parts:
             lines.append("• Data: " + " | ".join(data_parts))
+
+        # ── Low-data hint (inline, not blocking) ─────────────
+        if conf_val <= 2:
+            lines.append("")
+            lines.append("💡 Данные обновятся по ходу матча — нажми 🔄")
 
         # ── Footer ───────────────────────────────────────────
         lines.append("")
