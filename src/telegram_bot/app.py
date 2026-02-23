@@ -1339,20 +1339,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
-    # PRO:<tariff_key> — временная заглушка (до подключения ЮKassa)
+    # PRO:<tariff_key> — send invoice for payment (ЮKassa or Stars)
     if data.startswith("PRO:") and data != "PRO:TRIAL":
         tariff_key = data.split(":", 1)[1].strip().lower()
         try:
-            from .payments import pro_stub_text, kb_pro_stub
-            txt = pro_stub_text(tariff_key)
-            kb = kb_pro_stub()
+            from .payments import send_invoice
+            await q.answer()
+            await send_invoice(update, context, tariff_key)
         except Exception:
-            txt = "💳 Подключение оплаты в процессе.\nОплата станет доступна в ближайшее время!"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="MENU:PREMIUM")]])
-        try:
-            await q.edit_message_text(txt, reply_markup=kb)
-        except Exception:
-            await q.message.reply_text(txt, reply_markup=kb)
+            logger.exception("send_invoice failed for tariff=%s", tariff_key)
+            await q.answer("Ошибка при создании счёта. Попробуй позже.", show_alert=True)
         return
 
     # PRO:TRIAL — активация бесплатного пробного периода
