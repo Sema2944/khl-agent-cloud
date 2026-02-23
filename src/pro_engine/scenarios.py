@@ -172,17 +172,53 @@ def _build_main(
 def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_value) -> Dict[str, Any]:
     has_score = score_h is not None and score_a is not None
     score_txt = f"{score_h}:{score_a}" if has_score else "–:–"
-    tense = has_score and abs(score_h - score_a) <= 1
     period_txt = f" в {period}-м периоде" if period else ""
 
-    return {
-        "name": "Равная борьба",
-        "description": (
+    goals_scored = has_score and (score_h + score_a) > 0
+    score_equal = has_score and score_h == score_a
+    score_diff = abs(score_h - score_a) if has_score else 0
+
+    # MCI text — hide when None
+    mci_txt = f" MCI ≈ {mci_value}/100." if mci_value is not None else ""
+
+    if not has_score or score_equal:
+        # 0:0, 1:1, 2:2 — truly equal
+        name = "Равная борьба"
+        if goals_scored:
+            description = (
+                f"Счёт {score_txt}{period_txt}. "
+                f"Команды идут вровень — высокая напряжённость.{mci_txt}"
+            )
+            trigger = "следующий гол определит ход матча"
+        else:
+            description = (
+                f"Счёт {score_txt}{period_txt}. "
+                f"Команды уравновешены по показателям.{mci_txt}"
+            )
+            trigger = "первый гол или удаление сломает равновесие"
+    elif score_diff == 1:
+        # 1:0, 0:1, 2:1 — minimal advantage
+        leading = home_name if score_h > score_a else away_name
+        name = f"Минимальное преимущество {leading}"
+        description = (
             f"Счёт {score_txt}{period_txt}. "
-            f"{'Минимальная разница — высокая напряжённость.' if tense else 'Команды уравновешены по показателям.'} "
-            f"MCI ≈ {mci_value}/100."
-        ),
-        "trigger": "первый гол или удаление сломает равновесие",
+            f"{leading} ведёт с минимальным отрывом — интрига сохраняется.{mci_txt}"
+        )
+        trigger = "следующий гол: усиление отрыва или возврат к равенству"
+    else:
+        # 2:0+ — MCI says "equal" but score doesn't
+        leading = home_name if score_h > score_a else away_name
+        name = f"Лидерство {leading}"
+        description = (
+            f"Счёт {score_txt}{period_txt}. "
+            f"{leading} впереди, но показатели команд близки.{mci_txt}"
+        )
+        trigger = f"гол проигрывающей команды или усиление доминирования {leading}"
+
+    return {
+        "name": name,
+        "description": description,
+        "trigger": trigger,
         "team": "neutral",
         "confidence": 0.55,
     }
@@ -208,10 +244,16 @@ def _build_alt(
         under_side = "home"
     else:
         # Already even — alt is a scoring burst
+        has_score = score_h is not None and score_a is not None
+        goals_scored = has_score and (score_h + score_a) > 0
         return {
             "name": "Burst одной из команд",
-            "description": "При первом голе ситуация может резко измениться в пользу забившей команды.",
-            "trigger": "первый гол",
+            "description": (
+                "Следующий гол может резко изменить баланс в пользу забившей команды."
+                if goals_scored else
+                "При первом голе ситуация может резко измениться в пользу забившей команды."
+            ),
+            "trigger": "следующий гол" if goals_scored else "первый гол",
             "team": "neutral",
             "confidence": 0.45,
         }
