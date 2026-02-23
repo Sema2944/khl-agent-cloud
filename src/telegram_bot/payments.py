@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PAYMENTS_PROVIDER_TOKEN = (os.getenv("PAYMENTS_PROVIDER_TOKEN") or "").strip()
+PAYMENTS_PROVIDER_TOKEN = (
+    os.getenv("YUKASSA_PROVIDER_TOKEN")
+    or os.getenv("PAYMENTS_PROVIDER_TOKEN")
+    or ""
+).strip()
 
 # If no provider token → we use Telegram Stars (XTR currency, no юрлицо needed)
 def _use_stars() -> bool:
