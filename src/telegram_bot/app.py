@@ -1128,6 +1128,69 @@ async def handle_hunter_refresh(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def handle_hunter_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /hunter_status — статус Охотника (только OWNER_IDS)."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    from ..daily_pro import get_hunter_status
+    info = get_hunter_status()
+
+    last_run = info.get("last_run_at")
+    if last_run:
+        last_run_txt = last_run.strftime("%d.%m.%Y %H:%M MSK")
+    else:
+        last_run_txt = "никогда"
+
+    status_map = {
+        "never_run": "⚪ Не запускался",
+        "running": "🟡 Запущен сейчас",
+        "done": "🟢 Завершён",
+        "error": "🔴 Ошибка",
+    }
+    status_txt = status_map.get(info.get("status", ""), info.get("status", "?"))
+
+    picks_count = info.get("picks_count", 0)
+    users_sent = info.get("users_sent", 0)
+
+    # Next run: 08:00 UTC
+    from datetime import timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    target = now_utc.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now_utc >= target:
+        target += timedelta(days=1)
+    next_run_seconds = int((target - now_utc).total_seconds())
+    next_run_hours = next_run_seconds // 3600
+    next_run_mins = (next_run_seconds % 3600) // 60
+
+    # Today's picks from DB
+    picks_in_db = _get_today_picks()
+    db_top3 = [p for p in picks_in_db if p.get("pick_type") == "top3"]
+
+    lines = [
+        "📊 Hunter Status",
+        "",
+        f"Статус: {status_txt}",
+        f"Последний запуск: {last_run_txt}",
+        f"Пиков сгенерировано: {picks_count}",
+        f"Пиков в БД (сегодня): {len(db_top3)}",
+        f"Юзеров получили рассылку: {users_sent}",
+        "",
+        f"Следующий запуск: через {next_run_hours}ч {next_run_mins}мин (08:00 UTC)",
+    ]
+
+    error = info.get("error")
+    if error:
+        lines.append(f"\n❌ Ошибка: {str(error)[:200]}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # 🔴 LIVE — all in-progress matches across all sports (PRO only)
 # ---------------------------------------------------------------------------
@@ -1961,6 +2024,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("pro", handle_pro))
     app.add_handler(CommandHandler("hunter", handle_hunter))
     app.add_handler(CommandHandler("hunter_refresh", handle_hunter_refresh))
+    app.add_handler(CommandHandler("hunter_status", handle_hunter_status))
 
     # Payments: pre-checkout + successful payment
     try:

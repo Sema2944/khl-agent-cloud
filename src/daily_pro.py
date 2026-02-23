@@ -22,9 +22,22 @@ from sqlmodel import Session
 from .db import engine
 from .integrations.sport_api import SportAPIClient
 from .llm_client import analyze_with_llm_cached
+from .pro_db import OWNER_IDS
 
 logger = logging.getLogger(__name__)
 MSK = ZoneInfo("Europe/Moscow")
+
+# ---------------------------------------------------------------------------
+# Hunter run status (module-level, survives across calls)
+# ---------------------------------------------------------------------------
+_hunter_run_info: Dict[str, Any] = {
+    "last_run_at": None,       # datetime (MSK)
+    "picks_count": 0,
+    "users_sent": 0,
+    "users_total": 0,
+    "status": "never_run",     # "never_run" | "running" | "done" | "error"
+    "error": None,
+}
 
 HUNTER_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "mma"]
 
@@ -600,8 +613,15 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
     return "\n".join(lines)
 
 
-async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: date) -> None:
-    """Send hunter picks to all PRO users and trial users."""
+async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: date) -> int:
+    """Send hunter picks to all PRO users, trial users, and OWNER_IDS.
+
+    Returns number of users successfully sent to.
+    """
+    if not picks:
+        logger.warning("Hunter broadcast: no picks to send")
+        return 0
+
     try:
         with Session(engine) as s:
             rows = s.exec(
@@ -614,13 +634,19 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
                       )
                 """)
             ).all()
-            user_ids = [r[0] for r in rows if r[0]]
+            user_ids = set(r[0] for r in rows if r[0])
     except Exception:
         logger.exception("Hunter broadcast: failed to fetch users")
-        return
+        user_ids = set()
 
-    if not picks or not user_ids:
-        return
+    # OWNER_IDS always receives broadcast (even if not formally PRO)
+    user_ids.update(OWNER_IDS)
+
+    if not user_ids:
+        logger.warning("Hunter broadcast: no PRO users to send (OWNER_IDS also empty)")
+        return 0
+
+    logger.info("Hunter: sending broadcast to %d users (incl. %d owners)", len(user_ids), len(OWNER_IDS))
 
     msg = _format_hunter_message(picks, pick_date)
 
@@ -633,6 +659,7 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
             logger.warning("Hunter broadcast failed for user %s", uid)
 
     logger.info("Hunter: broadcast sent to %d/%d users", sent, len(user_ids))
+    return sent
 
     # Check for expired trial users → send trial-ended message
     try:
@@ -670,90 +697,118 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
 async def run_daily_hunter(bot=None) -> None:
     """Main entry point for daily hunter job (v2)."""
     logger.info("Hunter v2: starting daily run")
-    today = datetime.now(MSK).date()
+    _hunter_run_info["status"] = "running"
+    _hunter_run_info["error"] = None
+    _hunter_run_info["last_run_at"] = datetime.now(MSK)
 
-    # 1. Fetch all matches
-    matches = await _fetch_all_matches_today()
-    logger.info("Hunter: fetched %d matches total", len(matches))
+    try:
+        today = datetime.now(MSK).date()
 
-    # 2. Filter: only scheduled + top leagues
-    filtered = _filter_matches(matches)
-    logger.info("Hunter: %d matches after filtering", len(filtered))
+        # 1. Fetch all matches
+        matches = await _fetch_all_matches_today()
+        logger.info("Hunter: fetched %d matches total", len(matches))
 
-    if not filtered:
-        logger.warning("Hunter: no matches found after filtering")
-        return
+        # 2. Filter: only scheduled + top leagues
+        filtered = _filter_matches(matches)
+        logger.info("Hunter: %d matches after TOP_LEAGUES filter", len(filtered))
 
-    # 3. Deterministic scoring (fast, no LLM)
-    for m in filtered:
-        m["det_score"] = _deterministic_score(m)
+        if not filtered:
+            logger.warning("Hunter: no matches found after filtering — aborting")
+            _hunter_run_info["status"] = "done"
+            _hunter_run_info["picks_count"] = 0
+            _hunter_run_info["users_sent"] = 0
+            _hunter_run_info["users_total"] = 0
+            return
 
-    filtered.sort(key=lambda x: x.get("det_score", 0), reverse=True)
-    top_candidates = filtered[:10]
-    logger.info("Hunter: top-10 candidates selected (scores: %s)",
-                [f"{m.get('det_score', 0):.0f}" for m in top_candidates])
+        # 3. Deterministic scoring (fast, no LLM)
+        for m in filtered:
+            m["det_score"] = _deterministic_score(m)
 
-    # 4. Enrich odds for top candidates
-    for m in top_candidates:
-        await _enrich_odds(m)
-        await asyncio.sleep(0.3)
+        filtered.sort(key=lambda x: x.get("det_score", 0), reverse=True)
+        top_candidates = filtered[:10]
+        logger.info("Hunter: top-10 candidates selected (scores: %s)",
+                    [f"{m.get('det_score', 0):.0f}" for m in top_candidates])
 
-    # 5. AI analysis for top candidates
-    scored = []
-    for m in top_candidates:
-        result = await _ai_analyze_match(m)
-        scored.append(result)
-        await asyncio.sleep(0.5)  # rate limit
+        # 4. Enrich odds for top candidates
+        for m in top_candidates:
+            await _enrich_odds(m)
+            await asyncio.sleep(0.3)
 
-    # 6. Rank by AI confidence
-    scored.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        # 5. AI analysis for top candidates
+        scored = []
+        for m in top_candidates:
+            result = await _ai_analyze_match(m)
+            scored.append(result)
+            await asyncio.sleep(0.5)  # rate limit
 
-    # 7. Diversify: max 2 per sport, but always try to get 3
-    top3: List[Dict[str, Any]] = []
-    sport_count: Dict[str, int] = defaultdict(int)
-    used_ids: set = set()
+        # 6. Rank by AI confidence
+        scored.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
-    for m in scored:
-        sport = m.get("sport_slug", "")
-        if sport_count[sport] >= 2:
-            continue
-        top3.append(m)
-        used_ids.add(m.get("match_id"))
-        sport_count[sport] += 1
-        if len(top3) == 3:
-            break
+        # 7. Diversify: max 2 per sport, but always try to get 3
+        top3: List[Dict[str, Any]] = []
+        sport_count: Dict[str, int] = defaultdict(int)
+        used_ids: set = set()
 
-    # Fallback: if < 3 after diversification, fill from remaining (ignore sport limit)
-    if len(top3) < 3:
         for m in scored:
-            if m.get("match_id") in used_ids:
+            sport = m.get("sport_slug", "")
+            if sport_count[sport] >= 2:
                 continue
             top3.append(m)
             used_ids.add(m.get("match_id"))
+            sport_count[sport] += 1
             if len(top3) == 3:
                 break
 
-    if not top3:
-        logger.warning("Hunter: no picks with confidence after AI analysis")
-        return
+        # Fallback: if < 3 after diversification, fill from remaining (ignore sport limit)
+        if len(top3) < 3:
+            for m in scored:
+                if m.get("match_id") in used_ids:
+                    continue
+                top3.append(m)
+                used_ids.add(m.get("match_id"))
+                if len(top3) == 3:
+                    break
 
-    for p in top3:
-        p["pick_type"] = "top3"
+        if not top3:
+            logger.warning("Hunter: no picks with confidence after AI analysis — aborting")
+            _hunter_run_info["status"] = "done"
+            _hunter_run_info["picks_count"] = 0
+            return
 
-    logger.info("Hunter: top-3 selected: %s",
-                [(p.get("title", "")[:30], f"{p.get('confidence', 0):.0%}") for p in top3])
+        for p in top3:
+            p["pick_type"] = "top3"
 
-    # 8. Build express
-    picks = list(top3)
-    if len(top3) >= 2:
-        express = _build_express(top3, today)
-        picks.append(express)
+        logger.info("Hunter: selected %d picks: %s",
+                    len(top3),
+                    [(p.get("title", "")[:30], f"{p.get('confidence', 0):.0%}") for p in top3])
 
-    # 9. Save to DB
-    _save_picks(picks, today)
+        # 8. Build express
+        picks = list(top3)
+        if len(top3) >= 2:
+            express = _build_express(top3, today)
+            picks.append(express)
 
-    # 10. Broadcast
-    if bot:
-        await _broadcast_to_pro_users(bot, picks, today)
+        # 9. Save to DB
+        _save_picks(picks, today)
+        _hunter_run_info["picks_count"] = len(top3)  # only top3, not express
 
-    logger.info("Hunter v2: daily run complete (%d picks)", len(picks))
+        # 10. Broadcast
+        sent = 0
+        if bot:
+            sent = await _broadcast_to_pro_users(bot, picks, today)
+        else:
+            logger.info("Hunter: bot=None, skipping broadcast")
+
+        _hunter_run_info["users_sent"] = sent
+        _hunter_run_info["status"] = "done"
+        logger.info("Hunter v2: done — %d picks, sent to %d users", len(top3), sent)
+
+    except Exception as exc:
+        _hunter_run_info["status"] = "error"
+        _hunter_run_info["error"] = str(exc)
+        logger.exception("Hunter v2: run failed")
+
+
+def get_hunter_status() -> Dict[str, Any]:
+    """Return current Hunter run status for /hunter_status command."""
+    return dict(_hunter_run_info)
