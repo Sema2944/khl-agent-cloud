@@ -308,7 +308,7 @@ class SportAPIClient:
             logger.info("SportAPI init: base=%r timeout=%.1f", self.base, self.timeout_s)
 
     # 404s on these path patterns are expected (many leagues lack these endpoints)
-    _SILENT_404_KEYWORDS = ("statistics", "lineups", "stats", "incidents", "events", "odds")
+    _SILENT_404_KEYWORDS = ("statistics", "lineups", "stats", "incidents", "events", "odds", "tennis")
 
     async def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base}{path}"
@@ -1378,7 +1378,17 @@ class SportAPIClient:
                     return dto
             except Exception as e:
                 last_err = e
-                logger.warning("ESPN Tennis match_details failed for %s: %s", match_id, e)
+                logger.debug("ESPN Tennis match_details failed for %s: %s", match_id, e)
+            # Fallback: build minimal DTO from matches_by_date scoreboard cache
+            try:
+                from datetime import date as _date
+                today = _date.today()
+                matches = await self.matches_by_date("tennis", today)
+                for m in matches:
+                    if str(getattr(m, "id", "")) == str(match_id):
+                        return m
+            except Exception:
+                logger.debug("Tennis scoreboard fallback also failed for %s", match_id)
             raise SportAPIError(f"match_details failed: tennis/{match_id}: {last_err}")
 
         # ── MMA: use ESPN (ESPN IDs don't exist in api-sports.io) ──
