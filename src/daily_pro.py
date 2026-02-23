@@ -659,7 +659,6 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
             logger.warning("Hunter broadcast failed for user %s", uid)
 
     logger.info("Hunter: broadcast sent to %d/%d users", sent, len(user_ids))
-    return sent
 
     # Check for expired trial users → send trial-ended message
     try:
@@ -689,6 +688,8 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
                 pass
     except Exception:
         logger.exception("Hunter: trial expiry check failed")
+
+    return sent
 
 
 # ---------------------------------------------------------------------------

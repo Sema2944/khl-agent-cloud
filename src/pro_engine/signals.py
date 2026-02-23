@@ -328,6 +328,9 @@ def _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute,
         value, explain = 2, "счёт + время (нет бросков и коэффициентов)"
     elif has_score and has_events:
         value, explain = 2, "счёт + события (нет бросков)"
+    elif has_score:
+        # LIVE match with score (even 0:0 at start) — always show analysis
+        value, explain = 2, "счёт (начало матча, данные обновятся)"
     elif has_odds:
         value, explain = 2, "только коэффициенты"
     else:
