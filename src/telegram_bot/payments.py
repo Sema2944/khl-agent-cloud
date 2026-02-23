@@ -336,6 +336,31 @@ async def handle_successful_payment(
         user_id, tariff.key, amount, currency,
     )
 
+    # Create receipt for tax compliance (only for RUB payments via ЮKassa)
+    receipt_url: Optional[str] = None
+    if not use_stars:
+        try:
+            from ..receipts import create_receipt
+            _username = getattr(update.effective_user, "username", None) or ""
+            receipt_url = create_receipt(
+                amount=float(tariff.price_rub),
+                service_name=f"PRO подписка Betly ({tariff.label}, {tariff.days} дн.)",
+                client_name=f"@{_username}" if _username else None,
+            )
+            await msg.reply_text(f"🧾 Ваш чек: {receipt_url}")
+            logger.info("Receipt sent: user=%s url=%s", user_id, receipt_url)
+        except Exception as _rcpt_err:
+            logger.exception("Receipt creation failed user=%s", user_id)
+            try:
+                from ..alerting import send_alert
+                await send_alert(
+                    "WARNING", "payments.receipt", _rcpt_err,
+                    user_id=user_id,
+                    context={"amount": tariff.price_rub, "tariff": tariff.key},
+                )
+            except Exception:
+                pass
+
     # Notify admin about new payment
     try:
         admin_id = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
@@ -349,6 +374,8 @@ async def handle_successful_payment(
                 f"Метод: {'Stars' if use_stars else 'ЮKassa'}\n"
                 f"Telegram charge: {sp.telegram_payment_charge_id or '—'}"
             )
+            if receipt_url:
+                admin_text += f"\n🧾 Чек: {receipt_url}"
             await context.bot.send_message(chat_id=admin_id, text=admin_text)
     except Exception:
         logger.debug("Failed to notify admin about payment user=%s", user_id)
