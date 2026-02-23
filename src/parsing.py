@@ -940,15 +940,16 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
                 )
             except Exception as _md_err:
                 logger.exception("match_details refresh failed; will try day-list refresh")
-                try:
-                    from .alerting import send_alert
-                    import asyncio
-                    asyncio.ensure_future(send_alert(
-                        "WARNING", "parsing.match_details_refresh", _md_err,
-                        user_id=user_id, context={"match_id": match_id, "sport": sport},
-                    ))
-                except Exception:
-                    pass
+                if sport != "tennis":  # tennis match_details fails often — known bug, no alert
+                    try:
+                        from .alerting import send_alert
+                        import asyncio
+                        asyncio.ensure_future(send_alert(
+                            "WARNING", "parsing.match_details_refresh", _md_err,
+                            user_id=user_id, context={"match_id": match_id, "sport": sport},
+                        ))
+                    except Exception:
+                        pass
 
             if (not str(merged.get("score") or "").strip()) or (not str(merged.get("status") or "").strip()):
                 day = _extract_date_from_start_time(str(merged.get("start_time") or "")) or _msk_today_date()
@@ -997,15 +998,16 @@ async def _get_match_context(user_id: int, match_id: str) -> Dict[str, Any]:
             }
         except Exception as _cm_err:
             logger.exception("match_details on cache miss failed; will try day-list refresh")
-            try:
-                from .alerting import send_alert
-                import asyncio
-                asyncio.ensure_future(send_alert(
-                    "WARNING", "parsing.match_details_cache_miss", _cm_err,
-                    user_id=user_id, context={"match_id": match_id, "sport": sport},
-                ))
-            except Exception:
-                pass
+            if sport != "tennis":  # tennis match_details fails often — known bug, no alert
+                try:
+                    from .alerting import send_alert
+                    import asyncio
+                    asyncio.ensure_future(send_alert(
+                        "WARNING", "parsing.match_details_cache_miss", _cm_err,
+                        user_id=user_id, context={"match_id": match_id, "sport": sport},
+                    ))
+                except Exception:
+                    pass
 
         refreshed = await _refresh_match_from_day_list(sport, match_id, _msk_today_date())
         if refreshed:
