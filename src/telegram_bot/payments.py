@@ -5,7 +5,7 @@ Payment system: multi-tier tariffs (RUB via ЮKassa + Telegram Stars).
 Tariffs:
   - week   (7 дней)   — 299₽  / 150 Stars
   - month  (30 дней)  — 799₽  / 400 Stars
-  - season (180 дней) — 4990₽ / 2500 Stars
+  - season (180 дней) — 3990₽ / 2000 Stars
 
 Flow: kb_tariffs → send_invoice → pre_checkout → successful_payment → grant_pro
 """
@@ -60,7 +60,7 @@ TARIFFS: Dict[str, Tariff] = {
     ),
     "season": Tariff(
         key="season", label="Сезон", days=180,
-        price_rub=4990, price_stars=2500, emoji="🏆",
+        price_rub=3990, price_stars=2000, emoji="🏆",
     ),
 }
 
@@ -82,7 +82,7 @@ def tariff_text() -> str:
         "━━━━━━━━━━━━━━━━━━\n"
         "📅 Неделя — 299 ₽\n"
         "📅 Месяц — 799 ₽ (экономия 25%)\n"
-        "📅 Сезон — 4 990 ₽ (экономия 40%)\n\n"
+        "📅 Сезон — 3 990 ₽ (экономия 17%)\n\n"
         "✅ Отмена в любой момент\n"
         "✅ Оплата картой прямо в Telegram"
     )
@@ -92,7 +92,7 @@ def kb_tariffs() -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = [
         [InlineKeyboardButton("📅 Неделя — 299 ₽", callback_data="PRO:week")],
         [InlineKeyboardButton("📅 Месяц — 799 ₽ ⭐ Популярный", callback_data="PRO:month")],
-        [InlineKeyboardButton("📅 Сезон — 4 990 ₽ 🔥 -40%", callback_data="PRO:season")],
+        [InlineKeyboardButton("📅 Сезон — 3 990 ₽ 🔥 -17%", callback_data="PRO:season")],
         [InlineKeyboardButton("⬅️ Назад в меню", callback_data="BACK:MENU")],
     ]
     return InlineKeyboardMarkup(rows)

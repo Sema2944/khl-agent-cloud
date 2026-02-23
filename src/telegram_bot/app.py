@@ -281,7 +281,7 @@ def _text_buy_pro(user_id: int) -> str:
             "━━━━━━━━━━━━━━━━━━\n"
             "📅 Неделя — 299 ₽\n"
             "📅 Месяц — 799 ₽ (экономия 25%)\n"
-            "📅 Сезон — 4 990 ₽ (экономия 40%)\n\n"
+            "📅 Сезон — 3 990 ₽ (экономия 17%)\n\n"
             "✅ Отмена в любой момент\n"
             "✅ Оплата картой прямо в Telegram"
         )
@@ -1172,7 +1172,7 @@ async def _handle_live_button(update: Update, user_id: int) -> None:
                 title = (m.title or "Матч")[:40]
                 league = (m.league or "")[:20]
                 lines.append(f"  {emoji} {start} {title} ({league})")
-        lines.append("\n🔔 Подпишись на PRO — получай уведомления о начале матчей!")
+        lines.append("\n💡 Матчи обычно начинаются с 12:00 MSK")
         await update.message.reply_text(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup([
@@ -1773,7 +1773,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     title = (m.title or "Матч")[:40]
                     league = (m.league or "")[:20]
                     lines.append(f"  {emoji} {start} {title} ({league})")
-            lines.append("\n🔔 Подпишись на PRO — получай уведомления о начале матчей!")
+            lines.append("\n💡 Матчи обычно начинаются с 12:00 MSK")
             try:
                 await q.edit_message_text(
                     "\n".join(lines),
