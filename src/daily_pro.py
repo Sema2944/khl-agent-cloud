@@ -215,8 +215,10 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
     for sport in HUNTER_SPORTS:
         try:
             items = await api.matches_by_date(sport, today)
+            sport_matches = []
+            leagues_found: set = set()
             for m in items:
-                all_matches.append({
+                entry = {
                     "match_id": str(m.id),
                     "sport_slug": getattr(m, "sport_slug", sport),
                     "title": getattr(m, "title", "") or "",
@@ -225,7 +227,14 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
                     "start_time": str(getattr(m, "start_time", "") or ""),
                     "status": str(getattr(m, "status", "") or "").lower(),
                     "odds": getattr(m, "odds_base", None),
-                })
+                }
+                sport_matches.append(entry)
+                leagues_found.add(entry["league"])
+            all_matches.extend(sport_matches)
+            logger.info(
+                "Hunter fetch %s: %d matches raw, leagues: %s",
+                sport, len(sport_matches), sorted(leagues_found) if leagues_found else "none",
+            )
         except Exception:
             logger.exception("Hunter fetch failed for %s", sport)
     return all_matches
@@ -234,13 +243,20 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
 def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep only scheduled matches from top leagues."""
     result = []
+    # Diagnostic counters per sport
+    sport_raw: Dict[str, int] = {}
+    sport_filtered: Dict[str, int] = {}
+    sport_status_skip: Dict[str, int] = {}
+
     for m in matches:
         status = m.get("status", "")
         league = (m.get("league") or "").lower()
         sport = m.get("sport_slug", "")
+        sport_raw[sport] = sport_raw.get(sport, 0) + 1
 
         # Only pre-match (not started)
         if status not in {"notstarted", "scheduled", "fixture", "ns", ""}:
+            sport_status_skip[sport] = sport_status_skip.get(sport, 0) + 1
             continue
 
         # Skip friendlies, women, youth
@@ -252,6 +268,17 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         result.append(m)
+        sport_filtered[sport] = sport_filtered.get(sport, 0) + 1
+
+    # Log diagnostics per sport
+    for sport in sorted(sport_raw.keys()):
+        raw_n = sport_raw.get(sport, 0)
+        filt_n = sport_filtered.get(sport, 0)
+        skip_n = sport_status_skip.get(sport, 0)
+        logger.info(
+            "Hunter filter %s: %d raw → %d filtered (%d skipped by status)",
+            sport, raw_n, filt_n, skip_n,
+        )
 
     # Fallback: if too few matches pass the top-league filter,
     # relax and include all non-friendly matches
