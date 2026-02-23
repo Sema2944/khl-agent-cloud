@@ -7,6 +7,7 @@ To enable a new sport: set "enabled": True → it auto-appears in the bot menu.
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 
@@ -368,6 +369,25 @@ def get_default_sports() -> List[str]:
     return list(get_enabled_sports().keys())
 
 
+def _dynamic_season(configured_season: Any) -> Any:
+    """Auto-calculate season for leagues using 'YYYY-YYYY' format.
+
+    NBA/Euroleague seasons start in October:
+      - month >= 10 → season = "{year}-{year+1}"
+      - month < 10  → season = "{year-1}-{year}"
+
+    For integer seasons (football, hockey) — return as-is.
+    """
+    if not isinstance(configured_season, str) or "-" not in configured_season:
+        return configured_season  # integer season, no change
+
+    today = date.today()
+    if today.month >= 10:
+        return f"{today.year}-{today.year + 1}"
+    else:
+        return f"{today.year - 1}-{today.year}"
+
+
 def get_sport_config(slug: str) -> Optional[Dict[str, Any]]:
     """Get config for a sport by slug. Also checks aliases."""
     if slug in SPORTS_CONFIG:
@@ -386,14 +406,22 @@ def get_api_base(slug: str) -> Optional[str]:
 
 
 def get_leagues(slug: str, max_priority: int = 99) -> Dict[int, Dict[str, Any]]:
-    """Get leagues for a sport, optionally filtered by priority."""
+    """Get leagues for a sport, optionally filtered by priority.
+
+    For leagues with 'YYYY-YYYY' seasons (basketball, etc.) the season
+    is auto-calculated based on the current date so it never goes stale.
+    """
     cfg = get_sport_config(slug)
     if not cfg:
         return {}
-    return {
-        lid: info for lid, info in cfg.get("leagues", {}).items()
-        if info.get("priority", 99) <= max_priority
-    }
+    result = {}
+    for lid, info in cfg.get("leagues", {}).items():
+        if info.get("priority", 99) <= max_priority:
+            # Apply dynamic season for string-format seasons
+            patched = dict(info)
+            patched["season"] = _dynamic_season(info.get("season"))
+            result[lid] = patched
+    return result
 
 
 def get_odds_keys(slug: str) -> List[str]:
