@@ -244,7 +244,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            1:  {"name": "UFC", "flag": "🇺🇸", "country": "USA", "season": 2025, "priority": 1},
+            1:  {"name": "UFC", "flag": "🇺🇸", "country": "USA", "season": 2026, "priority": 1},
         },
         "odds_keys": [
             "mma_mixed_martial_arts",

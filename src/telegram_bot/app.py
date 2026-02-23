@@ -916,11 +916,33 @@ async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, In
         return text, kb
 
     if not matches:
+        extra = ""
+        # For MMA: show next upcoming UFC event
+        if sport_slug == "mma":
+            try:
+                from ..integrations.sport_api import SportAPIClient
+                _api = SportAPIClient()
+                import asyncio
+                next_ev = await _api.fetch_next_ufc_event()
+                if next_ev:
+                    ev_name = next_ev.get("name", "UFC")
+                    ev_date = next_ev.get("date", "")
+                    # Parse date for display
+                    if ev_date:
+                        try:
+                            from datetime import datetime as _dt
+                            dt = _dt.fromisoformat(ev_date.replace("Z", "+00:00"))
+                            ev_date_str = dt.strftime("%d.%m.%Y")
+                        except Exception:
+                            ev_date_str = ev_date[:10]
+                        extra = f"\n\n🥊 Ближайший ивент: {ev_name}\n📅 {ev_date_str}"
+            except Exception:
+                pass
         text = (
             f"🏟 Матчи сегодня (по МСК) — {title}\n"
             f"Дата: {today.isoformat()}\n\n"
             "Сегодня нет запланированных матчей в доступных лигах.\n"
-            "Попробуйте завтра или выберите другой спорт."
+            f"Попробуйте завтра или выберите другой спорт.{extra}"
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")]])
         return text, kb

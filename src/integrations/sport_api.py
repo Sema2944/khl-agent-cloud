@@ -905,6 +905,34 @@ class SportAPIClient:
             logger.exception("ESPN MMA: request failed")
             return []
 
+    async def fetch_next_ufc_event(self) -> Optional[Dict[str, str]]:
+        """Fetch the nearest upcoming UFC event from ESPN.
+
+        Returns dict with 'name' and 'date' or None.
+        Checks next 30 days from today.
+        """
+        from datetime import timedelta
+        today = date.today()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                for offset in range(0, 30, 7):
+                    check_day = today + timedelta(days=offset)
+                    day_s = check_day.strftime("%Y%m%d")
+                    url = "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
+                    resp = await client.get(url, params={"dates": day_s})
+                    if resp.status_code != 200:
+                        continue
+                    events = resp.json().get("events") or []
+                    for ev in events:
+                        ev_date = ev.get("date") or ""
+                        ev_name = ev.get("name") or ev.get("shortName") or "UFC"
+                        # Check if event is in the future
+                        if ev_date and ev_name:
+                            return {"name": ev_name, "date": ev_date}
+        except Exception:
+            logger.debug("fetch_next_ufc_event failed")
+        return None
+
     async def _fetch_football_data_org(self, day: date) -> List[MatchDTO]:
         """
         Fetch football matches from football-data.org (free tier).
@@ -1040,27 +1068,17 @@ class SportAPIClient:
                 logger.warning("ESPN Tennis failed: %s", e)
             return []
 
-        # ── MMA/UFC: api-sports.io primary, ESPN fallback ──
+        # ── MMA/UFC: ESPN only (api-sports.io unreliable for MMA) ──
         if sport_slug == "mma":
-            try:
-                matches = await self._fallback_api_sports(sport_slug, day)
-                if matches:
-                    logger.info("SportAPI MMA (api-sports.io): n=%d", len(matches))
-                    return matches
-            except Exception as e:
-                logger.warning("api-sports.io MMA failed: %s", e)
-                last_err = e
-
-            # Fallback to ESPN for MMA (UFC events are sparse)
             try:
                 mma_matches = await self._fetch_mma_espn(day)
                 if mma_matches:
-                    logger.info("SportAPI ESPN MMA fallback: n=%d", len(mma_matches))
+                    logger.info("SportAPI ESPN MMA: n=%d", len(mma_matches))
                     return mma_matches
             except Exception:
-                pass
+                logger.debug("ESPN MMA failed for %s", day_s)
 
-            logger.info("mma: no matches on %s", day_s)
+            logger.info("mma: no fights on %s", day_s)
             return []
 
         # ── For other non-hockey sports: go to api-sports.io ──
