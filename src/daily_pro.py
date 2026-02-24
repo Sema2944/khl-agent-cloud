@@ -418,8 +418,8 @@ async def _enrich_odds(match: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info("Hunter: enriched %s with OddsAPI (%d bookmakers)",
                             title[:30], len(odds_data.get("h2h", {})))
                 return match
-    except Exception:
-        logger.debug("Hunter: OddsAPI enrichment failed for %s", match.get("title", "")[:30])
+    except Exception as e:
+        logger.warning("Hunter: OddsAPI enrichment failed for %s: %s", match.get("title", "")[:30], e)
 
     # 2. Fallback: use existing odds from matches_by_date
     odds = match.get("odds")
@@ -913,6 +913,17 @@ async def run_daily_hunter(bot=None) -> None:
         filtered = _filter_matches(matches)
         logger.info("Hunter: %d matches after TOP_LEAGUES filter", len(filtered))
 
+        # --- Diagnostic: log premium league matches (CL, EL, NHL, NBA, UFC) ---
+        for m in filtered:
+            lg = (m.get("league") or "").lower()
+            if any(kw in lg for kw in _PREMIUM_LEAGUE_KEYWORDS):
+                logger.info(
+                    "Hunter PREMIUM match: %s | league=%s | sport=%s | status=%s | odds=%s",
+                    m.get("title", ""), m.get("league", ""),
+                    m.get("sport_slug", ""), m.get("status", ""),
+                    bool(m.get("odds")),
+                )
+
         if not filtered:
             logger.warning("Hunter: no matches found after filtering — aborting")
             _hunter_run_info["status"] = "done"
@@ -927,8 +938,14 @@ async def run_daily_hunter(bot=None) -> None:
 
         filtered.sort(key=lambda x: x.get("det_score", 0), reverse=True)
         top_candidates = filtered[:10]
-        logger.info("Hunter: top-10 candidates selected (scores: %s)",
-                    [f"{m.get('det_score', 0):.0f}" for m in top_candidates])
+
+        # --- Diagnostic: log top-10 with sport + league + score ---
+        for i, m in enumerate(top_candidates, 1):
+            logger.info(
+                "Hunter top-%d: score=%.0f | %s | %s | %s",
+                i, m.get("det_score", 0), m.get("sport_slug", ""),
+                m.get("league", "")[:40], m.get("title", "")[:50],
+            )
 
         # 4. Enrich odds for top candidates
         for m in top_candidates:
@@ -944,18 +961,18 @@ async def run_daily_hunter(bot=None) -> None:
 
         # 6. Filter out failed analyses (confidence=0 or no recommendation)
         valid = []
-        skipped = 0
+        skipped_list = []
         for m in scored:
             conf = m.get("confidence", 0)
             rec = (m.get("recommendation") or "").strip()
             if conf <= 0 or not rec:
-                skipped += 1
-                logger.info("Hunter: skipping %s — confidence=%.2f rec=%r",
-                            m.get("title", "")[:30], conf, rec)
+                skipped_list.append(m)
+                logger.info("Hunter: AI skipped %s — confidence=%.2f rec=%r",
+                            m.get("title", "")[:40], conf, rec)
                 continue
             valid.append(m)
-        if skipped:
-            logger.info("Hunter: skipped %d matches with empty AI analysis", skipped)
+        if skipped_list:
+            logger.info("Hunter: AI skipped %d matches with empty analysis", len(skipped_list))
 
         # Rank by AI confidence + league tier bonus
         # Premium leagues (CL, EL, NHL, NBA, UFC) get +0.10 effective boost,
@@ -972,6 +989,15 @@ async def run_daily_hunter(bot=None) -> None:
 
         valid.sort(key=_sort_key, reverse=True)
 
+        # --- Diagnostic: log sorted valid candidates with effective sort key ---
+        for i, m in enumerate(valid[:6], 1):
+            logger.info(
+                "Hunter valid-%d: conf=%.2f sort=%.2f | %s | %s | %s",
+                i, m.get("confidence", 0), _sort_key(m),
+                m.get("sport_slug", ""), m.get("league", "")[:30],
+                m.get("title", "")[:40],
+            )
+
         # 7. Diversify: max 2 per sport, but always try to get 3
         top3: List[Dict[str, Any]] = []
         sport_count: Dict[str, int] = defaultdict(int)
@@ -987,7 +1013,7 @@ async def run_daily_hunter(bot=None) -> None:
             if len(top3) == 3:
                 break
 
-        # Fallback: if < 3 after diversification, fill from remaining (ignore sport limit)
+        # Fallback: if < 3 after diversification, fill from remaining valid
         if len(top3) < 3:
             for m in valid:
                 if m.get("match_id") in used_ids:
@@ -997,11 +1023,48 @@ async def run_daily_hunter(bot=None) -> None:
                 if len(top3) == 3:
                     break
 
+        # Fallback 2: if still < 3, use AI-skipped matches (prefer premium leagues)
+        if len(top3) < 3 and skipped_list:
+            logger.info("Hunter: only %d valid picks, filling from AI-skipped matches", len(top3))
+            # Sort skipped by det_score (premium leagues first)
+            skipped_list.sort(key=lambda x: x.get("det_score", 0), reverse=True)
+            for m in skipped_list:
+                if m.get("match_id") in used_ids:
+                    continue
+                # Give minimal confidence and a generic recommendation
+                if not m.get("recommendation"):
+                    odds_p = m.get("odds_parsed", {})
+                    if odds_p.get("home") and odds_p.get("away"):
+                        # Auto-generate: pick the favourite
+                        h = _safe_float(odds_p.get("home"))
+                        a = _safe_float(odds_p.get("away"))
+                        if h > 0 and a > 0:
+                            if h < a:
+                                m["recommendation"] = "П1"
+                                m["rec_odds"] = h
+                            else:
+                                m["recommendation"] = "П2"
+                                m["rec_odds"] = a
+                            m["confidence"] = 0.60
+                            m["analysis_text"] = m.get("analysis_text") or "Матч из топ-лиги."
+                if m.get("confidence", 0) <= 0:
+                    m["confidence"] = 0.60
+                if not m.get("recommendation"):
+                    continue
+                top3.append(m)
+                used_ids.add(m.get("match_id"))
+                logger.info("Hunter: filled slot with AI-skipped: %s (score=%.0f)",
+                            m.get("title", "")[:40], m.get("det_score", 0))
+                if len(top3) == 3:
+                    break
+
         if not top3:
-            logger.warning("Hunter: no picks with confidence after AI analysis — aborting")
+            logger.warning("Hunter: no picks at all after all fallbacks — aborting")
             _hunter_run_info["status"] = "done"
             _hunter_run_info["picks_count"] = 0
             return
+
+        logger.info("Hunter: FINAL %d picks selected", len(top3))
 
         for p in top3:
             p["pick_type"] = "top3"

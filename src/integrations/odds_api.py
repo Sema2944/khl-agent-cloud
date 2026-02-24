@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 ODDS_API_KEY = (os.getenv("ODDS_API_KEY") or "").strip()
 ODDS_API_URL = "https://api.the-odds-api.com/v4"
 
+def _get_api_key() -> str:
+    """Get API key — re-read from env if module-level was empty."""
+    global ODDS_API_KEY
+    if not ODDS_API_KEY:
+        ODDS_API_KEY = (os.getenv("ODDS_API_KEY") or "").strip()
+    return ODDS_API_KEY
+
 # Betly sport_slug → The Odds API sport key(s)
 # Each sport may need multiple keys to cover different leagues.
 SPORT_KEY_MAP: Dict[str, List[str]] = {
@@ -72,16 +79,20 @@ async def fetch_odds_for_sport(
 
     Returns raw events list with bookmaker odds.
     """
-    if not ODDS_API_KEY:
-        logger.debug("ODDS_API_KEY not set, skipping odds fetch")
+    api_key = _get_api_key()
+    if not api_key:
+        logger.warning("OddsAPI: ODDS_API_KEY not set — skipping odds fetch for %s", sport_slug)
         return []
 
     sport_keys = SPORT_KEY_MAP.get(sport_slug, [])
     if not sport_keys:
+        logger.debug("OddsAPI: no sport keys mapped for %s", sport_slug)
         return []
 
     bm_str = bookmakers or ",".join(BOOKMAKER_PRIORITY)
     all_events: List[Dict[str, Any]] = []
+
+    logger.info("OddsAPI: fetching %s, key_present=True, sport_keys=%s", sport_slug, sport_keys)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
         for sport_key in sport_keys:
@@ -89,7 +100,7 @@ async def fetch_odds_for_sport(
                 resp = await client.get(
                     f"{ODDS_API_URL}/sports/{sport_key}/odds/",
                     params={
-                        "apiKey": ODDS_API_KEY,
+                        "apiKey": api_key,
                         "regions": "eu",
                         "markets": "h2h,totals",
                         "bookmakers": bm_str,
@@ -97,9 +108,12 @@ async def fetch_odds_for_sport(
                     },
                 )
                 remaining = resp.headers.get("x-requests-remaining", "?")
+                used = resp.headers.get("x-requests-used", "?")
                 logger.info(
-                    "OddsAPI: %s HTTP %d, remaining=%s",
-                    sport_key, resp.status_code, remaining,
+                    "OddsAPI: %s HTTP %d, events=%s, used=%s, remaining=%s",
+                    sport_key, resp.status_code,
+                    len(resp.json()) if resp.status_code == 200 else "N/A",
+                    used, remaining,
                 )
 
                 if resp.status_code != 200:

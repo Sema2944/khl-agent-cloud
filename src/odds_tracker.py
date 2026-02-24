@@ -18,8 +18,8 @@ from sqlmodel import Session
 
 from .db import engine
 from .integrations.odds_api import (
-    ODDS_API_KEY,
     SPORT_KEY_MAP,
+    _get_api_key,
     fetch_odds_for_sport,
     parse_event_odds,
 )
@@ -276,7 +276,7 @@ async def odds_tracking_loop() -> None:
     await asyncio.sleep(60)
 
     while True:
-        if not ODDS_API_KEY:
+        if not _get_api_key():
             logger.info("Odds tracker: ODDS_API_KEY not set, sleeping")
             await asyncio.sleep(TRACK_INTERVAL)
             continue
