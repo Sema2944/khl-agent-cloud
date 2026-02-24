@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -267,6 +268,10 @@ async def _track_one_sport(sport_slug: str) -> int:
 
 async def odds_tracking_loop() -> None:
     """Background loop: collect odds snapshots every 2 hours."""
+    if (os.getenv("ODDS_TRACKING_ENABLED") or "false").strip().lower() != "true":
+        logger.info("Odds tracking disabled (set ODDS_TRACKING_ENABLED=true to enable)")
+        return
+
     # Wait for app to fully start
     await asyncio.sleep(60)
 
