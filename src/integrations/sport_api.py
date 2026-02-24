@@ -1836,3 +1836,57 @@ class SportAPIClient:
             country=country,
             raw=raw,
         )
+
+    # ------------------------------------------------------------------
+    # Formula 1 dedicated methods (races, not daily fixtures)
+    # ------------------------------------------------------------------
+    async def f1_races_calendar(self, season: int = 2026) -> List[Dict[str, Any]]:
+        """Fetch F1 race calendar for a season."""
+        api_key = _env("API_SPORTS_KEY")
+        if not api_key:
+            return []
+        url = "https://v1.formula-1.api-sports.io/races"
+        headers = {"x-apisports-key": api_key}
+        params = {"season": season, "timezone": "Europe/Moscow", "type": "Race"}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                data = resp.json()
+                return data.get("response", [])
+        except Exception:
+            logger.exception("F1 calendar fetch failed")
+            return []
+
+    async def f1_driver_standings(self, season: int = 2026) -> List[Dict[str, Any]]:
+        """Fetch F1 driver standings."""
+        api_key = _env("API_SPORTS_KEY")
+        if not api_key:
+            return []
+        url = "https://v1.formula-1.api-sports.io/rankings/drivers"
+        headers = {"x-apisports-key": api_key}
+        params = {"season": season}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                data = resp.json()
+                return data.get("response", [])
+        except Exception:
+            logger.exception("F1 standings fetch failed")
+            return []
+
+    async def f1_team_standings(self, season: int = 2026) -> List[Dict[str, Any]]:
+        """Fetch F1 constructor standings."""
+        api_key = _env("API_SPORTS_KEY")
+        if not api_key:
+            return []
+        url = "https://v1.formula-1.api-sports.io/rankings/teams"
+        headers = {"x-apisports-key": api_key}
+        params = {"season": season}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s)) as client:
+                resp = await client.get(url, headers=headers, params=params)
+                data = resp.json()
+                return data.get("response", [])
+        except Exception:
+            logger.exception("F1 team standings fetch failed")
+            return []

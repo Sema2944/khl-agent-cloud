@@ -184,7 +184,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Волейбол",
         "slug": "volleyball",
         "bot_slug": "volleyball",
-        "enabled": False,  # disabled: api-sports.io free plan blocks current season
+        "enabled": True,
         "api_base": "https://v1.volleyball.api-sports.io",
         "endpoints": {
             "fixtures":   "/games",
@@ -260,7 +260,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         "name": "Формула-1",
         "slug": "formula1",
         "bot_slug": "formula1",
-        "enabled": False,
+        "enabled": True,
         "api_base": "https://v1.formula-1.api-sports.io",
         "endpoints": {
             "fixtures": "/races",

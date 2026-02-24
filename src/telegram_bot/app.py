@@ -118,7 +118,8 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("⚽ Футбол"), KeyboardButton("🏀 Баскетбол")],
         [KeyboardButton("🏒 Хоккей"), KeyboardButton("🎾 Теннис")],
-        [KeyboardButton("🥊 MMA"), KeyboardButton("🔴 LIVE")],
+        [KeyboardButton("🥊 MMA"), KeyboardButton("🏐 Волейбол")],
+        [KeyboardButton("🏎 Формула-1"), KeyboardButton("🔴 LIVE")],
         [KeyboardButton("🌟 PRO")],
     ],
     resize_keyboard=True,
@@ -132,6 +133,8 @@ _REPLY_SPORT_MAP = {
     "🏒 Хоккей": "ice-hockey",
     "🎾 Теннис": "tennis",
     "🥊 MMA": "mma",
+    "🏐 Волейбол": "volleyball",
+    "🏎 Формула-1": "formula1",
 }
 
 # ---------------------------------------------------------------------------
@@ -929,6 +932,161 @@ def kb_buy_pro() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(rows)
 
 
+# ---------------------------------------------------------------------------
+# F1 custom navigation (races, not daily fixtures)
+# ---------------------------------------------------------------------------
+async def _render_f1_home(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    """Render F1 main screen: next race + action buttons."""
+    from ..integrations.sport_api import SportAPIClient
+
+    api = SportAPIClient()
+    races = await api.f1_races_calendar(2026)
+
+    # Find next upcoming race
+    now = datetime.now(MSK)
+    next_race = None
+    for r in races:
+        race_date_str = r.get("date", "")
+        if not race_date_str:
+            continue
+        try:
+            rd = datetime.fromisoformat(race_date_str.replace("Z", "+00:00"))
+            if rd > now:
+                next_race = r
+                break
+        except Exception:
+            continue
+
+    lines = ["🏎 Formula 1\n"]
+
+    if next_race:
+        comp = next_race.get("competition") or {}
+        name = comp.get("name") or next_race.get("competition", {}).get("name", "Гран-при")
+        loc = comp.get("location") or {}
+        city = loc.get("city", "")
+        country = loc.get("country", "")
+        circuit = next_race.get("circuit") or {}
+        circuit_name = circuit.get("name", "")
+
+        race_date_str = next_race.get("date", "")
+        date_display = ""
+        if race_date_str:
+            try:
+                rd = datetime.fromisoformat(race_date_str.replace("Z", "+00:00"))
+                date_display = rd.strftime("%d.%m.%Y %H:%M MSK")
+            except Exception:
+                date_display = race_date_str[:16]
+
+        lines.append(f"📅 Ближайший этап:")
+        lines.append(f"  🏁 {name}")
+        if circuit_name:
+            lines.append(f"  📍 {circuit_name}")
+        if city or country:
+            lines.append(f"  🌍 {city}, {country}" if city else f"  🌍 {country}")
+        if date_display:
+            lines.append(f"  📆 {date_display}")
+    else:
+        if races:
+            lines.append("Сезон 2026: все гонки завершены")
+        else:
+            lines.append("Календарь сезона 2026 пока недоступен")
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Чемпионат пилотов", callback_data="F1:DRIVERS")],
+        [InlineKeyboardButton("🏗 Чемпионат конструкторов", callback_data="F1:TEAMS")],
+        [InlineKeyboardButton("📅 Календарь сезона", callback_data="F1:CALENDAR")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="BACK:MENU")],
+    ])
+    return text, kb
+
+
+async def _render_f1_drivers(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    from ..integrations.sport_api import SportAPIClient
+    api = SportAPIClient()
+    standings = await api.f1_driver_standings(2026)
+
+    lines = ["🏎 Чемпионат пилотов 2026\n"]
+    if not standings:
+        lines.append("Данные пока недоступны (сезон не начался)")
+    else:
+        for i, entry in enumerate(standings[:15], 1):
+            driver = entry.get("driver") or {}
+            name = driver.get("name", "?")
+            team = (entry.get("team") or {}).get("name", "")
+            points = entry.get("points", 0)
+            pos_emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            line = f"  {pos_emoji} {name}"
+            if team:
+                line += f" ({team})"
+            line += f" — {points} очк."
+            lines.append(line)
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏗 Конструкторы", callback_data="F1:TEAMS")],
+        [InlineKeyboardButton("⬅️ F1", callback_data="F1:HOME")],
+    ])
+    return text, kb
+
+
+async def _render_f1_teams(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    from ..integrations.sport_api import SportAPIClient
+    api = SportAPIClient()
+    standings = await api.f1_team_standings(2026)
+
+    lines = ["🏎 Чемпионат конструкторов 2026\n"]
+    if not standings:
+        lines.append("Данные пока недоступны (сезон не начался)")
+    else:
+        for i, entry in enumerate(standings[:10], 1):
+            team = entry.get("team") or {}
+            name = team.get("name", "?")
+            points = entry.get("points", 0)
+            pos_emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            lines.append(f"  {pos_emoji} {name} — {points} очк.")
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Пилоты", callback_data="F1:DRIVERS")],
+        [InlineKeyboardButton("⬅️ F1", callback_data="F1:HOME")],
+    ])
+    return text, kb
+
+
+async def _render_f1_calendar(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    from ..integrations.sport_api import SportAPIClient
+    api = SportAPIClient()
+    races = await api.f1_races_calendar(2026)
+
+    lines = ["🏎 Календарь F1 2026\n"]
+    if not races:
+        lines.append("Календарь пока недоступен")
+    else:
+        now = datetime.now(MSK)
+        for r in races:
+            comp = r.get("competition") or {}
+            name = comp.get("name", "Гран-при")
+            race_date_str = r.get("date", "")
+            date_short = ""
+            is_past = False
+            if race_date_str:
+                try:
+                    rd = datetime.fromisoformat(race_date_str.replace("Z", "+00:00"))
+                    date_short = rd.strftime("%d.%m")
+                    is_past = rd < now
+                except Exception:
+                    date_short = race_date_str[:5]
+            marker = "✅" if is_past else "📅"
+            lines.append(f"  {marker} {date_short} — {name}")
+
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ F1", callback_data="F1:HOME")],
+    ])
+    return text, kb
+
+
 async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, InlineKeyboardMarkup]:
     from ..integrations.sport_api import SportAPIClient, SportAPIError
 
@@ -1691,6 +1849,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply_markup=MAIN_MENU_KEYBOARD,
             )
             return
+        # F1 has custom navigation (races, not daily fixtures)
+        if sport_slug == "formula1":
+            try:
+                text, kb = await _render_f1_home(user_id)
+                await update.message.reply_text(text, reply_markup=kb)
+            except Exception:
+                logger.exception("F1 render failed")
+                await update.message.reply_text("🏎 Formula 1 временно недоступна. Попробуй позже.")
+            return
         text, kb = await _render_sport_nav_root(user_id, sport_slug)
         txt = _truncate_tg(text)
         await update.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
@@ -1773,6 +1940,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
         except Exception:
             logger.exception("feedback callback failed for data=%r", data)
+        return
+
+    # F1:* — Formula 1 navigation callbacks
+    if data.startswith("F1:"):
+        try:
+            if data == "F1:HOME":
+                txt, kb = await _render_f1_home(user_id)
+            elif data == "F1:DRIVERS":
+                txt, kb = await _render_f1_drivers(user_id)
+            elif data == "F1:TEAMS":
+                txt, kb = await _render_f1_teams(user_id)
+            elif data == "F1:CALENDAR":
+                txt, kb = await _render_f1_calendar(user_id)
+            else:
+                return
+            await _safe_edit_or_send(q, txt, reply_markup=kb)
+        except Exception:
+            logger.exception("F1 callback failed for data=%r", data)
         return
 
     # BACK:MENU
