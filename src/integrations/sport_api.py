@@ -897,8 +897,28 @@ class SportAPIClient:
                 # Filter out finished fights from the list (keep only NS/LIVE)
                 total_before = len(result)
                 result = [m for m in result if m.status in ("NS", "LIVE", "")]
-                logger.info("ESPN MMA: parsed %d fights, %d after filter (NS/LIVE)",
-                            total_before, len(result))
+
+                # ESPN MMA scoreboard returns nearest event even if it's weeks away.
+                # Filter: only keep fights whose start_time is on the requested day.
+                day_iso = day.isoformat()  # "2026-02-24"
+                on_day = [m for m in result if day_iso in (m.start_time or "")]
+                if on_day:
+                    result = on_day
+                else:
+                    # No fights on this exact day — log the actual dates
+                    dates_found = set()
+                    for m in result:
+                        st = (m.start_time or "")[:10]
+                        if st:
+                            dates_found.add(st)
+                    logger.info(
+                        "ESPN MMA: no fights on %s, nearest event dates: %s",
+                        day_iso, sorted(dates_found),
+                    )
+                    result = []  # return empty — _render_sport_nav_root will show next event
+
+                logger.info("ESPN MMA: parsed %d fights, %d on %s",
+                            total_before, len(result), day_iso)
                 return result
 
         except Exception:
