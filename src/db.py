@@ -233,6 +233,20 @@ def _bootstrap_migrations_postgres() -> None:
             ON CONFLICT (code) DO NOTHING
         """))
 
+        # P3b: feedback survey
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                q1 TEXT NOT NULL DEFAULT '',
+                q2 TEXT NOT NULL DEFAULT '',
+                q3 TEXT NOT NULL DEFAULT '',
+                free_text TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_feedback_user ON feedback (user_id)"""))
+
         # P2: referrals table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS referrals (

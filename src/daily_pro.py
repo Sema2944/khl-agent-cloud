@@ -715,6 +715,38 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
     except Exception:
         logger.exception("Hunter: trial expiry check failed")
 
+    # Auto-suggest /feedback 3 days after promo activation (once per user)
+    try:
+        with Session(engine) as s:
+            promo_3d = s.exec(
+                text("""
+                    SELECT pa.user_id FROM promo_activations pa
+                    LEFT JOIN feedback f ON f.user_id = pa.user_id
+                    WHERE pa.activated_at <= NOW() - INTERVAL '3 days'
+                      AND pa.activated_at > NOW() - INTERVAL '4 days'
+                      AND f.id IS NULL
+                """)
+            ).all()
+        for row in promo_3d:
+            uid = row[0]
+            try:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        "📝 Привет! Ты пользуешься Betly уже 3 дня.\n\n"
+                        "Расскажи, что нравится и что улучшить — "
+                        "это займёт 30 секунд:\n"
+                        "/feedback\n\n"
+                        "🎁 +3 дня PRO за обратную связь!"
+                    ),
+                )
+            except Exception:
+                pass
+        if promo_3d:
+            logger.info("Hunter: sent feedback reminder to %d promo users", len(promo_3d))
+    except Exception:
+        logger.exception("Hunter: feedback reminder failed")
+
     return sent
 
 

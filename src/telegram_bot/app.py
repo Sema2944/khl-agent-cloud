@@ -1346,9 +1346,42 @@ async def handle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
-# /feedback — user sends feedback, forwarded to admin
+# /feedback — multi-step survey with inline buttons
 # ---------------------------------------------------------------------------
-_feedback_waiting: set = set()  # user_ids waiting for feedback text
+# State: {user_id: {"q1": "...", "q2": "...", "q3": "...", "step": "text"}}
+_feedback_state: Dict[int, Dict[str, str]] = {}
+
+_FB_Q1_TEXT = "📋 Шаг 1/4 — Насколько понятно как пользоваться ботом?"
+_FB_Q1_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("😍 Всё понятно", callback_data="FB:Q1:1")],
+    [InlineKeyboardButton("😐 Более-менее", callback_data="FB:Q1:2")],
+    [InlineKeyboardButton("😕 Запутался", callback_data="FB:Q1:3")],
+])
+_FB_Q1_LABELS = {"1": "😍 Всё понятно", "2": "😐 Более-менее", "3": "😕 Запутался"}
+
+_FB_Q2_TEXT = "📋 Шаг 2/4 — Охотник (Топ-3 матча) — полезен?"
+_FB_Q2_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔥 Супер, буду следить", callback_data="FB:Q2:1")],
+    [InlineKeyboardButton("👍 Нормально", callback_data="FB:Q2:2")],
+    [InlineKeyboardButton("👎 Не интересно", callback_data="FB:Q2:3")],
+])
+_FB_Q2_LABELS = {"1": "🔥 Супер, буду следить", "2": "👍 Нормально", "3": "👎 Не интересно"}
+
+_FB_Q3_TEXT = "📋 Шаг 3/4 — Готов платить 299₽/неделю за PRO?"
+_FB_Q3_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("💰 Да, стоит того", callback_data="FB:Q3:1")],
+    [InlineKeyboardButton("🤔 Дороговато", callback_data="FB:Q3:2")],
+    [InlineKeyboardButton("❌ Нет", callback_data="FB:Q3:3")],
+])
+_FB_Q3_LABELS = {"1": "💰 Да, стоит того", "2": "🤔 Дороговато", "3": "❌ Нет"}
+
+_FB_TEXT_PROMPT = (
+    "📋 Шаг 4/4 — Что добавить или улучшить?\n\n"
+    "Напиши свободным текстом (или /skip чтобы пропустить)"
+)
+
+# Set of user_ids waiting for free-text feedback input
+_feedback_waiting: set = set()
 
 
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1358,17 +1391,124 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user_id:
         return
 
-    args = context.args
-    if args:
-        # Inline feedback: /feedback текст
-        feedback_text = " ".join(args)
-        await _send_feedback(update, context, user_id, feedback_text)
-    else:
+    # Check if user already submitted feedback
+    try:
+        from sqlalchemy import text as sa_text
+        from ..db import SessionLocal
+        session = SessionLocal()
+        try:
+            existing = session.exec(
+                sa_text("SELECT id FROM feedback WHERE user_id = :uid"),
+                params={"uid": user_id},
+            ).first()
+        finally:
+            session.close()
+        if existing:
+            await update.message.reply_text("ℹ️ Ты уже оставлял отзыв. Спасибо!")
+            return
+    except Exception:
+        pass  # DB check failed — allow anyway
+
+    # Start survey: step 1
+    _feedback_state[user_id] = {}
+    await update.message.reply_text(_FB_Q1_TEXT, reply_markup=_FB_Q1_KB)
+
+
+async def _handle_feedback_callback(q, user_id: int, data: str, context) -> bool:
+    """Handle FB:* callbacks. Returns True if handled."""
+    if not data.startswith("FB:"):
+        return False
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        return False
+
+    question, answer = parts[1], parts[2]
+    state = _feedback_state.get(user_id)
+
+    if state is None:
+        # No active survey — maybe expired
+        await _safe_edit_or_send(q, "ℹ️ Опрос не активен. Начни заново: /feedback")
+        return True
+
+    if question == "Q1":
+        state["q1"] = answer
+        await _safe_edit_or_send(
+            q,
+            f"{_FB_Q1_TEXT}\n✅ {_FB_Q1_LABELS.get(answer, answer)}\n\n{_FB_Q2_TEXT}",
+            reply_markup=_FB_Q2_KB,
+        )
+        return True
+
+    if question == "Q2":
+        state["q2"] = answer
+        await _safe_edit_or_send(
+            q,
+            f"{_FB_Q2_TEXT}\n✅ {_FB_Q2_LABELS.get(answer, answer)}\n\n{_FB_Q3_TEXT}",
+            reply_markup=_FB_Q3_KB,
+        )
+        return True
+
+    if question == "Q3":
+        state["q3"] = answer
+        # Move to text input step
         _feedback_waiting.add(user_id)
-        await update.message.reply_text("📝 Напиши свой отзыв или предложение следующим сообщением:")
+        await _safe_edit_or_send(
+            q,
+            f"{_FB_Q3_TEXT}\n✅ {_FB_Q3_LABELS.get(answer, answer)}",
+        )
+        # Send text prompt as a new message (can't edit into text input)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=_FB_TEXT_PROMPT)
+        except Exception:
+            logger.warning("feedback: failed to send text prompt to %s", user_id)
+        return True
+
+    return False
 
 
-async def _send_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text_body: str) -> None:
+async def _finish_feedback(update: Update, context, user_id: int, free_text: str) -> None:
+    """Save feedback to DB, forward to admin, grant +3 days PRO."""
+    _feedback_waiting.discard(user_id)
+    state = _feedback_state.pop(user_id, {})
+
+    q1 = state.get("q1", "")
+    q2 = state.get("q2", "")
+    q3 = state.get("q3", "")
+
+    # Save to DB
+    try:
+        from sqlalchemy import text as sa_text
+        from ..db import SessionLocal
+        session = SessionLocal()
+        try:
+            session.exec(
+                sa_text("""
+                    INSERT INTO feedback (user_id, q1, q2, q3, free_text)
+                    VALUES (:uid, :q1, :q2, :q3, :ft)
+                """),
+                params={"uid": user_id, "q1": q1, "q2": q2, "q3": q3, "ft": free_text[:2000]},
+            )
+            session.commit()
+        finally:
+            session.close()
+    except Exception:
+        logger.exception("feedback: failed to save to DB")
+
+    # Grant +3 days PRO
+    try:
+        from ..pro_db import grant_pro
+        grant_pro(user_id, days=3)
+    except Exception:
+        logger.exception("feedback: failed to grant PRO reward")
+
+    # Thank user
+    await update.message.reply_text(
+        "🙏 Спасибо за отзыв! Ты помогаешь сделать Betly лучше.\n\n"
+        "🎁 +3 дня PRO за обратную связь!"
+    )
+
+    # Forward to admin
     username = getattr(update.effective_user, "username", "") or ""
     first_name = getattr(update.effective_user, "first_name", "") or ""
     name = f"@{username}" if username else first_name or str(user_id)
@@ -1376,15 +1516,27 @@ async def _send_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     admin_id = next(iter(OWNER_IDS), None)
     if admin_id:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"📝 Feedback от {name} (id={user_id}):\n\n{text_body[:2000]}",
+            admin_text = (
+                f"📋 ФИДБЭК от {name}:\n"
+                f"1. Понятность: {_FB_Q1_LABELS.get(q1, q1 or '—')}\n"
+                f"2. Охотник: {_FB_Q2_LABELS.get(q2, q2 or '—')}\n"
+                f"3. Оплата: {_FB_Q3_LABELS.get(q3, q3 or '—')}\n"
+                f"4. Текст: {free_text[:500] if free_text else '—'}"
             )
+            await context.bot.send_message(chat_id=admin_id, text=admin_text)
         except Exception:
             logger.warning("feedback: failed to forward to admin")
 
-    await update.message.reply_text("✅ Спасибо за обратную связь! Мы обязательно учтём.")
-    _feedback_waiting.discard(user_id)
+
+async def handle_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/skip — skips the free-text step of feedback survey."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id in _feedback_waiting:
+        await _finish_feedback(update, context, user_id, "")
+    else:
+        await update.message.reply_text("Нечего пропускать.")
 
 
 # ---------------------------------------------------------------------------
@@ -1518,9 +1670,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
 
-    # --- Feedback awaiting ---
+    # --- Feedback text step (step 4 of survey) ---
     if user_id in _feedback_waiting and text_raw:
-        await _send_feedback(update, context, user_id, text_raw)
+        free_text = "" if norm == "/skip" else text_raw
+        await _finish_feedback(update, context, user_id, free_text)
         return
 
     # --- Reply keyboard: 🔴 LIVE button ---
@@ -1610,6 +1763,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pass
 
     if data in {"NOOP", ""}:
+        return
+
+    # FB:* — feedback survey callbacks
+    if data.startswith("FB:"):
+        try:
+            handled = await _handle_feedback_callback(q, user_id, data, context)
+            if handled:
+                return
+        except Exception:
+            logger.exception("feedback callback failed for data=%r", data)
         return
 
     # BACK:MENU
@@ -2206,6 +2369,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("hunter_status", handle_hunter_status))
     app.add_handler(CommandHandler("promo", handle_promo))
     app.add_handler(CommandHandler("feedback", handle_feedback))
+    app.add_handler(CommandHandler("skip", handle_skip))
 
     # Payments: pre-checkout + successful payment
     try:
