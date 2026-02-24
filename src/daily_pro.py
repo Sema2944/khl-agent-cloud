@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, date
@@ -26,6 +27,9 @@ from .pro_db import OWNER_IDS
 
 logger = logging.getLogger(__name__)
 MSK = ZoneInfo("Europe/Moscow")
+
+# Channel auto-posting (set CHANNEL_USERNAME env var or leave empty to disable)
+CHANNEL_USERNAME = (os.getenv("CHANNEL_USERNAME") or "").strip()
 
 # ---------------------------------------------------------------------------
 # Hunter run status (module-level, survives across calls)
@@ -639,6 +643,27 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
     return "\n".join(lines)
 
 
+async def _broadcast_to_channel(bot, picks: List[Dict[str, Any]], pick_date: date) -> bool:
+    """Post Hunter picks to public Telegram channel. Returns True if sent."""
+    if not CHANNEL_USERNAME:
+        return False
+
+    try:
+        msg = _format_hunter_message(picks, pick_date)
+        # Add CTA footer for channel audience
+        channel_msg = (
+            msg + "\n\n"
+            "Полный AI-анализ каждого матча → @BetlyAIBot\n"
+            "🎁 3 дня PRO бесплатно"
+        )
+        await bot.send_message(chat_id=CHANNEL_USERNAME, text=channel_msg)
+        logger.info("Hunter: posted to channel %s", CHANNEL_USERNAME)
+        return True
+    except Exception:
+        logger.exception("Hunter: channel broadcast failed for %s", CHANNEL_USERNAME)
+        return False
+
+
 async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: date) -> int:
     """Send hunter picks to all PRO users, trial users, and OWNER_IDS.
 
@@ -878,12 +903,16 @@ async def run_daily_hunter(bot=None) -> None:
         _save_picks(picks, today)
         _hunter_run_info["picks_count"] = len(top3)  # only top3, not express
 
-        # 10. Broadcast
+        # 10. Broadcast to PRO users
         sent = 0
         if bot:
             sent = await _broadcast_to_pro_users(bot, picks, today)
         else:
             logger.info("Hunter: bot=None, skipping broadcast")
+
+        # 11. Post to public channel
+        if bot:
+            await _broadcast_to_channel(bot, picks, today)
 
         _hunter_run_info["users_sent"] = sent
         _hunter_run_info["status"] = "done"
