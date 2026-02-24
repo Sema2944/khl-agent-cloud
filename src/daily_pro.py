@@ -203,22 +203,25 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 Коэффициенты: {odds_text}
 {line_movement_text}
 ЗАДАЧА:
-1. Дай одну КОНКРЕТНУЮ рекомендацию (исход или тотал или их комбинацию)
-2. Объясни в 2-3 предложениях ПОЧЕМУ — конкретные факты, форма, статистика
+1. ОБЯЗАТЕЛЬНО дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
+2. Объясни в 2-3 предложениях ПОЧЕМУ — сила команд, форма, статистика, турнирная ситуация
 3. Если есть движение линии — учти его в анализе
-4. Оцени уверенность (60-85%)
+4. Оцени уверенность от 55% до 85%
 
-Верни JSON:
+Верни ТОЛЬКО JSON (без markdown, без ```):
 {{
-  "confidence": число от 0.60 до 0.85,
-  "recommendation": "П1 + ТБ 2.5" или "ТБ 4.5" или "П2" (краткая формулировка),
-  "rec_odds": число (приблизительный коэффициент на рекомендацию, например 2.10),
-  "summary": "2-3 предложения конкретного анализа с фактами"
+  "confidence": число от 0.55 до 0.85,
+  "recommendation": "П1" или "П2" или "ТБ 2.5" или "П1 + ТБ 2.5" (краткая формулировка),
+  "rec_odds": число (коэффициент на рекомендацию из данных выше, например 1.75),
+  "summary": "2-3 предложения анализа с фактами"
 }}
 
-ВАЖНО:
+КРИТИЧЕСКИ ВАЖНО:
+- ВСЕГДА возвращай confidence >= 0.55. Не возвращай 0!
+- Если данных мало — ставь confidence 0.55-0.65, но ОБЯЗАТЕЛЬНО дай рекомендацию.
+- Используй силу команд, рейтинг, позицию в турнире для анализа.
+- rec_odds: бери из коэффициентов выше. Если нет — оцени сам (1.50-3.00).
 - Без слов "ставь", "бери", "гарантия". Только аналитический материал.
-- Если данных мало — снижай confidence.
 - Отвечай на русском."""
 
 
@@ -494,22 +497,42 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
             ttl_s=3600 * 6,
         )
 
+        # LLM may return string with JSON (possibly wrapped in ```json...```)
+        if isinstance(result, str):
+            raw = result.strip()
+            # Strip markdown code block
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            try:
+                result = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning("Hunter AI: can't parse JSON from string for %s: %s",
+                               match.get("title", "")[:30], raw[:200])
+
         if isinstance(result, dict):
-            confidence = min(0.85, max(0.0, _safe_float(result.get("confidence", 0))))
+            confidence = min(0.85, max(0.55, _safe_float(result.get("confidence", 0.60))))
             recommendation = str(result.get("recommendation", ""))[:50]
             rec_odds = _safe_float(result.get("rec_odds", 0))
             summary = str(result.get("summary", ""))[:500]
+
+            # If AI still returned 0 confidence — force minimum
+            if confidence < 0.55:
+                confidence = 0.55
 
             # Adjust confidence based on line movement
             try:
                 from .odds_tracker import get_odds_confidence_adjustment
                 adj = get_odds_confidence_adjustment(match["match_id"])
                 if adj != 0:
-                    confidence = min(0.85, max(0.0, confidence + adj))
+                    confidence = min(0.85, max(0.55, confidence + adj))
                     logger.info("Hunter: confidence adjusted by %+.2f for %s",
                                 adj, match.get("title", "")[:30])
             except Exception:
                 pass
+
+            logger.info("Hunter AI result: %s → conf=%.2f rec=%s",
+                        match.get("title", "")[:30], confidence, recommendation)
 
             return {
                 **match,
@@ -520,6 +543,8 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
                 "line_movement": line_movement_text,
             }
 
+        logger.warning("Hunter AI: non-dict result for %s: type=%s",
+                        match.get("title", "")[:30], type(result).__name__)
         return {**match, "confidence": 0.0, "analysis_text": "", "recommendation": "", "rec_odds": 0}
 
     except Exception:

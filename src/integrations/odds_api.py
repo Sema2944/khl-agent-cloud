@@ -43,8 +43,27 @@ SPORT_KEY_MAP: Dict[str, List[str]] = {
         "basketball_euroleague",
     ],
     "tennis": [
+        "tennis_atp_aus_open",
         "tennis_atp_french_open",
+        "tennis_atp_us_open",
+        "tennis_atp_wimbledon",
+        # Mid-tier ATP events (dynamic — Odds API only returns active tournaments)
+        "tennis_atp_indian_wells",
+        "tennis_atp_miami_open",
+        "tennis_atp_dubai",
+        "tennis_atp_china_open",
+        "tennis_atp_rome",
+        "tennis_atp_madrid",
+        "tennis_atp_canadian_open",
+        "tennis_atp_cincinnati",
+        "tennis_atp_santiago",
+        "tennis_wta_aus_open",
         "tennis_wta_french_open",
+        "tennis_wta_us_open",
+        "tennis_wta_wimbledon",
+        "tennis_wta_indian_wells",
+        "tennis_wta_miami_open",
+        "tennis_wta_dubai",
     ],
     "mma": [
         "mma_mixed_martial_arts",
@@ -52,6 +71,27 @@ SPORT_KEY_MAP: Dict[str, List[str]] = {
 }
 
 BOOKMAKER_PRIORITY = ["pinnacle", "bet365", "onexbet", "marathonbet", "betfair"]
+
+# ---------------------------------------------------------------------------
+# Cache: {sport_key: (events_list, timestamp)}
+# Avoids hitting OddsAPI repeatedly for the same sport within 30 minutes.
+# ---------------------------------------------------------------------------
+import time
+
+_odds_cache: Dict[str, tuple] = {}  # sport_key → (events, time.time())
+_CACHE_TTL = 1800  # 30 minutes
+
+
+def _get_cached(sport_key: str) -> Optional[List[Dict[str, Any]]]:
+    """Return cached events if fresh, else None."""
+    entry = _odds_cache.get(sport_key)
+    if entry and (time.time() - entry[1]) < _CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _set_cache(sport_key: str, events: List[Dict[str, Any]]) -> None:
+    _odds_cache[sport_key] = (events, time.time())
 
 
 def _fuzzy_match_teams(event: Dict[str, Any], home: str, away: str) -> bool:
@@ -91,11 +131,18 @@ async def fetch_odds_for_sport(
 
     bm_str = bookmakers or ",".join(BOOKMAKER_PRIORITY)
     all_events: List[Dict[str, Any]] = []
-
-    logger.info("OddsAPI: fetching %s, key_present=True, sport_keys=%s", sport_slug, sport_keys)
+    api_calls = 0
+    cache_hits = 0
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
         for sport_key in sport_keys:
+            # Check cache first
+            cached = _get_cached(sport_key)
+            if cached is not None:
+                all_events.extend(cached)
+                cache_hits += 1
+                continue
+
             try:
                 resp = await client.get(
                     f"{ODDS_API_URL}/sports/{sport_key}/odds/",
@@ -107,30 +154,35 @@ async def fetch_odds_for_sport(
                         "oddsFormat": "decimal",
                     },
                 )
+                api_calls += 1
                 remaining = resp.headers.get("x-requests-remaining", "?")
                 used = resp.headers.get("x-requests-used", "?")
-                logger.info(
-                    "OddsAPI: %s HTTP %d, events=%s, used=%s, remaining=%s",
-                    sport_key, resp.status_code,
-                    len(resp.json()) if resp.status_code == 200 else "N/A",
-                    used, remaining,
-                )
 
-                if resp.status_code != 200:
+                if resp.status_code == 200:
+                    events = resp.json()
+                    if isinstance(events, list):
+                        _set_cache(sport_key, events)
+                        all_events.extend(events)
+                        logger.info(
+                            "OddsAPI: %s → %d events (used=%s, remaining=%s)",
+                            sport_key, len(events), used, remaining,
+                        )
+                    else:
+                        _set_cache(sport_key, [])
+                elif resp.status_code == 404:
+                    # Tournament not active — cache empty to avoid retries
+                    _set_cache(sport_key, [])
+                else:
                     logger.warning(
                         "OddsAPI: %s HTTP %d: %s",
-                        sport_key, resp.status_code, (resp.text or "")[:300],
+                        sport_key, resp.status_code, (resp.text or "")[:200],
                     )
-                    continue
-
-                events = resp.json()
-                if isinstance(events, list):
-                    all_events.extend(events)
 
             except Exception:
                 logger.exception("OddsAPI: fetch failed for %s", sport_key)
 
-    logger.info("OddsAPI: %s → %d events total", sport_slug, len(all_events))
+    logger.info("OddsAPI: %s → %d events (api_calls=%d, cache_hits=%d)",
+                sport_slug, len(all_events), api_calls, cache_hits)
     return all_events
 
 
