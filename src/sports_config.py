@@ -194,9 +194,10 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            78:  {"name": "Суперлига", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
-            37:  {"name": "CEV Champions League", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
-            30:  {"name": "Serie A1", "flag": "🇮🇹", "country": "Италия", "season": 2025, "priority": 2},
+            # Volleyball seasons are cross-year (like basketball): Oct 2025 → May 2026
+            78:  {"name": "Суперлига", "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 1},
+            37:  {"name": "CEV Champions League", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 2},
+            30:  {"name": "Serie A1", "flag": "🇮🇹", "country": "Италия", "season": "2025-2026", "priority": 2},
         },
         "odds_keys": [],
         "rss_feeds": [],
