@@ -458,10 +458,32 @@ def _format_odds_text(odds: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hunter-specific system prompt (NOT ui_live — that one overrides JSON format)
+# ---------------------------------------------------------------------------
+_HUNTER_SYSTEM_PROMPT = """Ты спортивный аналитик.
+Отвечай СТРОГО одним JSON-объектом (без markdown, без текста, без пояснений).
+
+Формат ответа:
+{
+  "confidence": число от 0.55 до 0.85,
+  "recommendation": "П1" или "П2" или "ТБ 2.5" или "П1 + ТБ 2.5",
+  "rec_odds": число (коэффициент),
+  "summary": "2-3 предложения анализа"
+}
+
+ОБЯЗАТЕЛЬНО: recommendation НЕ МОЖЕТ быть пустым. Всегда дай конкретную рекомендацию.
+Верни только JSON."""
+
+
+# ---------------------------------------------------------------------------
 # AI scoring with concrete recommendations
 # ---------------------------------------------------------------------------
 async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
-    """Ask AI to analyze a match and give concrete recommendation."""
+    """Ask AI to analyze a match and give concrete recommendation.
+
+    Uses direct LLM call with Hunter-specific system prompt
+    (NOT schema="ui_live" which overrides the JSON format).
+    """
     odds_parsed = match.get("odds_parsed", {})
     odds_text = _format_odds_text(odds_parsed)
 
@@ -487,38 +509,57 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
         odds_text=odds_text,
         line_movement_text=line_movement_text,
     )
-    cache_key = f"hunter:v2:{match['match_id']}"
 
     try:
-        result, meta = await analyze_with_llm_cached(
+        from .llm_client import _llm_chat_json
+        result = await _llm_chat_json(
             prompt,
-            cache_key=cache_key,
-            schema="ui_live",
-            ttl_s=3600 * 6,
+            timeout_s=40.0,
+            system_prompt=_HUNTER_SYSTEM_PROMPT,
+            max_tokens=500,
         )
 
-        # LLM may return string with JSON (possibly wrapped in ```json...```)
-        if isinstance(result, str):
-            raw = result.strip()
-            # Strip markdown code block
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-            try:
-                result = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                logger.warning("Hunter AI: can't parse JSON from string for %s: %s",
-                               match.get("title", "")[:30], raw[:200])
+        logger.info("Hunter AI raw keys for %s: %s",
+                     match.get("title", "")[:30], list(result.keys()) if isinstance(result, dict) else type(result).__name__)
 
         if isinstance(result, dict):
-            confidence = min(0.85, max(0.55, _safe_float(result.get("confidence", 0.60))))
-            recommendation = str(result.get("recommendation", ""))[:50]
-            rec_odds = _safe_float(result.get("rec_odds", 0))
-            summary = str(result.get("summary", ""))[:500]
+            # Extract fields — try multiple possible key names
+            confidence = _safe_float(
+                result.get("confidence")
+                or result.get("conf")
+                or 0.60
+            )
+            confidence = min(0.85, max(0.55, confidence))
 
-            # If AI still returned 0 confidence — force minimum
-            if confidence < 0.55:
-                confidence = 0.55
+            recommendation = str(
+                result.get("recommendation")
+                or result.get("rec")
+                or result.get("pick")
+                or result.get("bet")
+                or ""
+            ).strip()[:50]
+
+            rec_odds = _safe_float(
+                result.get("rec_odds")
+                or result.get("odds")
+                or 0
+            )
+
+            summary = str(
+                result.get("summary")
+                or result.get("analysis")
+                or result.get("reasoning")
+                or result.get("text")
+                or ""
+            ).strip()[:500]
+
+            # Fallback: extract recommendation from summary text if empty
+            if not recommendation and summary:
+                recommendation = _extract_rec_from_text(summary)
+
+            # Fallback: extract from odds if still empty
+            if not recommendation:
+                recommendation = _extract_rec_from_odds(odds_parsed)
 
             # Adjust confidence based on line movement
             try:
@@ -531,8 +572,8 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            logger.info("Hunter AI result: %s → conf=%.2f rec=%s",
-                        match.get("title", "")[:30], confidence, recommendation)
+            logger.info("Hunter AI result: %s → conf=%.2f rec=%r odds=%.2f",
+                        match.get("title", "")[:30], confidence, recommendation, rec_odds)
 
             return {
                 **match,
@@ -543,13 +584,53 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
                 "line_movement": line_movement_text,
             }
 
-        logger.warning("Hunter AI: non-dict result for %s: type=%s",
-                        match.get("title", "")[:30], type(result).__name__)
+        logger.warning("Hunter AI: non-dict result for %s: %s",
+                        match.get("title", "")[:30], str(result)[:200])
         return {**match, "confidence": 0.0, "analysis_text": "", "recommendation": "", "rec_odds": 0}
 
     except Exception:
         logger.exception("Hunter AI analysis failed for %s", match.get("match_id"))
         return {**match, "confidence": 0.0, "analysis_text": "", "recommendation": "", "rec_odds": 0}
+
+
+def _extract_rec_from_text(text: str) -> str:
+    """Try to extract a recommendation from analysis text."""
+    t = text.upper()
+    # Look for explicit recommendation patterns
+    for pattern, rec in [
+        ("П1 + ТБ", "П1 + ТБ 2.5"), ("П2 + ТБ", "П2 + ТБ 2.5"),
+        ("П1 + ТМ", "П1 + ТМ 2.5"), ("П2 + ТМ", "П2 + ТМ 2.5"),
+    ]:
+        if pattern in t:
+            # Try to extract the actual number
+            m = re.search(rf"{re.escape(pattern)}\s*(\d+[.,]?\d*)", t)
+            if m:
+                return f"{pattern} {m.group(1).replace(',', '.')}"
+            return rec
+
+    # Simple patterns
+    for pattern in ["ТБ", "ТМ"]:
+        m = re.search(rf"\b{pattern}\s*(\d+[.,]?\d*)", t)
+        if m:
+            return f"{pattern} {m.group(1).replace(',', '.')}"
+
+    if "П1" in t and "П2" not in t:
+        return "П1"
+    if "П2" in t and "П1" not in t:
+        return "П2"
+    if re.search(r"\bНИЧЬ", t) or re.match(r"^\s*X\s*$", t):
+        return "X"
+
+    return ""
+
+
+def _extract_rec_from_odds(odds: Dict[str, Any]) -> str:
+    """Fallback: pick favourite from odds."""
+    h = _safe_float(odds.get("home"))
+    a = _safe_float(odds.get("away"))
+    if h > 1.0 and a > 1.0:
+        return "П1" if h < a else "П2"
+    return ""
 
 
 # ---------------------------------------------------------------------------
