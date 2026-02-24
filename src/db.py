@@ -162,6 +162,15 @@ def _bootstrap_migrations_postgres() -> None:
         for col, typ in [("start_time", "TEXT DEFAULT ''"), ("odds_json", "TEXT DEFAULT ''"), ("recommendation", "TEXT DEFAULT ''")]:
             conn.execute(text(f"ALTER TABLE daily_picks ADD COLUMN IF NOT EXISTS {col} {typ}"))
 
+        # Track Record: result columns for daily_picks
+        for col, typ in [
+            ("result", "TEXT"),
+            ("final_score", "TEXT"),
+            ("profit", "DOUBLE PRECISION"),
+            ("checked_at", "TIMESTAMP"),
+        ]:
+            conn.execute(text(f"ALTER TABLE daily_picks ADD COLUMN IF NOT EXISTS {col} {typ}"))
+
         # P1: match_cache (structured data from APIs)
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS match_cache (

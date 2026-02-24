@@ -605,6 +605,7 @@ def kb_main_menu() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
         [InlineKeyboardButton("📊 Анализ матчей", callback_data="MENU:MATCHES")],
+        [InlineKeyboardButton("📈 Track Record", callback_data="MENU:STATS")],
         [InlineKeyboardButton("🌟 PRO", callback_data="MENU:PREMIUM")],
         [InlineKeyboardButton("👤 Профиль", callback_data="MENU:PROFILE")],
         [InlineKeyboardButton("ℹ️ О боте", callback_data="MENU:ABOUT")],
@@ -1431,6 +1432,29 @@ async def handle_hunter_status(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ---------------------------------------------------------------------------
+# /stats — Track Record (доступна ВСЕМ)
+# ---------------------------------------------------------------------------
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /stats — статистика точности Охотника."""
+    if not update.message:
+        return
+    try:
+        from ..track_record import get_stats, format_stats_message
+        stats = get_stats(days=30)
+        text = format_stats_message(stats)
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+            ]),
+        )
+    except Exception:
+        logger.exception("handle_stats error")
+        await update.message.reply_text("Ошибка загрузки статистики. Попробуй позже.")
+
+
+# ---------------------------------------------------------------------------
 # /promo — activate promo code for free PRO
 # ---------------------------------------------------------------------------
 async def handle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2229,6 +2253,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.message.reply_text(_safe_markdown(txt), reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
         return
 
+    if data == "MENU:STATS":
+        try:
+            from ..track_record import get_stats, format_stats_message
+            stats = get_stats(days=30)
+            txt = _truncate_tg(format_stats_message(stats))
+        except Exception:
+            logger.exception("MENU:STATS error")
+            txt = "Ошибка загрузки статистики."
+        stats_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎯 Охотник", callback_data="MENU:HUNTER")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="BACK:MENU")],
+        ])
+        try:
+            await q.edit_message_text(txt, reply_markup=stats_kb)
+        except Exception:
+            await q.message.reply_text(txt, reply_markup=stats_kb)
+        return
+
     if data == "MENU:PROFILE":
         reply = await call_agent_local(user_id, "профиль")
         txt = _truncate_tg(reply)
@@ -2608,6 +2650,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("hunter_status", handle_hunter_status))
     app.add_handler(CommandHandler("promo", handle_promo))
     app.add_handler(CommandHandler("feedback", handle_feedback))
+    app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("skip", handle_skip))
 
     # Payments: pre-checkout + successful payment

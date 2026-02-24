@@ -249,6 +249,79 @@ async def on_startup():
     except Exception:
         logger.exception("Odds tracker failed to start")
 
+    # Track Record: check results every 2 hours
+    try:
+        import asyncio
+        asyncio.create_task(_results_check_loop())
+        logger.info("Track Record results checker started (every 2 hours)")
+    except Exception:
+        logger.exception("Track Record results checker failed to start")
+
+    # Track Record: evening results broadcast at 22:00 MSK
+    try:
+        import asyncio
+        asyncio.create_task(_evening_results_loop())
+        logger.info("Track Record evening broadcast started (22:00 MSK)")
+    except Exception:
+        logger.exception("Track Record evening broadcast failed to start")
+
+
+async def _results_check_loop():
+    """Background loop: check Hunter pick results every 2 hours."""
+    import asyncio
+
+    await asyncio.sleep(120)  # let app start
+
+    while True:
+        try:
+            from .track_record import check_results
+            n = await check_results()
+            logger.info("Track Record loop: settled %d picks", n)
+        except asyncio.CancelledError:
+            logger.info("Results check loop cancelled")
+            break
+        except Exception:
+            logger.exception("Results check loop error")
+
+        await asyncio.sleep(7200)  # 2 hours
+
+
+async def _evening_results_loop():
+    """Background loop: post evening results at 22:00 MSK."""
+    import asyncio
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    await asyncio.sleep(120)  # let app start
+
+    while True:
+        try:
+            now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+            target = now_msk.replace(hour=22, minute=0, second=0, microsecond=0)
+            if now_msk >= target:
+                target += timedelta(days=1)
+            wait = (target - now_msk).total_seconds()
+            logger.info("Evening results loop: sleeping %.0f seconds until 22:00 MSK", wait)
+            await asyncio.sleep(wait)
+
+            # Run final check before posting
+            from .track_record import check_results, evening_results_broadcast
+            await check_results()
+
+            from .telegram_bot.app import _telegram_app
+            bot = _telegram_app.bot if _telegram_app else None
+            if bot:
+                await evening_results_broadcast(bot)
+            else:
+                logger.warning("Evening results: no bot available")
+
+        except asyncio.CancelledError:
+            logger.info("Evening results loop cancelled")
+            break
+        except Exception:
+            logger.exception("Evening results loop error")
+            await asyncio.sleep(60)
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
