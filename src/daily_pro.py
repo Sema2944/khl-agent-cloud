@@ -643,21 +643,55 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
     return "\n".join(lines)
 
 
+def _format_channel_teaser(picks: List[Dict[str, Any]], pick_date: date) -> str:
+    """Build teaser message for channel: matches only, no recommendations."""
+    top3 = [p for p in picks if p.get("pick_type") == "top3"]
+
+    lines = [
+        f"🎯 Охотник — Топ матчи дня",
+        f"{pick_date.strftime('%d.%m.%Y')} | Подобрано AI",
+        "",
+    ]
+
+    for i, p in enumerate(top3[:3], 1):
+        sport = p.get("sport_slug", "")
+        emoji = SPORT_EMOJI.get(sport, "🏆")
+        title = p.get("title", "Матч")
+        league = p.get("league", "")
+        start = _extract_hhmm(p.get("start_time", ""))
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"{i}️⃣ {emoji} {title}")
+
+        league_time = ""
+        if league:
+            league_time = f"   🏆 {league}"
+        if start:
+            league_time += f" | {start} MSK" if league_time else f"   {start} MSK"
+        if league_time:
+            lines.append(league_time)
+
+        lines.append(f"   🔒 Прогноз — в PRO")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔒 Прогнозы и AI-анализ — в PRO подписке")
+    lines.append("")
+    lines.append("👉 @BetlyAIBot — открой бота")
+    lines.append("🎁 Промокод BETLY2026 → 7 дней PRO бесплатно")
+
+    return "\n".join(lines)
+
+
 async def _broadcast_to_channel(bot, picks: List[Dict[str, Any]], pick_date: date) -> bool:
-    """Post Hunter picks to public Telegram channel. Returns True if sent."""
+    """Post Hunter teaser to public Telegram channel. Returns True if sent."""
     if not CHANNEL_USERNAME:
         return False
 
     try:
-        msg = _format_hunter_message(picks, pick_date)
-        # Add CTA footer for channel audience
-        channel_msg = (
-            msg + "\n\n"
-            "Полный AI-анализ каждого матча → @BetlyAIBot\n"
-            "🎁 3 дня PRO бесплатно"
-        )
+        channel_msg = _format_channel_teaser(picks, pick_date)
         await bot.send_message(chat_id=CHANNEL_USERNAME, text=channel_msg)
-        logger.info("Hunter: posted to channel %s", CHANNEL_USERNAME)
+        logger.info("Hunter: posted teaser to channel %s", CHANNEL_USERNAME)
         return True
     except Exception:
         logger.exception("Hunter: channel broadcast failed for %s", CHANNEL_USERNAME)
