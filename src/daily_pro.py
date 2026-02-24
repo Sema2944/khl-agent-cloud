@@ -314,15 +314,41 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Deterministic scoring (no LLM, fast)
 # ---------------------------------------------------------------------------
+# Premium league keywords → extra scoring bonus
+_PREMIUM_LEAGUE_KEYWORDS = [
+    "champions league", "лига чемпионов",
+    "europa league", "лига европы",
+    "conference league",
+    "nhl", "нхл",
+    "nba", "нба",
+    "ufc",
+]
+
+# Minor league keywords → scoring penalty
+_MINOR_LEAGUE_KEYWORDS = [
+    "challenger", "atp 250", "wta 250", "wta 125",
+    "itf", "futures", "qualifying",
+]
+
+
 def _deterministic_score(match: Dict[str, Any]) -> float:
     """Score a match based on deterministic criteria (no LLM)."""
     score = 0.0
     sport = match.get("sport_slug", "")
     league = match.get("league", "")
+    lg_lower = (league or "").lower()
 
     # 1. Top-league bonus (+30)
     if _is_top_league(sport, league):
         score += 30
+
+    # 1b. Premium league bonus (+20): Champions League, NHL, NBA, UFC
+    if any(kw in lg_lower for kw in _PREMIUM_LEAGUE_KEYWORDS):
+        score += 20
+
+    # 1c. Minor league penalty (-15): ATP 250, ITF, challengers
+    if any(kw in lg_lower for kw in _MINOR_LEAGUE_KEYWORDS):
+        score -= 15
 
     # 2. Has odds (+20)
     odds = match.get("odds")
@@ -742,15 +768,42 @@ async def run_daily_hunter(bot=None) -> None:
             scored.append(result)
             await asyncio.sleep(0.5)  # rate limit
 
-        # 6. Rank by AI confidence
-        scored.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        # 6. Filter out failed analyses (confidence=0 or no recommendation)
+        valid = []
+        skipped = 0
+        for m in scored:
+            conf = m.get("confidence", 0)
+            rec = (m.get("recommendation") or "").strip()
+            if conf <= 0 or not rec:
+                skipped += 1
+                logger.info("Hunter: skipping %s — confidence=%.2f rec=%r",
+                            m.get("title", "")[:30], conf, rec)
+                continue
+            valid.append(m)
+        if skipped:
+            logger.info("Hunter: skipped %d matches with empty AI analysis", skipped)
+
+        # Rank by AI confidence + league tier bonus
+        # Premium leagues (CL, EL, NHL, NBA, UFC) get +0.10 effective boost,
+        # minor leagues (ATP 250, ITF, challengers) get -0.10 penalty.
+        # This ensures CL 72% beats ATP 250 75% in selection.
+        def _sort_key(m: Dict[str, Any]) -> float:
+            conf = m.get("confidence", 0)
+            lg = (m.get("league") or "").lower()
+            if any(kw in lg for kw in _PREMIUM_LEAGUE_KEYWORDS):
+                conf += 0.10
+            elif any(kw in lg for kw in _MINOR_LEAGUE_KEYWORDS):
+                conf -= 0.10
+            return conf
+
+        valid.sort(key=_sort_key, reverse=True)
 
         # 7. Diversify: max 2 per sport, but always try to get 3
         top3: List[Dict[str, Any]] = []
         sport_count: Dict[str, int] = defaultdict(int)
         used_ids: set = set()
 
-        for m in scored:
+        for m in valid:
             sport = m.get("sport_slug", "")
             if sport_count[sport] >= 2:
                 continue
@@ -762,7 +815,7 @@ async def run_daily_hunter(bot=None) -> None:
 
         # Fallback: if < 3 after diversification, fill from remaining (ignore sport limit)
         if len(top3) < 3:
-            for m in scored:
+            for m in valid:
                 if m.get("match_id") in used_ids:
                     continue
                 top3.append(m)
