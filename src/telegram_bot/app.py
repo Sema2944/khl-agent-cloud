@@ -1053,7 +1053,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Выбери спорт 👇\n\n"
             "Или используй меню:\n"
             "🎯 /hunter — топ матчи дня\n"
-            "🌟 /pro — PRO подписка",
+            "🌟 /pro — PRO подписка\n"
+            "🎁 Есть промокод? Введи /promo КОД",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
         return
@@ -1227,6 +1228,166 @@ async def handle_hunter_status(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ---------------------------------------------------------------------------
+# /promo — activate promo code for free PRO
+# ---------------------------------------------------------------------------
+async def handle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not user_id:
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Введи промокод: /promo КОД")
+        return
+
+    code = args[0].strip().upper()
+
+    try:
+        from sqlalchemy import text as sa_text
+        from ..db import SessionLocal
+
+        session = SessionLocal()
+        try:
+            # 1. Check if promo code exists
+            row = session.exec(
+                sa_text("SELECT code, max_uses, current_uses, days, expires_at FROM promo_codes WHERE code = :c"),
+                params={"c": code},
+            ).first()
+            if not row:
+                await update.message.reply_text("❌ Промокод не найден")
+                return
+
+            from ..pro_db import _row_to_dict
+            promo = _row_to_dict(row)
+            max_uses = promo.get("max_uses", 0)
+            current_uses = promo.get("current_uses", 0)
+            days = promo.get("days", 7)
+            expires_at = promo.get("expires_at")
+
+            # 2. Check expiry
+            if expires_at is not None:
+                from datetime import timezone as tz
+                exp = expires_at
+                if isinstance(exp, str):
+                    exp = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                if hasattr(exp, 'tzinfo') and exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=tz.utc)
+                if exp < datetime.now(tz.utc):
+                    await update.message.reply_text("❌ Промокод истёк")
+                    return
+
+            # 3. Check limit
+            if current_uses >= max_uses:
+                await update.message.reply_text("❌ Промокод исчерпан (все активации использованы)")
+                return
+
+            # 4. Check if user already activated this code
+            existing = session.exec(
+                sa_text("SELECT id FROM promo_activations WHERE user_id = :uid AND code = :c"),
+                params={"uid": user_id, "c": code},
+            ).first()
+            if existing:
+                await update.message.reply_text("ℹ️ Ты уже активировал этот промокод")
+                return
+
+            # 5. Activate: grant PRO + record activation + increment counter
+            from ..pro_db import grant_pro
+            grant_pro(user_id, days=days)
+
+            session.exec(
+                sa_text("INSERT INTO promo_activations (user_id, code) VALUES (:uid, :c)"),
+                params={"uid": user_id, "c": code},
+            )
+            session.exec(
+                sa_text("UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code = :c"),
+                params={"c": code},
+            )
+            session.commit()
+
+            new_uses = current_uses + 1
+            remaining = max_uses - new_uses
+
+            await update.message.reply_text(
+                f"🎉 Промокод активирован!\n\n"
+                f"✅ PRO на {days} дней — бесплатно\n\n"
+                f"Тебе доступны:\n"
+                f"🎯 Охотник — Топ-3 матча в 11:00\n"
+                f"🔴 LIVE PRO — аналитика в реальном времени\n"
+                f"🔴 LIVE — все идущие матчи\n\n"
+                f"📝 Буду рад обратной связи! Пиши /feedback"
+            )
+
+            # Alert admin
+            username = getattr(update.effective_user, "username", "") or ""
+            first_name = getattr(update.effective_user, "first_name", "") or ""
+            try:
+                admin_id = OWNER_IDS.__iter__().__next__() if OWNER_IDS else None
+                if admin_id and admin_id != user_id:
+                    name = f"@{username}" if username else first_name or str(user_id)
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"🎁 Промокод: {name} активировал {code}\n"
+                            f"PRO на {days} дней\n"
+                            f"Осталось: {remaining}/{max_uses}"
+                        ),
+                    )
+            except Exception:
+                logger.warning("promo: failed to notify admin")
+
+        finally:
+            session.close()
+
+    except Exception:
+        logger.exception("handle_promo failed")
+        await update.message.reply_text("❌ Ошибка при активации промокода. Попробуй позже.")
+
+
+# ---------------------------------------------------------------------------
+# /feedback — user sends feedback, forwarded to admin
+# ---------------------------------------------------------------------------
+_feedback_waiting: set = set()  # user_ids waiting for feedback text
+
+
+async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not user_id:
+        return
+
+    args = context.args
+    if args:
+        # Inline feedback: /feedback текст
+        feedback_text = " ".join(args)
+        await _send_feedback(update, context, user_id, feedback_text)
+    else:
+        _feedback_waiting.add(user_id)
+        await update.message.reply_text("📝 Напиши свой отзыв или предложение следующим сообщением:")
+
+
+async def _send_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text_body: str) -> None:
+    username = getattr(update.effective_user, "username", "") or ""
+    first_name = getattr(update.effective_user, "first_name", "") or ""
+    name = f"@{username}" if username else first_name or str(user_id)
+
+    admin_id = next(iter(OWNER_IDS), None)
+    if admin_id:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"📝 Feedback от {name} (id={user_id}):\n\n{text_body[:2000]}",
+            )
+        except Exception:
+            logger.warning("feedback: failed to forward to admin")
+
+    await update.message.reply_text("✅ Спасибо за обратную связь! Мы обязательно учтём.")
+    _feedback_waiting.discard(user_id)
+
+
+# ---------------------------------------------------------------------------
 # 🔴 LIVE — all in-progress matches across all sports (PRO only)
 # ---------------------------------------------------------------------------
 _LIVE_SPORT_EMOJI = {
@@ -1356,6 +1517,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     norm = text_raw.lower().strip()
 
     logger.info("tg.handle_message user_id=%s text=%r", user_id, text_raw)
+
+    # --- Feedback awaiting ---
+    if user_id in _feedback_waiting and text_raw:
+        await _send_feedback(update, context, user_id, text_raw)
+        return
 
     # --- Reply keyboard: 🔴 LIVE button ---
     if text_raw.strip() == "🔴 LIVE":
@@ -2038,6 +2204,8 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("hunter", handle_hunter))
     app.add_handler(CommandHandler("hunter_refresh", handle_hunter_refresh))
     app.add_handler(CommandHandler("hunter_status", handle_hunter_status))
+    app.add_handler(CommandHandler("promo", handle_promo))
+    app.add_handler(CommandHandler("feedback", handle_feedback))
 
     # Payments: pre-checkout + successful payment
     try:

@@ -204,6 +204,35 @@ def _bootstrap_migrations_postgres() -> None:
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_payments_user_id ON payments (user_id)"""))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_payments_created_at ON payments (created_at)"""))
 
+        # P3: promo codes
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                max_uses INT NOT NULL DEFAULT 20,
+                current_uses INT NOT NULL DEFAULT 0,
+                days INT NOT NULL DEFAULT 7,
+                expires_at TIMESTAMP NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS promo_activations (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                code TEXT NOT NULL,
+                activated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (user_id, code)
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_promo_activations_user ON promo_activations (user_id)"""))
+
+        # Seed default promo code BETLY2026
+        conn.execute(text("""
+            INSERT INTO promo_codes (code, max_uses, days)
+            VALUES ('BETLY2026', 20, 7)
+            ON CONFLICT (code) DO NOTHING
+        """))
+
         # P2: referrals table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS referrals (
