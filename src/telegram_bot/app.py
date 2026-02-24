@@ -53,6 +53,45 @@ HIDE_LOCKED_SPORTS = (os.getenv("HIDE_LOCKED_SPORTS") or "0").strip() == "1"
 
 MSK = datetime.now().astimezone().tzinfo
 
+# ---------------------------------------------------------------------------
+# Update deduplication (handler-level)
+# ---------------------------------------------------------------------------
+_processed_update_ids: set = set()
+_PROCESSED_MAX = 200
+
+
+def _is_duplicate(update_id: int) -> bool:
+    """Return True if this update was already processed (skip it)."""
+    if update_id in _processed_update_ids:
+        logger.debug("Handler dedup: skipping duplicate update_id=%s", update_id)
+        return True
+    _processed_update_ids.add(update_id)
+    if len(_processed_update_ids) > _PROCESSED_MAX:
+        to_remove = sorted(_processed_update_ids)[:_PROCESSED_MAX // 2]
+        _processed_update_ids.difference_update(to_remove)
+    return False
+
+
+async def _safe_edit_or_send(q, text: str, reply_markup=None, parse_mode=None):
+    """Try to edit message; on 'not modified' silently skip, on other errors send new."""
+    try:
+        kwargs: dict = {"reply_markup": reply_markup}
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        await q.edit_message_text(text, **kwargs)
+    except Exception as exc:
+        err_msg = str(exc).lower()
+        if "not modified" in err_msg or "message is not modified" in err_msg:
+            return  # same content — do NOT send a duplicate
+        # genuine error — fallback to reply
+        try:
+            kwargs2: dict = {"reply_markup": reply_markup}
+            if parse_mode:
+                kwargs2["parse_mode"] = parse_mode
+            await q.message.reply_text(text, **kwargs2)
+        except Exception:
+            logger.warning("_safe_edit_or_send: both edit and reply failed")
+
 # Telegram Application
 _telegram_app: Optional[Application] = None
 
@@ -477,10 +516,7 @@ async def _handle_hunter(q, user_id: int):
             [InlineKeyboardButton("⬅️ В меню", callback_data="BACK:MENU")],
         ])
 
-    try:
-        await q.edit_message_text(_truncate_tg(txt), reply_markup=kb)
-    except Exception:
-        await q.message.reply_text(_truncate_tg(txt), reply_markup=kb)
+    await _safe_edit_or_send(q, _truncate_tg(txt), reply_markup=kb)
 
 
 async def _handle_hunter_detail(q, user_id: int, match_id: str):
@@ -514,10 +550,7 @@ async def _handle_hunter_detail(q, user_id: int, match_id: str):
             [InlineKeyboardButton("⬅️ Назад к Охотнику", callback_data="MENU:HUNTER")],
         ])
 
-    try:
-        await q.edit_message_text(txt, reply_markup=kb)
-    except Exception:
-        await q.message.reply_text(txt, reply_markup=kb)
+    await _safe_edit_or_send(q, txt, reply_markup=kb)
 
 
 def kb_main_menu() -> InlineKeyboardMarkup:
@@ -979,6 +1012,8 @@ def _nav_back_to_last(user_id: int) -> Tuple[str, InlineKeyboardMarkup]:
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if _is_duplicate(update.update_id):
+        return
     user_id = update.effective_user.id if update.effective_user else 0
 
     # Ensure user exists in DB
@@ -1313,6 +1348,8 @@ async def _handle_live_button(update: Update, user_id: int) -> None:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+    if _is_duplicate(update.update_id):
+        return
 
     user_id = update.effective_user.id if update.effective_user else 0
     text_raw = (update.message.text or "").strip()
@@ -1385,6 +1422,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.callback_query:
         return
+    if _is_duplicate(update.update_id):
+        return
 
     q = update.callback_query
     data = (q.data or "").strip()
@@ -1409,19 +1448,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # BACK:MENU
     if data == "BACK:MENU":
-        try:
-            await q.edit_message_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
-        except Exception:
-            await q.message.reply_text(MAIN_MENU_TEXT, reply_markup=kb_main_menu())
+        await _safe_edit_or_send(q, MAIN_MENU_TEXT, reply_markup=kb_main_menu())
         return
 
     # BUY:PRO — show tariff selection
     if data == "BUY:PRO":
         txt = _truncate_tg(_text_buy_pro(user_id))
-        try:
-            await q.edit_message_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
-        except Exception:
-            await q.message.reply_text(_safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
+        await _safe_edit_or_send(q, _safe_markdown(txt), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_pro())
         return
 
     # PRO:<tariff_key> — send invoice for payment (ЮKassa or Stars)
@@ -1931,28 +1964,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"матч {match_id}")
         txt = _truncate_tg(reply)
 
-        try:
-            await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        await _safe_edit_or_send(
+            q, _safe_markdown(txt),
+            reply_markup=kb_match_hub(match_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     # UI actions
     if data.startswith("UI:"):
         parts = data.split(":")
         if len(parts) < 4:
-            try:
-                await q.edit_message_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
-            except Exception:
-                await q.message.reply_text("⚠️ Некорректная команда.", reply_markup=kb_main_menu())
+            await _safe_edit_or_send(q, "⚠️ Некорректная команда.", reply_markup=kb_main_menu())
             return
 
         match_id = parts[1].strip()
@@ -1962,25 +1985,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply = await call_agent_local(user_id, f"ui match {match_id} {mode} {action}")
         txt = _truncate_tg(reply)
 
-        try:
-            await q.edit_message_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            await q.message.reply_text(
-                _safe_markdown(txt),
-                reply_markup=kb_match_hub(match_id),
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        await _safe_edit_or_send(
+            q, _safe_markdown(txt),
+            reply_markup=kb_match_hub(match_id),
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     # fallback
-    try:
-        await q.edit_message_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
-    except Exception:
-        await q.message.reply_text("Не понял действие. Открой меню.", reply_markup=kb_main_menu())
+    await _safe_edit_or_send(q, "Не понял действие. Открой меню.", reply_markup=kb_main_menu())
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
