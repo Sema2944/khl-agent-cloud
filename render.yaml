@@ -27,3 +27,6 @@ services:
 
       - key: CHANNEL_USERNAME
         sync: false
+
+      - key: ODDS_API_KEY
+        sync: false

@@ -305,6 +305,51 @@ async def call_agent_local(user_id: int, text: str) -> str:
         return f"⚠️ Агент временно недоступен: {type(e).__name__}: {str(e)[:160]}"
 
 
+async def _get_odds_section(sport_slug: str, match_id: str, base_reply: str) -> str:
+    """Build odds table + line movement section for PRO match analysis.
+
+    Returns a text block to append to the match analysis, or empty string.
+    """
+    sections: list = []
+
+    # 1. Multi-bookmaker odds from The Odds API
+    try:
+        from ..integrations.odds_api import get_match_odds, format_odds_table
+        # Extract team names from base_reply (first line usually has "Team A — Team B")
+        home = away = ""
+        for line in base_reply.split("\n"):
+            if " — " in line:
+                parts = line.split(" — ", 1)
+                home = re.sub(r"[^\w\s]", "", parts[0]).strip()
+                away = re.sub(r"[^\w\s]", "", parts[1]).strip()
+                if home and away:
+                    break
+
+        if home and away:
+            odds = await get_match_odds(sport_slug, home, away)
+            if odds and odds.get("h2h"):
+                table = format_odds_table(odds, home, away)
+                if table:
+                    sections.append(table)
+    except Exception:
+        logger.debug("Odds table fetch failed for %s/%s", sport_slug, match_id)
+
+    # 2. Line movement from odds_history
+    try:
+        from ..odds_tracker import get_line_movement_summary
+        home2 = home or ""
+        away2 = away or ""
+        lm = get_line_movement_summary(match_id, home2, away2)
+        if lm:
+            sections.append(lm)
+    except Exception:
+        logger.debug("Line movement fetch failed for %s", match_id)
+
+    if sections:
+        return "\n\n" + "\n\n".join(sections)
+    return ""
+
+
 def _text_buy_pro(user_id: int) -> str:
     try:
         from .payments import tariff_text
@@ -2476,7 +2521,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.exception("pre-cache matches failed")
 
         reply = await call_agent_local(user_id, f"матч {match_id}")
-        txt = _truncate_tg(reply)
+
+        # Append odds table + line movement for PRO users
+        odds_section = ""
+        try:
+            if is_pro(user_id):
+                odds_section = await _get_odds_section(sport_slug, match_id, reply)
+        except Exception:
+            logger.debug("Odds section failed for MATCH:%s", match_id)
+
+        txt = _truncate_tg(reply + odds_section)
 
         await _safe_edit_or_send(
             q, _safe_markdown(txt),

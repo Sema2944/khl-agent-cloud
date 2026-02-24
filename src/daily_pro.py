@@ -201,11 +201,12 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 Страна: {country}
 Время: {start_time}
 Коэффициенты: {odds_text}
-
+{line_movement_text}
 ЗАДАЧА:
 1. Дай одну КОНКРЕТНУЮ рекомендацию (исход или тотал или их комбинацию)
 2. Объясни в 2-3 предложениях ПОЧЕМУ — конкретные факты, форма, статистика
-3. Оцени уверенность (60-85%)
+3. Если есть движение линии — учти его в анализе
+4. Оцени уверенность (60-85%)
 
 Верни JSON:
 {{
@@ -381,17 +382,52 @@ def _deterministic_score(match: Dict[str, Any]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Odds enrichment for finalists
+# Odds enrichment for finalists (The Odds API + fallback to sport_api)
 # ---------------------------------------------------------------------------
 async def _enrich_odds(match: Dict[str, Any]) -> Dict[str, Any]:
-    """Fetch detailed odds if not already present."""
+    """Fetch detailed odds: try The Odds API first, fallback to sport_api."""
+    # 1. Try The Odds API (multi-bookmaker odds)
+    try:
+        from .integrations.odds_api import get_match_odds as get_odds_api_odds
+        title = match.get("title", "")
+        parts = title.split(" — ", 1)
+        if len(parts) == 2:
+            odds_data = await get_odds_api_odds(
+                match["sport_slug"], parts[0].strip(), parts[1].strip()
+            )
+            if odds_data and odds_data.get("h2h"):
+                match["odds_api_data"] = odds_data
+                # Extract moneyline from best odds
+                best = odds_data.get("best_odds", {})
+                parsed = {}
+                if best.get("home", {}).get("price"):
+                    parsed["home"] = round(best["home"]["price"], 2)
+                if best.get("draw", {}).get("price"):
+                    parsed["draw"] = round(best["draw"]["price"], 2)
+                if best.get("away", {}).get("price"):
+                    parsed["away"] = round(best["away"]["price"], 2)
+                # Totals from first bookmaker
+                totals = odds_data.get("totals", {})
+                if totals:
+                    first_bm = next(iter(totals.values()))
+                    if first_bm.get("line") and first_bm.get("over"):
+                        parsed["total_line"] = first_bm["line"]
+                        parsed["total_over"] = round(first_bm["over"], 2)
+                        parsed["total_under"] = round(first_bm.get("under", 0), 2)
+                match["odds_parsed"] = parsed
+                logger.info("Hunter: enriched %s with OddsAPI (%d bookmakers)",
+                            title[:30], len(odds_data.get("h2h", {})))
+                return match
+    except Exception:
+        logger.debug("Hunter: OddsAPI enrichment failed for %s", match.get("title", "")[:30])
+
+    # 2. Fallback: use existing odds from matches_by_date
     odds = match.get("odds")
     if odds and isinstance(odds, dict):
-        # Already have odds from matches_by_date
         match["odds_parsed"] = _extract_moneyline(odds)
         return match
 
-    # Try to fetch from match_odds API
+    # 3. Last resort: try sport_api match_odds
     try:
         api = SportAPIClient()
         snap = await api.match_odds(match["sport_slug"], match["match_id"])
@@ -426,12 +462,27 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
     odds_parsed = match.get("odds_parsed", {})
     odds_text = _format_odds_text(odds_parsed)
 
+    # Get line movement info (if available from odds_tracker)
+    line_movement_text = ""
+    try:
+        from .odds_tracker import get_line_movement_summary
+        title = match.get("title", "")
+        parts = title.split(" — ", 1)
+        home = parts[0].strip() if len(parts) == 2 else ""
+        away = parts[1].strip() if len(parts) == 2 else ""
+        lm = get_line_movement_summary(match["match_id"], home, away)
+        if lm:
+            line_movement_text = f"Движение линии:\n{lm}\n"
+    except Exception:
+        pass
+
     prompt = _HUNTER_ANALYSIS_PROMPT.format(
         title=match.get("title", ""),
         league=match.get("league", ""),
         country=match.get("country", ""),
         start_time=match.get("start_time", ""),
         odds_text=odds_text,
+        line_movement_text=line_movement_text,
     )
     cache_key = f"hunter:v2:{match['match_id']}"
 
@@ -449,12 +500,24 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
             rec_odds = _safe_float(result.get("rec_odds", 0))
             summary = str(result.get("summary", ""))[:500]
 
+            # Adjust confidence based on line movement
+            try:
+                from .odds_tracker import get_odds_confidence_adjustment
+                adj = get_odds_confidence_adjustment(match["match_id"])
+                if adj != 0:
+                    confidence = min(0.85, max(0.0, confidence + adj))
+                    logger.info("Hunter: confidence adjusted by %+.2f for %s",
+                                adj, match.get("title", "")[:30])
+            except Exception:
+                pass
+
             return {
                 **match,
                 "confidence": confidence,
                 "recommendation": recommendation,
                 "rec_odds": rec_odds,
                 "analysis_text": summary,
+                "line_movement": line_movement_text,
             }
 
         return {**match, "confidence": 0.0, "analysis_text": "", "recommendation": "", "rec_odds": 0}
@@ -610,11 +673,31 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
             if parts:
                 lines.append(f"   💰 {' | '.join(parts)}")
 
-        # Recommendation
+        # Line movement (compact, one line)
+        lm = p.get("line_movement", "")
+        if lm:
+            # Show just the first meaningful line of movement
+            lm_lines = [l.strip() for l in lm.strip().split("\n") if l.strip()]
+            for ll in lm_lines:
+                if ll.startswith("П1") or ll.startswith("П2") or ll.startswith("⚠️"):
+                    lines.append(f"   📈 {ll}")
+                    break
+
+        # Recommendation with best bookmaker
         if rec:
             rec_str = f"   🎯 {rec}"
             if rec_odds > 1.0:
                 rec_str += f" (КЭФ {rec_odds:.2f})"
+            # Add best bookmaker info from OddsAPI data
+            odds_api = p.get("odds_api_data", {})
+            best = odds_api.get("best_odds", {}) if odds_api else {}
+            # Try to match recommendation to best odds
+            if best:
+                rec_lower = rec.lower()
+                if ("п1" in rec_lower or "home" in rec_lower) and best.get("home", {}).get("bookmaker"):
+                    rec_str += f" @ {best['home']['bookmaker']}"
+                elif ("п2" in rec_lower or "away" in rec_lower) and best.get("away", {}).get("bookmaker"):
+                    rec_str += f" @ {best['away']['bookmaker']}"
             lines.append(rec_str)
 
         # Summary

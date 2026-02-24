@@ -240,6 +240,15 @@ async def on_startup():
     except Exception:
         logger.exception("Expiry checker failed to start")
 
+    # Odds tracker (every 2 hours — Line Movement data)
+    try:
+        from .odds_tracker import odds_tracking_loop
+        import asyncio
+        asyncio.create_task(odds_tracking_loop())
+        logger.info("Odds tracker started (every 2 hours)")
+    except Exception:
+        logger.exception("Odds tracker failed to start")
+
 
 @app.on_event("shutdown")
 async def on_shutdown():

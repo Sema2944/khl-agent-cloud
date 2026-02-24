@@ -247,6 +247,23 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_feedback_user ON feedback (user_id)"""))
 
+        # P4: odds_history table (Line Movement tracking)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS odds_history (
+                id SERIAL PRIMARY KEY,
+                match_id TEXT NOT NULL,
+                sport TEXT NOT NULL DEFAULT '',
+                bookmaker TEXT NOT NULL DEFAULT 'Pinnacle',
+                market TEXT NOT NULL DEFAULT 'h2h',
+                outcome TEXT NOT NULL,
+                line DOUBLE PRECISION,
+                price DOUBLE PRECISION NOT NULL,
+                recorded_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_odds_history_match ON odds_history (match_id, market, outcome)"""))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_odds_history_recorded ON odds_history (recorded_at)"""))
+
         # P2: referrals table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS referrals (
