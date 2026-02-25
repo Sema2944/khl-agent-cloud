@@ -1658,23 +1658,40 @@ class SportAPIClient:
                     items = data.get("response") or []
                     errors = data.get("errors")
 
-                    # Season fallback: try season-1 if errors or 0 results
+                    # Season fallback: try alternative seasons if errors or 0 results
                     # SKIP for football — season is always correct (year of season start)
                     # Only do fallback if we haven't already cached a season
                     if (errors or not items) and cached_season is None and sport_slug != "football":
-                        # Build fallback season
-                        fb_season = None
-                        try:
-                            fb_season = int(cfg_season) - 1
-                        except (ValueError, TypeError):
-                            if isinstance(cfg_season, str) and "-" in cfg_season:
-                                parts = cfg_season.split("-")
-                                try:
-                                    fb_season = f"{int(parts[0]) - 1}-{int(parts[1]) - 1}"
-                                except (ValueError, IndexError):
-                                    pass
+                        # Build list of fallback seasons to try
+                        fallback_seasons = []
+                        if sport_slug == "volleyball" or (
+                            sport_slug == "basketball" and isinstance(cfg_season, int)
+                        ):
+                            # Integer-season leagues (volleyball, basketball European).
+                            # Fallback order: next year → previous year
+                            try:
+                                s = int(cfg_season)
+                                fallback_seasons = [s + 1, s - 1]
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            try:
+                                fallback_seasons.append(int(cfg_season) - 1)
+                            except (ValueError, TypeError):
+                                if isinstance(cfg_season, str) and "-" in cfg_season:
+                                    parts = cfg_season.split("-")
+                                    try:
+                                        # Previous season in YYYY-YYYY format
+                                        fallback_seasons.append(f"{int(parts[0]) - 1}-{int(parts[1]) - 1}")
+                                        # Just start year (some leagues use single year)
+                                        fallback_seasons.append(parts[0])
+                                        # Previous start year
+                                        fallback_seasons.append(str(int(parts[0]) - 1))
+                                    except (ValueError, IndexError):
+                                        pass
 
-                        if fb_season is not None:
+                        found = False
+                        for fb_season in fallback_seasons:
                             logger.info(
                                 "api-sports.io: league=%d season=%s → %s, trying season=%s",
                                 league_id, season,
@@ -1696,11 +1713,13 @@ class SportAPIClient:
                                         "api-sports.io: league=%d season=%s fallback → %d matches (cached)",
                                         league_id, fb_season, len(items),
                                     )
-                                elif not errors_fb and not items_fb:
-                                    # Neither season has matches today — cache original to avoid retry
-                                    self._league_season_cache[league_id] = season
-                        elif errors:
-                            logger.warning("api-sports.io: league=%d errors=%s", league_id, errors)
+                                    found = True
+                                    break
+                        if not found:
+                            # No fallback worked — cache original to avoid retrying
+                            self._league_season_cache[league_id] = season
+                            if errors:
+                                logger.warning("api-sports.io: league=%d errors=%s", league_id, errors)
                     elif items and cached_season is None:
                         # First success — cache the season
                         self._league_season_cache[league_id] = season
@@ -1841,7 +1860,13 @@ class SportAPIClient:
         if isinstance(scores, dict):
             h_s = scores.get("home")
             a_s = scores.get("away")
-            if h_s is not None and a_s is not None:
+            # Basketball: scores are dicts with quarter_1..quarter_4, over_time, total
+            if isinstance(h_s, dict) and isinstance(a_s, dict):
+                h_total = h_s.get("total")
+                a_total = a_s.get("total")
+                if h_total is not None and a_total is not None:
+                    score = f"{h_total}:{a_total}"
+            elif h_s is not None and a_s is not None:
                 score = f"{h_s}:{a_s}"
 
         title = f"{home} — {away}"

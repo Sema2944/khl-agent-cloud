@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from .snapshot import build_snapshot
 from .signals import compute_signals
 from .scenarios import build_scenarios
-from .render import render_pro_message
+from .render import render_pro_message, _terms
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,9 @@ def _render_not_started(snapshot: Dict[str, Any]) -> str:
 
 def _render_finished(snapshot: Dict[str, Any]) -> str:
     """Short summary for a finished match — no scenarios needed."""
+    sport_slug = snapshot.get("sport_slug") or "ice-hockey"
+    t = _terms(sport_slug)
+
     teams = snapshot.get("teams") or {}
     home = teams.get("home") or "Хозяева"
     away = teams.get("away") or "Гости"
@@ -117,13 +120,17 @@ def _render_finished(snapshot: Dict[str, Any]) -> str:
     s_h = score.get("home")
     s_a = score.get("away")
     score_txt = f"{s_h}:{s_a}" if (s_h is not None and s_a is not None) else "–:–"
+    quarters = score.get("quarters")
+    if quarters:
+        q_parts = ", ".join(f"{h}:{a}" for h, a in quarters)
+        score_txt += f" ({q_parts})"
 
     league = snapshot.get("league") or ""
     country = snapshot.get("country") or ""
     league_line = " • ".join(p for p in [league, country] if p)
 
     lines = [
-        "📋 Матч завершён",
+        f"{t['emoji']} Матч завершён",
         "",
         f"{home} — {away}",
     ]

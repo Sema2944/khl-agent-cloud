@@ -258,9 +258,56 @@ def _truncate_at_sentence(text: str, limit: int = 200) -> str:
     return chunk.rstrip() + "…"
 
 
+def _normalize_score(raw: Any) -> str:
+    """Normalize basketball dict-scores into readable format.
+
+    '{'quarter_1': 35, 'total': 119}:{'quarter_1': 20, 'total': 98}'
+    → '119:98 (35:20, 25:23, 40:21, 19:34)'
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, dict):
+        total = raw.get("total")
+        return str(total) if total is not None else ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    # Fast path: normal "X:Y" score
+    if re.match(r'^\d+:\d+', s):
+        return s
+    # Detect stringified dicts: "{'quarter_1': ..., 'total': 119}:{'quarter_1': ..., 'total': 98}"
+    if "quarter_" in s or "'total'" in s:
+        try:
+            import ast
+            parts = re.split(r'\}:\{', s)
+            if len(parts) == 2:
+                home_d = ast.literal_eval(parts[0] + '}')
+                away_d = ast.literal_eval('{' + parts[1])
+                h_total = home_d.get('total')
+                a_total = away_d.get('total')
+                if h_total is not None and a_total is not None:
+                    quarters = []
+                    for q in range(1, 10):
+                        h_q = home_d.get(f'quarter_{q}')
+                        a_q = away_d.get(f'quarter_{q}')
+                        if h_q is not None and a_q is not None:
+                            quarters.append(f"{h_q}:{a_q}")
+                    h_ot = home_d.get('over_time')
+                    a_ot = away_d.get('over_time')
+                    if h_ot is not None and a_ot is not None and (h_ot or a_ot):
+                        quarters.append(f"{h_ot}:{a_ot}")
+                    result = f"{h_total}:{a_total}"
+                    if quarters:
+                        result += f" ({', '.join(quarters)})"
+                    return result
+        except Exception:
+            pass
+    return s
+
+
 def _compact_match_btn_title(title: str, score: str, status: str) -> str:
     t = (title or "").strip() or "Матч"
-    sc = (score or "").strip()
+    sc = _normalize_score(score)
     st = (status or "").strip().lower()
 
     is_live = st in {"live", "inprogress", "in_progress", "ht"}
@@ -815,7 +862,7 @@ def _build_nav_state(user_id: int, sport_slug: str, matches: List[Any]) -> _NavS
             "league": league,
             "country": country,
             "status": str(getattr(m, "status", "") or ""),
-            "score": str(getattr(m, "score", "") or ""),
+            "score": _normalize_score(getattr(m, "score", "") or ""),
             "start_time": str(getattr(m, "start_time", "") or ""),
         }
 
@@ -1338,7 +1385,7 @@ async def handle_hunter_refresh(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         from ..daily_pro import run_daily_hunter
-        await run_daily_hunter(bot=None)
+        await run_daily_hunter(bot=context.bot)
     except Exception:
         logger.exception("hunter_refresh failed")
         await update.message.reply_text("❌ Ошибка при генерации. Смотри логи.")
@@ -1856,7 +1903,7 @@ async def _handle_live_button(update: Update, user_id: int) -> None:
 
         for m in matches[:5]:
             title = (m.title or "Матч")[:35]
-            score = (m.score or "?:?")
+            score = _normalize_score(m.score) or "?:?"
             league = (m.league or "")[:15]
             status = (m.status or "").strip()
 
@@ -2174,7 +2221,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         try:
             from ..daily_pro import run_daily_hunter
-            await run_daily_hunter(bot=None)
+            await run_daily_hunter(bot=context.bot)
         except Exception:
             logger.exception("HUNTER:REFRESH failed")
             try:
@@ -2518,7 +2565,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             for m in matches[:5]:
                 title = (m.title or "Матч")[:35]
-                score = (m.score or "?:?")
+                score = _normalize_score(m.score) or "?:?"
                 league = (m.league or "")[:15]
                 text += f"  🔴 {title} {score}"
                 if league:

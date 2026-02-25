@@ -807,7 +807,7 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
                     "league": getattr(m, "league", ""),
                     "status": getattr(m, "status", ""),
                     "start_time": getattr(m, "start_time", ""),
-                    "score": getattr(m, "score", ""),
+                    "score": normalize_score(getattr(m, "score", "")),
                     "odds_base": getattr(m, "odds_base", None),
                     "country": getattr(m, "country", "") if hasattr(m, "country") else "",
                     "raw": getattr(m, "raw", None),
@@ -815,6 +815,63 @@ async def _refresh_match_from_day_list(sport_slug: str, match_id: str, day: date
     except Exception:
         logger.exception("_refresh_match_from_day_list failed")
     return None
+
+
+def normalize_score(raw_score: Any) -> str:
+    """Normalize basketball-style dict scores into readable format.
+
+    Handles:
+      - Normal strings: "119:98" → "119:98"
+      - Dict scores: {'quarter_1': 35, 'total': 119} → "119"
+      - Stringified dicts: "{'quarter_1': 35, 'total': 119}:..." → "119:98 (35:20, 25:23, ...)"
+    """
+    if raw_score is None:
+        return ""
+    # If it's an actual dict (e.g. from raw API), extract total
+    if isinstance(raw_score, dict):
+        total = raw_score.get("total")
+        return str(total) if total is not None else ""
+
+    s = str(raw_score).strip()
+    if not s:
+        return ""
+
+    # Fast path: if it looks like a normal score (digits:digits), return as-is
+    if re.match(r'^\d+:\d+', s):
+        return s
+
+    # Detect stringified dict(s): "{'quarter_1': ...}:{'quarter_1': ...}"
+    if "quarter_" in s or "'total'" in s or '"total"' in s:
+        try:
+            # Try to parse the two sides separated by "}:{"
+            # The raw string looks like: "{'quarter_1': 35, 'total': 119}:{'quarter_1': 20, 'total': 98}"
+            parts = re.split(r'\}:\{', s)
+            if len(parts) == 2:
+                import ast
+                home_d = ast.literal_eval(parts[0] + '}')
+                away_d = ast.literal_eval('{' + parts[1])
+                h_total = home_d.get('total')
+                a_total = away_d.get('total')
+                if h_total is not None and a_total is not None:
+                    # Build quarter breakdown
+                    quarters = []
+                    for q in range(1, 10):
+                        h_q = home_d.get(f'quarter_{q}')
+                        a_q = away_d.get(f'quarter_{q}')
+                        if h_q is not None and a_q is not None:
+                            quarters.append(f"{h_q}:{a_q}")
+                    h_ot = home_d.get('over_time')
+                    a_ot = away_d.get('over_time')
+                    if h_ot is not None and a_ot is not None and (h_ot or a_ot):
+                        quarters.append(f"{h_ot}:{a_ot}")
+                    result = f"{h_total}:{a_total}"
+                    if quarters:
+                        result += f" ({', '.join(quarters)})"
+                    return result
+        except Exception:
+            pass
+
+    return s
 
 
 def _format_status_and_score(status: str, score: str) -> Tuple[str, str]:
@@ -827,7 +884,7 @@ def _format_status_and_score(status: str, score: str) -> Tuple[str, str]:
       - ⏸ Перенесён / Отменён
     """
     s = (status or "").strip().lower()
-    sc = (score or "").strip()
+    sc = normalize_score(score)
 
     # Normalize a few common vendor statuses
     is_live = any(x in s for x in ("live", "1h", "2h", "3h", "ot", "so", "in progress", "playing"))

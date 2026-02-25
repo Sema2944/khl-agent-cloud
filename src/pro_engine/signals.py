@@ -19,6 +19,15 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 # Main entry
 # ---------------------------------------------------------------------------
 
+_SIGNAL_STAT_LABEL: Dict[str, str] = {
+    "ice-hockey": "броски",
+    "football": "удары",
+    "basketball": "атаки",
+    "tennis": "подачи",
+    "volleyball": "атаки",
+}
+
+
 def compute_signals(
     snapshot: Dict[str, Any],
     prev_snapshot: Optional[Dict[str, Any]] = None,
@@ -28,6 +37,9 @@ def compute_signals(
     Never raises.
     """
     try:
+        sport_slug = snapshot.get("sport_slug") or "ice-hockey"
+        stat_label = _SIGNAL_STAT_LABEL.get(sport_slug, "действия")
+
         stats = snapshot.get("stats") or {}
         odds = snapshot.get("odds") or {}
         score = snapshot.get("score") or {}
@@ -53,9 +65,9 @@ def compute_signals(
         has_events = bool(snapshot.get("events"))
 
         signals = {
-            "mci": _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a),
-            "momentum": _compute_momentum(shots_h, shots_a, prev_stats),
-            "market": _compute_market(ml_h, ml_a, prev_odds, shots_h, shots_a),
+            "mci": _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a, stat_label),
+            "momentum": _compute_momentum(shots_h, shots_a, prev_stats, stat_label),
+            "market": _compute_market(ml_h, ml_a, prev_odds, shots_h, shots_a, stat_label),
             "risk": _compute_risk(shots_h, shots_a, ml_h, ml_a, score_h, score_a, period, minute, pen_h, pen_a, prev_odds),
             "confidence": _compute_confidence(shots_h, shots_a, ml_h, ml_a, period, minute,
                                                score_h=score_h, score_a=score_a, has_events=has_events),
@@ -81,7 +93,7 @@ def compute_signals(
 # MCI — Match Control Index 0..100 (home perspective)
 # ---------------------------------------------------------------------------
 
-def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, Any]:
+def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a, stat_label: str = "броски") -> Dict[str, Any]:
     inputs_used: List[str] = []
     shot_score = market_score = score_score = 0.0
 
@@ -108,9 +120,9 @@ def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, An
         inputs_used.append("score")
 
     # Rule: MCI requires at least shots or odds — score alone is NOT enough
-    # (score 0:0 at 20-5 shots ≠ MCI 50; score alone = scoreboard data, not PRO value)
     if not has_shots and not has_ml:
-        return {"value": None, "winner": "–", "explain": "недостаточно данных для MCI (нет бросков и коэффициентов)",
+        return {"value": None, "winner": "–",
+                "explain": f"недостаточно данных для MCI (нет {stat_label} и коэффициентов)",
                 "confidence": 0.0, "inputs_used": inputs_used}
 
     if has_shots and has_ml:
@@ -136,7 +148,7 @@ def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, An
 
     parts = []
     if has_shots:
-        parts.append(f"броски {shots_h}–{shots_a}")
+        parts.append(f"{stat_label} {shots_h}–{shots_a}")
     if has_ml:
         parts.append(f"коэф. {ml_h}/{ml_a}")
     if has_score:
@@ -155,7 +167,7 @@ def _compute_mci(shots_h, shots_a, ml_h, ml_a, score_h, score_a) -> Dict[str, An
 # Momentum (delta shots vs prev snapshot)
 # ---------------------------------------------------------------------------
 
-def _compute_momentum(shots_h, shots_a, prev_stats: Dict[str, Any]) -> Dict[str, Any]:
+def _compute_momentum(shots_h, shots_a, prev_stats: Dict[str, Any], stat_label: str = "броски") -> Dict[str, Any]:
     prev_h = prev_stats.get("shots_home") or prev_stats.get("shots_on_goal_home")
     prev_a = prev_stats.get("shots_away") or prev_stats.get("shots_on_goal_away")
 
@@ -169,9 +181,9 @@ def _compute_momentum(shots_h, shots_a, prev_stats: Dict[str, Any]) -> Dict[str,
     mom_pct = int(round(_clamp(mom * 10, -100, 100)))
 
     if mom_pct >= 20:
-        explain = f"давление хозяев (+{delta_h} бросков)"
+        explain = f"давление хозяев (+{delta_h} {stat_label})"
     elif mom_pct <= -20:
-        explain = f"давление гостей (+{delta_a} бросков)"
+        explain = f"давление гостей (+{delta_a} {stat_label})"
     else:
         explain = "нейтральный темп"
 
@@ -189,7 +201,7 @@ def _compute_momentum(shots_h, shots_a, prev_stats: Dict[str, Any]) -> Dict[str,
 # Market Movement
 # ---------------------------------------------------------------------------
 
-def _compute_market(ml_h, ml_a, prev_odds: Dict[str, Any], shots_h, shots_a) -> Dict[str, Any]:
+def _compute_market(ml_h, ml_a, prev_odds: Dict[str, Any], shots_h, shots_a, stat_label: str = "броски") -> Dict[str, Any]:
     has_odds = ml_h is not None and ml_a is not None and ml_h > 0.1 and ml_a > 0.1
 
     if not has_odds:
@@ -229,12 +241,12 @@ def _compute_market(ml_h, ml_a, prev_odds: Dict[str, Any], shots_h, shots_a) -> 
         drift = result["drift_team"]
         if sog_ratio >= 1.5 and drift in ("away", None):
             result["status"] = "диссонанс"
-            result["explain"] = "хозяева давят по броскам, рынок не реагирует → value"
+            result["explain"] = f"хозяева давят по {stat_label}, рынок не реагирует → value"
             result["confidence"] = 0.80
             result["inputs_used"].append("shots")
         elif sog_ratio <= 0.67 and drift in ("home", None):
             result["status"] = "диссонанс"
-            result["explain"] = "гости давят по броскам, рынок не реагирует → value"
+            result["explain"] = f"гости давят по {stat_label}, рынок не реагирует → value"
             result["confidence"] = 0.80
             result["inputs_used"].append("shots")
 

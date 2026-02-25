@@ -173,11 +173,36 @@ def _build_score(raw: Dict[str, Any], match_meta: Dict[str, Any]) -> Dict[str, A
             except Exception:
                 pass
 
+    # Extract basketball quarter breakdown
+    quarters = _extract_quarters(raw)
+
     return {
         "home": score_h,
         "away": score_a,
         "raw": str(match_meta.get("score") or ""),
+        "quarters": quarters,
     }
+
+
+def _extract_quarters(raw: Dict[str, Any]) -> Optional[list]:
+    """Extract basketball quarter-by-quarter scores from raw data."""
+    scores = raw.get("scores") or {}
+    h_scores = scores.get("home")
+    a_scores = scores.get("away")
+    if not isinstance(h_scores, dict) or not isinstance(a_scores, dict):
+        return None
+    quarters = []
+    for q in range(1, 10):
+        h_q = h_scores.get(f"quarter_{q}")
+        a_q = a_scores.get(f"quarter_{q}")
+        if h_q is not None and a_q is not None:
+            quarters.append((h_q, a_q))
+    # Overtime
+    h_ot = h_scores.get("over_time")
+    a_ot = a_scores.get("over_time")
+    if h_ot is not None and a_ot is not None and (h_ot or a_ot):
+        quarters.append((h_ot, a_ot))
+    return quarters if quarters else None
 
 
 def _score_side(raw: Dict[str, Any], side: str) -> Optional[int]:
@@ -190,6 +215,12 @@ def _score_side(raw: Dict[str, Any], side: str) -> Optional[int]:
         _dig(raw, "teams", side, "score"), _dig(raw, "teams", side, "goals"),
     ]
     for c in candidates:
+        # Basketball: score may be a dict with "total" key
+        if isinstance(c, dict) and "total" in c:
+            v = _i(c["total"])
+            if v is not None:
+                return v
+            continue
         v = _i(c)
         if v is not None:
             return v

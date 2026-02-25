@@ -162,10 +162,11 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
+            # NBA: string "YYYY-YYYY"; European leagues: INTEGER season (like volleyball)
             12:  {"name": "NBA", "flag": "🇺🇸", "country": "USA", "season": "2025-2026", "priority": 1},
-            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 1},
-            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 2},
-            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 2},
+            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
+            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
+            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
         },
         "odds_keys": [
             "basketball_nba",
@@ -194,10 +195,14 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            # Volleyball seasons are cross-year (like basketball): Oct 2025 → May 2026
-            78:  {"name": "Суперлига", "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 1},
-            37:  {"name": "CEV Champions League", "flag": "🇪🇺", "country": "Европа", "season": "2025-2026", "priority": 2},
-            30:  {"name": "Serie A1", "flag": "🇮🇹", "country": "Италия", "season": "2025-2026", "priority": 2},
+            # Volleyball API requires INTEGER season (not "YYYY-YYYY").
+            # Auto-calculated in _dynamic_season(): month >= 9 → year, else year-1.
+            # Correct league IDs verified via api-sports.io:
+            132: {"name": "Суперлига", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
+            133: {"name": "Суперлига Ж", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
+            139: {"name": "Высшая лига", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
+            37:  {"name": "CEV Champions League", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
+            30:  {"name": "Serie A1", "flag": "🇮🇹", "country": "Италия", "season": 2025, "priority": 2},
         },
         "odds_keys": [],
         "rss_feeds": [],
@@ -370,15 +375,32 @@ def get_default_sports() -> List[str]:
     return list(get_enabled_sports().keys())
 
 
-def _dynamic_season(configured_season: Any) -> Any:
-    """Auto-calculate season for leagues using 'YYYY-YYYY' format.
+def _dynamic_season(configured_season: Any, sport_slug: str = "") -> Any:
+    """Auto-calculate season based on sport type.
 
-    NBA/Euroleague seasons start in October:
-      - month >= 10 → season = "{year}-{year+1}"
-      - month < 10  → season = "{year-1}-{year}"
+    Volleyball: INTEGER season, cross-year starting September.
+      month >= 9 → current year, else previous year.
+      E.g. February 2026 → 2025, October 2026 → 2026.
 
-    For integer seasons (football, hockey) — return as-is.
+    Basketball European leagues (Euroleague, Eurocup, VTB): INTEGER season,
+      cross-year starting October. Same logic but month >= 10.
+      NBA keeps 'YYYY-YYYY' string format (handled below).
+
+    NBA and other string 'YYYY-YYYY' seasons start in October:
+      month >= 10 → "{year}-{year+1}", else "{year-1}-{year}"
+
+    For other integer seasons (football, hockey) — return as-is.
     """
+    # Volleyball: always integer, cross-year season starting in September
+    if sport_slug == "volleyball":
+        today = date.today()
+        return today.year if today.month >= 9 else today.year - 1
+
+    # Basketball with integer season (European leagues): cross-year, starts October
+    if sport_slug == "basketball" and isinstance(configured_season, int):
+        today = date.today()
+        return today.year if today.month >= 10 else today.year - 1
+
     if not isinstance(configured_season, str) or "-" not in configured_season:
         return configured_season  # integer season, no change
 
@@ -418,9 +440,9 @@ def get_leagues(slug: str, max_priority: int = 99) -> Dict[int, Dict[str, Any]]:
     result = {}
     for lid, info in cfg.get("leagues", {}).items():
         if info.get("priority", 99) <= max_priority:
-            # Apply dynamic season for string-format seasons
+            # Apply dynamic season calculation
             patched = dict(info)
-            patched["season"] = _dynamic_season(info.get("season"))
+            patched["season"] = _dynamic_season(info.get("season"), slug)
             result[lid] = patched
     return result
 

@@ -1003,7 +1003,8 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
 # ---------------------------------------------------------------------------
 async def run_daily_hunter(bot=None) -> None:
     """Main entry point for daily hunter job (v2)."""
-    logger.info("Hunter v2: starting daily run")
+    logger.info("Hunter v2: starting daily run, bot=%s, channel=%s",
+                "provided" if bot else "None", CHANNEL_USERNAME or "(not set)")
     _hunter_run_info["status"] = "running"
     _hunter_run_info["error"] = None
     _hunter_run_info["last_run_at"] = datetime.now(MSK)

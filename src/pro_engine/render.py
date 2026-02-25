@@ -2,6 +2,7 @@
 """
 Telegram text renderer for PRO ENGINE 2.0.
 Produces the formatted LIVE PRO block — no LLM required.
+Sport-aware: adapts emoji, terminology and stats per sport.
 """
 from __future__ import annotations
 
@@ -20,6 +21,77 @@ except Exception:
     _MSK = None
 
 
+# ---------------------------------------------------------------------------
+# Sport-specific terminology
+# ---------------------------------------------------------------------------
+
+_SPORT_TERMS: Dict[str, Dict[str, Any]] = {
+    "ice-hockey": {
+        "emoji": "🏒",
+        "period_label": "П",          # Период
+        "score_event": "гол",
+        "penalty_event": "удаление",
+        "pressure_stat": "броски",
+        "pressure_label": "Shots",
+        "dominance_word": "давит",
+    },
+    "football": {
+        "emoji": "⚽",
+        "period_label": "Т",           # Тайм
+        "score_event": "гол",
+        "penalty_event": "удаление",
+        "pressure_stat": "удары",
+        "pressure_label": "Shots",
+        "dominance_word": "давит",
+    },
+    "basketball": {
+        "emoji": "🏀",
+        "period_label": "Q",           # Четверть
+        "score_event": "рывок",
+        "penalty_event": "фол",
+        "pressure_stat": "атаки",
+        "pressure_label": "Scoring",
+        "dominance_word": "доминирует",
+    },
+    "tennis": {
+        "emoji": "🎾",
+        "period_label": "Сет",
+        "score_event": "брейк",
+        "penalty_event": "двойная ошибка",
+        "pressure_stat": "подачи",
+        "pressure_label": "Serve",
+        "dominance_word": "доминирует",
+    },
+    "volleyball": {
+        "emoji": "🏐",
+        "period_label": "Сет",
+        "score_event": "серия очков",
+        "penalty_event": "ошибка",
+        "pressure_stat": "атаки",
+        "pressure_label": "Attacks",
+        "dominance_word": "доминирует",
+    },
+}
+
+_DEFAULT_TERMS: Dict[str, Any] = {
+    "emoji": "🏟",
+    "period_label": "П",
+    "score_event": "гол",
+    "penalty_event": "нарушение",
+    "pressure_stat": "действия",
+    "pressure_label": "Actions",
+    "dominance_word": "давит",
+}
+
+
+def _terms(sport_slug: str) -> Dict[str, Any]:
+    return _SPORT_TERMS.get(sport_slug or "", _DEFAULT_TERMS)
+
+
+# ---------------------------------------------------------------------------
+# Main renderer
+# ---------------------------------------------------------------------------
+
 def render_pro_message(
     snapshot: Dict[str, Any],
     signals: Dict[str, Any],
@@ -31,6 +103,9 @@ def render_pro_message(
     """
     try:
         lines: List[str] = []
+
+        sport_slug = snapshot.get("sport_slug") or "ice-hockey"
+        t = _terms(sport_slug)
 
         teams = snapshot.get("teams") or {}
         home = teams.get("home") or "Хозяева"
@@ -44,7 +119,7 @@ def render_pro_message(
         period = clock.get("period")
         minute = clock.get("minute")
         if period:
-            header_parts.append(f"П{period}")
+            header_parts.append(f"{t['period_label']}{period}")
         if minute is not None:
             header_parts.append(f"{minute}'")
         lines.append(" | ".join(header_parts))
@@ -54,7 +129,11 @@ def render_pro_message(
         s_h = score.get("home")
         s_a = score.get("away")
         score_txt = f"{s_h}:{s_a}" if (s_h is not None and s_a is not None) else "–:–"
-        lines.append(f"🏒 {home} {score_txt} {away}")
+        quarters = score.get("quarters")
+        if quarters:
+            q_parts = ", ".join(f"{h}:{a}" for h, a in quarters)
+            score_txt += f" ({q_parts})"
+        lines.append(f"{t['emoji']} {home} {score_txt} {away}")
 
         league = snapshot.get("league") or ""
         country = snapshot.get("country") or ""
@@ -67,7 +146,7 @@ def render_pro_message(
         conf_val = conf.get("value", 1)
 
         # ── 📊 Статистика матча ────────────────────────────
-        _render_stats_section(lines, stats)
+        _render_stats_section(lines, stats, sport_slug)
 
         # ── ⚡ События ──────────────────────────────────────
         _render_events_section(lines, snapshot.get("events") or [])
@@ -97,7 +176,7 @@ def render_pro_message(
             lines.append("")
             lines.append("📈 Pressure / Momentum")
             if shots_h is not None and shots_a is not None:
-                lines.append(f"• Shots: {shots_h}–{shots_a}")
+                lines.append(f"• {t['pressure_label']}: {shots_h}–{shots_a}")
             if mom_val is not None:
                 sign = "+" if mom_val > 0 else ""
                 lines.append(f"• Momentum: {sign}{mom_val}% ({mom_explain})" if mom_explain else f"• Momentum: {sign}{mom_val}%")
@@ -210,10 +289,28 @@ def render_pro_message(
 # Section renderers
 # ---------------------------------------------------------------------------
 
-def _render_stats_section(lines: List[str], stats: Dict[str, Any]) -> None:
-    """Render statistics table (shots, penalties, powerplay, etc.)."""
+def _render_stats_section(lines: List[str], stats: Dict[str, Any], sport_slug: str = "ice-hockey") -> None:
+    """Render statistics table — adapted per sport."""
     stat_lines = []
 
+    if sport_slug == "tennis":
+        _render_tennis_stats(stat_lines, stats)
+    elif sport_slug == "basketball":
+        _render_basketball_stats(stat_lines, stats)
+    elif sport_slug == "volleyball":
+        _render_volleyball_stats(stat_lines, stats)
+    elif sport_slug == "football":
+        _render_football_stats(stat_lines, stats)
+    else:
+        _render_hockey_stats(stat_lines, stats)
+
+    if stat_lines:
+        lines.append("")
+        lines.append("📊 Статистика матча:")
+        lines.extend(stat_lines)
+
+
+def _render_hockey_stats(stat_lines: List[str], stats: Dict[str, Any]) -> None:
     shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
     shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
     if shots_h is not None and shots_a is not None:
@@ -234,7 +331,18 @@ def _render_stats_section(lines: List[str], stats: Dict[str, Any]) -> None:
     if pp_h is not None and pp_a is not None:
         stat_lines.append(f"  Большинство: {pp_h} — {pp_a}")
 
-    # Football-specific
+
+def _render_football_stats(stat_lines: List[str], stats: Dict[str, Any]) -> None:
+    shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
+    shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
+    if shots_h is not None and shots_a is not None:
+        dominant = ""
+        if shots_h > shots_a * 1.3:
+            dominant = " (хозяева давят)"
+        elif shots_a > shots_h * 1.3:
+            dominant = " (гости давят)"
+        stat_lines.append(f"  Удары:      {shots_h} — {shots_a}{dominant}")
+
     poss_h = stats.get("possession_home")
     poss_a = stats.get("possession_away")
     if poss_h is not None and poss_a is not None:
@@ -250,10 +358,52 @@ def _render_stats_section(lines: List[str], stats: Dict[str, Any]) -> None:
     if xg_h is not None and xg_a is not None:
         stat_lines.append(f"  xG:         {xg_h} — {xg_a}")
 
-    if stat_lines:
-        lines.append("")
-        lines.append("📊 Статистика матча:")
-        lines.extend(stat_lines)
+    da_h = stats.get("dangerous_home")
+    da_a = stats.get("dangerous_away")
+    if da_h is not None and da_a is not None:
+        stat_lines.append(f"  Опасные:    {da_h} — {da_a}")
+
+
+def _render_basketball_stats(stat_lines: List[str], stats: Dict[str, Any]) -> None:
+    shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
+    shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
+    if shots_h is not None and shots_a is not None:
+        stat_lines.append(f"  Атаки:      {shots_h} — {shots_a}")
+
+    pen_h = stats.get("penalties_home")
+    pen_a = stats.get("penalties_away")
+    if pen_h is not None and pen_a is not None:
+        stat_lines.append(f"  Фолы:       {pen_h} — {pen_a}")
+
+
+def _render_tennis_stats(stat_lines: List[str], stats: Dict[str, Any]) -> None:
+    # Tennis: aces, double faults, break points, serve %
+    shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
+    shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
+    if shots_h is not None and shots_a is not None:
+        stat_lines.append(f"  Эйсы:      {shots_h} — {shots_a}")
+
+    pen_h = stats.get("penalties_home")
+    pen_a = stats.get("penalties_away")
+    if pen_h is not None and pen_a is not None:
+        stat_lines.append(f"  Дабл-фолты: {pen_h} — {pen_a}")
+
+    pp_h = stats.get("pp_home")
+    pp_a = stats.get("pp_away")
+    if pp_h is not None and pp_a is not None:
+        stat_lines.append(f"  Брейк-пойнты: {pp_h} — {pp_a}")
+
+
+def _render_volleyball_stats(stat_lines: List[str], stats: Dict[str, Any]) -> None:
+    shots_h = stats.get("shots_home") or stats.get("shots_on_goal_home")
+    shots_a = stats.get("shots_away") or stats.get("shots_on_goal_away")
+    if shots_h is not None and shots_a is not None:
+        stat_lines.append(f"  Атаки:      {shots_h} — {shots_a}")
+
+    pen_h = stats.get("penalties_home")
+    pen_a = stats.get("penalties_away")
+    if pen_h is not None and pen_a is not None:
+        stat_lines.append(f"  Ошибки:     {pen_h} — {pen_a}")
 
 
 def _render_events_section(lines: List[str], events: list) -> None:
@@ -283,6 +433,8 @@ def _render_timestamp(lines: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_status(snapshot: Dict[str, Any]) -> str:
+    sport_slug = snapshot.get("sport_slug") or "ice-hockey"
+    t = _terms(sport_slug)
     clock = snapshot.get("clock") or {}
     score = snapshot.get("score") or {}
     status = snapshot.get("status") or ""
@@ -297,7 +449,7 @@ def _render_status(snapshot: Dict[str, Any]) -> str:
     # Period
     period = clock.get("period")
     if period:
-        parts.append(f"П{period}")
+        parts.append(f"{t['period_label']}{period}")
 
     # Minute
     minute = clock.get("minute")

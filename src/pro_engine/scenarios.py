@@ -2,6 +2,7 @@
 """
 Scenario Engine: builds main + alternative scenario from snapshot + signals.
 Each scenario: {name, description, trigger, cancel, team, confidence}.
+Sport-aware: adapts terminology per sport.
 Never raises.
 """
 from __future__ import annotations
@@ -10,6 +11,79 @@ import logging
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Sport-specific scenario terminology
+# ---------------------------------------------------------------------------
+
+_SCENARIO_TERMS: Dict[str, Dict[str, str]] = {
+    "ice-hockey": {
+        "score_event": "гол",
+        "first_score": "первый гол",
+        "penalty_event": "удаление",
+        "pressure_stat": "броски",
+        "pressure_delta": "Δshots",
+        "period_name": "периоде",
+        "late_period": "3-й период",
+        "fast_counter": "быстрая контратака",
+    },
+    "football": {
+        "score_event": "гол",
+        "first_score": "первый гол",
+        "penalty_event": "удаление",
+        "pressure_stat": "удары",
+        "pressure_delta": "Δshots",
+        "period_name": "тайме",
+        "late_period": "2-й тайм",
+        "fast_counter": "быстрая контратака",
+    },
+    "basketball": {
+        "score_event": "рывок",
+        "first_score": "первый рывок",
+        "penalty_event": "фол",
+        "pressure_stat": "атаки",
+        "pressure_delta": "Δscoring",
+        "period_name": "четверти",
+        "late_period": "4-я четверть",
+        "fast_counter": "быстрый переход",
+    },
+    "tennis": {
+        "score_event": "брейк",
+        "first_score": "первый брейк",
+        "penalty_event": "двойная ошибка",
+        "pressure_stat": "подачи",
+        "pressure_delta": "Δaces",
+        "period_name": "сете",
+        "late_period": "решающий сет",
+        "fast_counter": "брейк на подаче соперника",
+    },
+    "volleyball": {
+        "score_event": "серия очков",
+        "first_score": "первая серия",
+        "penalty_event": "ошибка",
+        "pressure_stat": "атаки",
+        "pressure_delta": "Δattacks",
+        "period_name": "сете",
+        "late_period": "решающий сет",
+        "fast_counter": "серия подач",
+    },
+}
+
+_DEFAULT_SCENARIO_TERMS: Dict[str, str] = {
+    "score_event": "гол",
+    "first_score": "первый гол",
+    "penalty_event": "нарушение",
+    "pressure_stat": "действия",
+    "pressure_delta": "Δactions",
+    "period_name": "периоде",
+    "late_period": "финальный период",
+    "fast_counter": "быстрая атака",
+}
+
+
+def _sterms(sport_slug: str) -> Dict[str, str]:
+    return _SCENARIO_TERMS.get(sport_slug or "", _DEFAULT_SCENARIO_TERMS)
 
 
 def build_scenarios(
@@ -26,6 +100,9 @@ def build_scenarios(
     ScenarioDict = {name, description, trigger, cancel, team, confidence}
     """
     try:
+        sport_slug = snapshot.get("sport_slug") or "ice-hockey"
+        t = _sterms(sport_slug)
+
         mci = signals.get("mci") or {}
         momentum = signals.get("momentum") or {}
         market = signals.get("market") or {}
@@ -62,17 +139,17 @@ def build_scenarios(
             market_status, drift_team,
             score_h, score_a, period,
             home_name, away_name,
-            shots_h, shots_a,
+            shots_h, shots_a, t,
         )
 
         alt_scenario = _build_alt(
             mci_winner, mom_value,
             market_status, drift_team,
             score_h, score_a, period,
-            home_name, away_name,
+            home_name, away_name, t,
         )
 
-        cancel_text = _build_cancel(mci_winner, home_name, away_name, score_h, score_a)
+        cancel_text = _build_cancel(mci_winner, home_name, away_name, score_h, score_a, t)
 
         return {
             "main": main_scenario,
@@ -95,7 +172,7 @@ def _build_main(
     market_status, drift_team,
     score_h, score_a, period,
     home_name, away_name,
-    shots_h, shots_a,
+    shots_h, shots_a, t,
 ) -> Optional[Dict[str, Any]]:
     """Dominant team continues to control — or tense draw scenario."""
 
@@ -110,32 +187,31 @@ def _build_main(
         opp_team = home_name
     else:
         # Draw — tight game scenario
-        return _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_value)
+        return _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_value, t)
 
     # Disssonance? Market not following game pressure → value bet
     if "диссонанс" in (market_status or ""):
         return {
             "name": f"Диссонанс: {ctrl_team} давит",
             "description": (
-                f"{ctrl_team} контролирует игру по броскам, "
+                f"{ctrl_team} контролирует игру по {t['pressure_stat']}, "
                 f"но рынок запаздывает с переоценкой — потенциальная value."
             ),
-            "trigger": f"следующий гол {ctrl_team}",
+            "trigger": f"следующий {t['score_event']} {ctrl_team}",
             "team": ctrl_side,
             "confidence": round(min(0.80, mci_conf + 0.05), 2),
         }
 
     # Strong momentum
     if mom_value is not None and abs(mom_value) >= 30:
-        pressing = ctrl_team
         delta = mom_delta_h if ctrl_side == "home" else mom_delta_a
         return {
             "name": f"Контроль {ctrl_team}",
             "description": (
-                f"{ctrl_team} набирает темп (+{delta} бросков за отрезок). "
-                f"При сохранении давления возможен гол."
+                f"{ctrl_team} набирает темп (+{delta} {t['pressure_stat']} за отрезок). "
+                f"При сохранении давления возможен {t['score_event']}."
             ),
-            "trigger": f"Δshots ≥ +3 у {ctrl_team} за 5 мин или гол",
+            "trigger": f"{t['pressure_delta']} ≥ +3 у {ctrl_team} за 5 мин или {t['score_event']}",
             "team": ctrl_side,
             "confidence": round(min(0.85, mci_conf), 2),
         }
@@ -151,7 +227,7 @@ def _build_main(
                 f"{ctrl_team} лидирует по MCI={mci_value}/100, "
                 f"коэффициенты движутся в их пользу — тренд подтверждён."
             ),
-            "trigger": f"продолжение доминирования {ctrl_team} по броскам",
+            "trigger": f"продолжение доминирования {ctrl_team} по {t['pressure_stat']}",
             "team": ctrl_side,
             "confidence": round(min(0.82, mci_conf), 2),
         }
@@ -161,18 +237,18 @@ def _build_main(
         "name": f"Контроль {ctrl_team}",
         "description": (
             f"{ctrl_team} контролирует матч (MCI {mci_value}/100). "
-            f"Сохраняют инициативу по броскам."
+            f"Сохраняют инициативу по {t['pressure_stat']}."
         ),
-        "trigger": f"MCI остаётся > {'60' if ctrl_side == 'home' else '60'} и Δshots в пользу {ctrl_team}",
+        "trigger": f"MCI остаётся > 60 и {t['pressure_delta']} в пользу {ctrl_team}",
         "team": ctrl_side,
         "confidence": round(mci_conf, 2),
     }
 
 
-def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_value) -> Dict[str, Any]:
+def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_value, t) -> Dict[str, Any]:
     has_score = score_h is not None and score_a is not None
     score_txt = f"{score_h}:{score_a}" if has_score else "–:–"
-    period_txt = f" в {period}-м периоде" if period else ""
+    period_txt = f" в {period}-м {t['period_name']}" if period else ""
 
     goals_scored = has_score and (score_h + score_a) > 0
     score_equal = has_score and score_h == score_a
@@ -189,13 +265,13 @@ def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_val
                 f"Счёт {score_txt}{period_txt}. "
                 f"Команды идут вровень — высокая напряжённость.{mci_txt}"
             )
-            trigger = "следующий гол определит ход матча"
+            trigger = f"следующий {t['score_event']} определит ход матча"
         else:
             description = (
                 f"Счёт {score_txt}{period_txt}. "
                 f"Команды уравновешены по показателям.{mci_txt}"
             )
-            trigger = "первый гол или удаление сломает равновесие"
+            trigger = f"{t['first_score']} или {t['penalty_event']} сломает равновесие"
     elif score_diff == 1:
         # 1:0, 0:1, 2:1 — minimal advantage
         leading = home_name if score_h > score_a else away_name
@@ -204,7 +280,7 @@ def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_val
             f"Счёт {score_txt}{period_txt}. "
             f"{leading} ведёт с минимальным отрывом — интрига сохраняется.{mci_txt}"
         )
-        trigger = "следующий гол: усиление отрыва или возврат к равенству"
+        trigger = f"следующий {t['score_event']}: усиление отрыва или возврат к равенству"
     else:
         # 2:0+ — MCI says "equal" but score doesn't
         leading = home_name if score_h > score_a else away_name
@@ -213,7 +289,7 @@ def _scenario_tight_game(score_h, score_a, period, home_name, away_name, mci_val
             f"Счёт {score_txt}{period_txt}. "
             f"{leading} впереди, но показатели команд близки.{mci_txt}"
         )
-        trigger = f"гол проигрывающей команды или усиление доминирования {leading}"
+        trigger = f"{t['score_event']} проигрывающей команды или усиление доминирования {leading}"
 
     return {
         "name": name,
@@ -232,7 +308,7 @@ def _build_alt(
     mci_winner, mom_value,
     market_status, drift_team,
     score_h, score_a, period,
-    home_name, away_name,
+    home_name, away_name, t,
 ) -> Optional[Dict[str, Any]]:
     """Reversal / tempo-drop / underdog scenario."""
 
@@ -249,25 +325,24 @@ def _build_alt(
         return {
             "name": "Burst одной из команд",
             "description": (
-                "Следующий гол может резко изменить баланс в пользу забившей команды."
+                f"Следующий {t['score_event']} может резко изменить баланс в пользу забившей команды."
                 if goals_scored else
-                "При первом голе ситуация может резко измениться в пользу забившей команды."
+                f"При первом {t['score_event']} ситуация может резко измениться."
             ),
-            "trigger": "следующий гол" if goals_scored else "первый гол",
+            "trigger": f"следующий {t['score_event']}" if goals_scored else t["first_score"],
             "team": "neutral",
             "confidence": 0.45,
         }
 
     # Disssonance: underdog is who market favours while pressing less
     if "диссонанс" in (market_status or ""):
-        # Market not moving with game → underdog reversal is alternative
         return {
             "name": f"Отскок {under_team}",
             "description": (
-                f"{under_team} уступают по броскам, но рынок ещё не переоценил шансы. "
-                f"Один быстрый гол меняет картину."
+                f"{under_team} уступают по {t['pressure_stat']}, но рынок ещё не переоценил шансы. "
+                f"Один быстрый {t['score_event']} меняет картину."
             ),
-            "trigger": f"гол {under_team} или резкий рост коэффициента против них",
+            "trigger": f"{t['score_event']} {under_team} или резкий рост коэффициента против них",
             "team": under_side,
             "confidence": 0.42,
         }
@@ -278,9 +353,9 @@ def _build_alt(
             "name": f"Спад темпа — шанс {under_team}",
             "description": (
                 f"Темп давления снижается. {under_team} могут перехватить инициативу "
-                f"при следующем удалении или быстрой контратаке."
+                f"при следующем {t['penalty_event']} или {t['fast_counter']}."
             ),
-            "trigger": f"удаление лидирующей команды или Δshots в пользу {under_team}",
+            "trigger": f"{t['penalty_event']} лидирующей команды или {t['pressure_delta']} в пользу {under_team}",
             "team": under_side,
             "confidence": 0.40,
         }
@@ -290,12 +365,12 @@ def _build_alt(
         has_score = score_h is not None and score_a is not None
         if has_score and abs(score_h - score_a) <= 1:
             return {
-                "name": f"Камбэк {under_team} (3-й период)",
+                "name": f"Камбэк {under_team} ({t['late_period']})",
                 "description": (
-                    f"Минимальная разница в счёте в 3-м периоде. "
+                    f"Минимальная разница в счёте в {t['late_period']}. "
                     f"{under_team} вынуждены идти вперёд — возможно обострение."
                 ),
-                "trigger": f"гол {under_team} + смена коэффициентов",
+                "trigger": f"{t['score_event']} {under_team} + смена коэффициентов",
                 "team": under_side,
                 "confidence": 0.48,
             }
@@ -304,9 +379,9 @@ def _build_alt(
         "name": f"Перехват {under_team}",
         "description": (
             f"{under_team} уступают по контролю, но одно стечение обстоятельств "
-            f"(удаление, быстрый гол) может изменить баланс."
+            f"({t['penalty_event']}, быстрый {t['score_event']}) может изменить баланс."
         ),
-        "trigger": f"удаление или гол {under_team}",
+        "trigger": f"{t['penalty_event']} или {t['score_event']} {under_team}",
         "team": under_side,
         "confidence": 0.38,
     }
@@ -316,7 +391,7 @@ def _build_alt(
 # Cancel conditions
 # ---------------------------------------------------------------------------
 
-def _build_cancel(mci_winner, home_name, away_name, score_h, score_a) -> str:
+def _build_cancel(mci_winner, home_name, away_name, score_h, score_a, t) -> str:
     if mci_winner == "Хозяева":
         ctrl = home_name
         opp = away_name
@@ -324,9 +399,9 @@ def _build_cancel(mci_winner, home_name, away_name, score_h, score_a) -> str:
         ctrl = away_name
         opp = home_name
     else:
-        return f"гол {home_name} или {away_name} с последующим изменением momentum"
+        return f"{t['score_event']} {home_name} или {away_name} с последующим изменением momentum"
 
-    parts = [f"гол {opp}"]
-    parts.append(f"удаление {ctrl}")
-    parts.append("резкий разворот momentum (Δshots ≥ +5 за 5 мин у соперника)")
+    parts = [f"{t['score_event']} {opp}"]
+    parts.append(f"{t['penalty_event']} {ctrl}")
+    parts.append(f"резкий разворот momentum ({t['pressure_delta']} ≥ +5 за 5 мин у соперника)")
     return " / ".join(parts)
