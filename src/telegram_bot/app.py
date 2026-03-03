@@ -1479,6 +1479,173 @@ async def handle_hunter_status(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ---------------------------------------------------------------------------
+# Scheduled channel posts — admin commands (OWNER_IDS only)
+# ---------------------------------------------------------------------------
+
+async def handle_post_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/post TEXT — publish text to channel immediately."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    post_text = " ".join(context.args) if context.args else ""
+    if not post_text:
+        await update.message.reply_text("Использование: /post <текст>")
+        return
+
+    from ..scheduled_posts import CHANNEL_USERNAME
+    if not CHANNEL_USERNAME:
+        await update.message.reply_text("❌ CHANNEL_USERNAME не задан в .env")
+        return
+
+    try:
+        msg = await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post_text)
+        await update.message.reply_text(f"✅ Опубликовано (msg_id={msg.message_id})")
+    except Exception as e:
+        logger.exception("handle_post_cmd error")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def handle_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/schedule YYYY-MM-DD HH:MM TEXT — schedule a post (MSK time)."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    # Parse: /schedule 2026-03-05 09:00 Текст поста
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_text("Использование: /schedule YYYY-MM-DD HH:MM <текст>")
+        return
+
+    date_str = args[0]
+    time_str = args[1]
+    post_text = " ".join(args[2:])
+
+    try:
+        from zoneinfo import ZoneInfo
+        dt_msk = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt_msk = dt_msk.replace(tzinfo=ZoneInfo("Europe/Moscow"))
+        dt_utc = dt_msk.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат даты/времени. Пример: 2026-03-05 09:00")
+        return
+
+    from ..scheduled_posts import add_scheduled_post
+    post_id = add_scheduled_post(post_text, dt_utc)
+    await update.message.reply_text(
+        f"✅ Пост #{post_id} запланирован на {date_str} {time_str} MSK"
+    )
+
+
+async def handle_posts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/posts — list pending scheduled posts."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    from ..scheduled_posts import list_scheduled_posts
+    from zoneinfo import ZoneInfo
+    posts = list_scheduled_posts(only_pending=True)
+    if not posts:
+        await update.message.reply_text("📭 Нет запланированных постов.")
+        return
+
+    lines = [f"📋 Запланировано постов: {len(posts)}\n"]
+    for p in posts[:30]:  # limit display
+        pub_at = p["publish_at"]
+        if pub_at.tzinfo is None:
+            pub_at = pub_at.replace(tzinfo=ZoneInfo("UTC"))
+        pub_msk = pub_at.astimezone(ZoneInfo("Europe/Moscow"))
+        preview = p["text"][:50].replace("\n", " ")
+        pin_mark = " 📌" if p.get("pinned") else ""
+        lines.append(f"#{p['id']} | {pub_msk:%d.%m %H:%M} | {preview}...{pin_mark}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_delpost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delpost ID — delete a pending scheduled post."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /delpost <ID>")
+        return
+
+    post_id = int(context.args[0])
+    from ..scheduled_posts import delete_scheduled_post
+    if delete_scheduled_post(post_id):
+        await update.message.reply_text(f"✅ Пост #{post_id} удалён.")
+    else:
+        await update.message.reply_text(f"❌ Пост #{post_id} не найден или уже опубликован.")
+
+
+async def handle_loadposts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/loadposts — bulk load 20 predefined posts (19 scheduled + 1 pinned now)."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id not in OWNER_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администратору.")
+        return
+
+    from zoneinfo import ZoneInfo
+    from ..scheduled_posts import (
+        load_predefined_posts, publish_pinned_post_now,
+        clear_unpublished_posts, CHANNEL_USERNAME,
+    )
+
+    if not CHANNEL_USERNAME:
+        await update.message.reply_text("❌ CHANNEL_USERNAME не задан в .env")
+        return
+
+    # Clear old unpublished posts first
+    deleted = clear_unpublished_posts()
+    if deleted:
+        await update.message.reply_text(f"🗑 Удалено {deleted} старых неопубликованных постов.")
+
+    # Tomorrow in MSK
+    from datetime import timedelta
+    tomorrow_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) + timedelta(days=1)
+
+    # 1) Schedule 19 content posts
+    count = load_predefined_posts(tomorrow_msk)
+
+    # 2) Publish and pin the pinned post immediately
+    await update.message.reply_text(f"📝 Загружено {count} постов в расписание.\n📌 Публикую закреп-пост...")
+    pin_msg_id = await publish_pinned_post_now(context.bot)
+
+    if pin_msg_id:
+        await update.message.reply_text(
+            f"✅ Готово!\n"
+            f"📌 Закреп опубликован (msg_id={pin_msg_id})\n"
+            f"📋 {count} постов запланировано начиная с {tomorrow_msk:%d.%m.%Y}\n"
+            f"🕐 Расписание: 09:00, 15:00/16:00, 21:00 MSK"
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Закреп-пост не удалось опубликовать (проверь CHANNEL_USERNAME и права бота).\n"
+            f"📋 {count} постов всё равно загружены в расписание."
+        )
+
+
+# ---------------------------------------------------------------------------
 # /stats — Track Record (доступна ВСЕМ)
 # ---------------------------------------------------------------------------
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2695,6 +2862,12 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("hunter", handle_hunter))
     app.add_handler(CommandHandler("hunter_refresh", handle_hunter_refresh))
     app.add_handler(CommandHandler("hunter_status", handle_hunter_status))
+    # Scheduled channel posts (admin only)
+    app.add_handler(CommandHandler("post", handle_post_cmd))
+    app.add_handler(CommandHandler("schedule", handle_schedule_cmd))
+    app.add_handler(CommandHandler("posts", handle_posts_cmd))
+    app.add_handler(CommandHandler("delpost", handle_delpost_cmd))
+    app.add_handler(CommandHandler("loadposts", handle_loadposts_cmd))
     app.add_handler(CommandHandler("promo", handle_promo))
     app.add_handler(CommandHandler("feedback", handle_feedback))
     app.add_handler(CommandHandler("stats", handle_stats))

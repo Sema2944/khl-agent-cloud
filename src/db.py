@@ -285,6 +285,21 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_referrals_referrer ON referrals (referrer_id)"""))
 
+        # P5: scheduled_posts (channel auto-posting)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                publish_at TIMESTAMP NOT NULL,
+                published BOOLEAN DEFAULT FALSE,
+                published_at TIMESTAMP,
+                message_id INTEGER,
+                pinned BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_scheduled_posts_publish ON scheduled_posts (publish_at, published)"""))
+
         # created_at/updated_at
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()"""))
         conn.execute(text("""ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()"""))

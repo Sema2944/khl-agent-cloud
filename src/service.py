@@ -265,6 +265,20 @@ async def on_startup():
     except Exception:
         logger.exception("Track Record evening broadcast failed to start")
 
+    # Scheduled channel posts: check every 60s
+    try:
+        import asyncio
+        from .scheduled_posts import scheduled_posts_loop
+        from .telegram_bot.app import _telegram_app
+        bot = _telegram_app.bot if _telegram_app else None
+        if bot:
+            asyncio.create_task(scheduled_posts_loop(bot))
+            logger.info("Scheduled posts loop started (every 60s)")
+        else:
+            logger.warning("Scheduled posts loop: no bot available, skipping")
+    except Exception:
+        logger.exception("Scheduled posts loop failed to start")
+
 
 async def _results_check_loop():
     """Background loop: check Hunter pick results every 2 hours."""
