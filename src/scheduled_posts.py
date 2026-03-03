@@ -159,47 +159,41 @@ async def scheduled_posts_loop(bot) -> None:
 # ------------------------------------------------------------------
 # /loadposts — bulk load 20 predefined posts for first week
 # ------------------------------------------------------------------
+# Post texts and schedule are loaded lazily (only on /loadposts call)
+# to avoid keeping ~15KB of strings in memory permanently.
+# ------------------------------------------------------------------
 
-# All 20 posts from Betly_Channel_Posts.md
-# Index 0 = pinned post (published immediately)
-# Index 1..20 = 7 days × 3 posts per day (see schedule below)
 
-PINNED_POST = """🎯 Betly — AI-аналитика спорта
+def _get_pinned_post() -> str:
+    """Return pinned post text (created on demand, not kept in module scope)."""
+    return (
+        "🎯 Betly — AI-аналитика спорта\n\n"
+        "Каждый день в 11:00 МСК — Топ-3 матча дня.\n"
+        "AI анализирует 500+ матчей и выбирает лучшие.\n\n"
+        "7 видов спорта: футбол, хоккей, баскетбол, теннис, MMA, волейбол, Формула 1.\n\n"
+        "КЭФы от Pinnacle, Bet365, 1xBet.\n"
+        "Движение линии и H2H-статистика.\n\n"
+        "Полные прогнозы и AI-разбор — в боте:\n"
+        "👉 @BetlyAIBot\n\n"
+        "🎁 Промокод BETLY2026 — 7 дней PRO бесплатно"
+    )
 
-Каждый день в 11:00 МСК — Топ-3 матча дня.
-AI анализирует 500+ матчей и выбирает лучшие.
 
-7 видов спорта: футбол, хоккей, баскетбол, теннис, MMA, волейбол, Формула 1.
+def _get_schedule_and_posts() -> Tuple[list, list]:
+    """Return (schedule, post_texts) — created on demand, GC'd after use."""
+    # (day, hour, minute) in MSK
+    schedule: list[Tuple[int, int, int]] = [
+        (1, 9, 0), (1, 15, 0), (1, 21, 0),   # Day 1
+        (2, 9, 0), (2, 15, 0), (2, 21, 0),   # Day 2
+        (3, 9, 0), (3, 15, 0), (3, 21, 0),   # Day 3
+        (4, 9, 0), (4, 16, 0),                # Day 4
+        (5, 9, 0), (5, 15, 0), (5, 21, 0),   # Day 5
+        (6, 9, 0), (6, 16, 0),                # Day 6
+        (7, 9, 0), (7, 15, 0), (7, 21, 0),   # Day 7
+    ]
 
-КЭФы от Pinnacle, Bet365, 1xBet.
-Движение линии и H2H-статистика.
-
-Полные прогнозы и AI-разбор — в боте:
-👉 @BetlyAIBot
-
-🎁 Промокод BETLY2026 — 7 дней PRO бесплатно"""
-
-# (day, hour, minute) in MSK — schedule from TZ
-# Day 4 has 16:00 (not 15:00), Day 6 has 16:00
-_SCHEDULE: list[Tuple[int, int, int]] = [
-    # Day 1
-    (1, 9, 0), (1, 15, 0), (1, 21, 0),
-    # Day 2
-    (2, 9, 0), (2, 15, 0), (2, 21, 0),
-    # Day 3
-    (3, 9, 0), (3, 15, 0), (3, 21, 0),
-    # Day 4
-    (4, 9, 0), (4, 16, 0),
-    # Day 5
-    (5, 9, 0), (5, 15, 0), (5, 21, 0),
-    # Day 6
-    (6, 9, 0), (6, 16, 0),
-    # Day 7
-    (7, 9, 0), (7, 15, 0), (7, 21, 0),
-]
-
-# 20 post texts (Day 1 → Day 7), order matches _SCHEDULE
-_POST_TEXTS: list[str] = [
+    # 19 post texts (Day 1 → Day 7), order matches schedule
+    post_texts: list[str] = [
     # Day 1 — Post 1 (09:00)
     """🔬 Как работает Betly?
 
@@ -409,11 +403,11 @@ F1 — не только гонка, но и стратегия. Betly соби�
 PRO: AI-прогнозы Охотника, КЭФы от 5 букмекеров, LIVE-аналитика.
 
 🎁 Промокод BETLY2026 — 7 дней PRO бесплатно.""",
-]
-
-# 19 scheduled posts + 1 pinned (published immediately) = 20 total
-assert len(_POST_TEXTS) == 19, f"Expected 19 content posts, got {len(_POST_TEXTS)}"
-assert len(_SCHEDULE) == 19, f"Expected 19 schedule entries, got {len(_SCHEDULE)}"
+    ]
+    # 19 scheduled posts total (matching schedule above)
+    assert len(post_texts) == 19, f"Expected 19 posts, got {len(post_texts)}"
+    assert len(schedule) == 19, f"Expected 19 schedule entries, got {len(schedule)}"
+    return schedule, post_texts
 
 
 async def publish_pinned_post_now(bot) -> Optional[int]:
@@ -423,7 +417,7 @@ async def publish_pinned_post_now(bot) -> Optional[int]:
         return None
 
     try:
-        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=PINNED_POST)
+        msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=_get_pinned_post())
         await bot.pin_chat_message(
             chat_id=CHANNEL_USERNAME,
             message_id=msg.message_id,
@@ -440,22 +434,25 @@ def load_predefined_posts(start_date: datetime) -> int:
     """
     Bulk-insert 19 scheduled posts starting from start_date.
     start_date should be a date in MSK (the "tomorrow" concept).
-    Returns count of inserted posts.
+    Returns count of inserted posts. Post texts are loaded on demand and GC'd after.
     """
+    import gc
+    schedule, post_texts = _get_schedule_and_posts()
     count = 0
     base_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    for i, ((day, hour, minute), post_text) in enumerate(zip(_SCHEDULE, _POST_TEXTS)):
-        publish_msk = base_date + timedelta(days=day - 1)
-        publish_msk = publish_msk.replace(hour=hour, minute=minute)
-        # Ensure it has MSK timezone
-        if publish_msk.tzinfo is None:
-            publish_msk = publish_msk.replace(tzinfo=MSK)
-        # Convert to UTC for storage
-        publish_utc = publish_msk.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-
-        add_scheduled_post(post_text, publish_utc, pinned=False)
-        count += 1
+    try:
+        for (day, hour, minute), post_text in zip(schedule, post_texts):
+            publish_msk = base_date + timedelta(days=day - 1)
+            publish_msk = publish_msk.replace(hour=hour, minute=minute)
+            if publish_msk.tzinfo is None:
+                publish_msk = publish_msk.replace(tzinfo=MSK)
+            publish_utc = publish_msk.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+            add_scheduled_post(post_text, publish_utc, pinned=False)
+            count += 1
+    finally:
+        del schedule, post_texts
+        gc.collect()
 
     logger.info("Loaded %d predefined posts starting from %s", count, base_date.date())
     return count

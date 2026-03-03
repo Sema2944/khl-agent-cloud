@@ -283,6 +283,7 @@ async def on_startup():
 async def _results_check_loop():
     """Background loop: check Hunter pick results every 2 hours."""
     import asyncio
+    import gc
 
     await asyncio.sleep(120)  # let app start
 
@@ -297,12 +298,14 @@ async def _results_check_loop():
         except Exception:
             logger.exception("Results check loop error")
 
+        gc.collect()
         await asyncio.sleep(7200)  # 2 hours
 
 
 async def _evening_results_loop():
     """Background loop: post evening results at 22:00 MSK."""
     import asyncio
+    import gc
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
@@ -335,6 +338,8 @@ async def _evening_results_loop():
         except Exception:
             logger.exception("Evening results loop error")
             await asyncio.sleep(60)
+        finally:
+            gc.collect()
 
 
 @app.on_event("shutdown")

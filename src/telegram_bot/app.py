@@ -168,6 +168,8 @@ async def _fetch_all_live_matches() -> tuple:
         ts, cached_live, cached_upcoming = _ALL_LIVE_CACHE
         if now - ts < _ALL_LIVE_TTL:
             return cached_live, cached_upcoming
+        # TTL expired — release old data before fetching new
+        _ALL_LIVE_CACHE = None
 
     from ..integrations.sport_api import SportAPIClient
 
@@ -194,9 +196,9 @@ async def _fetch_all_live_matches() -> tuple:
             if _is_live_status(status):
                 live.append(m)
             else:
-                # Collect not-started for "upcoming" fallback
+                # Collect not-started for "upcoming" fallback (cap at 20 to save memory)
                 s_lower = status.lower()
-                if s_lower in {"notstarted", "ns", "not started", "scheduled", ""}:
+                if s_lower in {"notstarted", "ns", "not started", "scheduled", ""} and len(all_upcoming) < 20:
                     all_upcoming.append(m)
 
         if live:
@@ -1789,8 +1791,10 @@ async def handle_promo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------------------------------------------------------------
 # /feedback — multi-step survey with inline buttons
 # ---------------------------------------------------------------------------
-# State: {user_id: {"q1": "...", "q2": "...", "q3": "...", "step": "text"}}
+# State: {user_id: {"q1": "...", "q2": "...", "q3": "...", "step": "text", "_ts": time()}}
 _feedback_state: Dict[int, Dict[str, str]] = {}
+_FEEDBACK_MAX_USERS = 50  # max concurrent feedback sessions
+_FEEDBACK_TTL_S = 600  # 10 min — stale sessions auto-cleaned
 
 _FB_Q1_TEXT = "📋 Шаг 1/4 — Насколько понятно как пользоваться ботом?"
 _FB_Q1_KB = InlineKeyboardMarkup([
@@ -1850,8 +1854,17 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         pass  # DB check failed — allow anyway
 
+    # Cleanup stale feedback sessions before starting new one
+    import time as _time
+    now_ts = _time.time()
+    stale = [uid for uid, st in _feedback_state.items()
+             if now_ts - st.get("_ts", 0) > _FEEDBACK_TTL_S]
+    for uid in stale:
+        _feedback_state.pop(uid, None)
+        _feedback_waiting.discard(uid)
+
     # Start survey: step 1
-    _feedback_state[user_id] = {}
+    _feedback_state[user_id] = {"_ts": now_ts}
     await update.message.reply_text(_FB_Q1_TEXT, reply_markup=_FB_Q1_KB)
 
 
@@ -2947,7 +2960,7 @@ telegram_router = APIRouter()
 
 # Deduplication: Telegram may retry webhooks — skip already-processed update_ids
 _seen_update_ids: set = set()
-_SEEN_MAX = 500  # keep last N to avoid memory growth
+_SEEN_MAX = 300  # keep last N to avoid memory growth
 
 
 @telegram_router.post("/telegram/webhook")

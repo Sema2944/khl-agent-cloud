@@ -158,6 +158,20 @@ CACHE_TTL = {
 }
 
 _cache: Dict[str, Any] = {}
+_CACHE_MAX_SIZE = 200  # hard cap to prevent OOM
+
+
+def _cache_cleanup() -> None:
+    """Remove all expired entries and trim to max size."""
+    now = datetime.utcnow()
+    expired = [k for k, (_, exp) in _cache.items() if exp <= now]
+    for k in expired:
+        del _cache[k]
+    # If still over limit, remove oldest entries
+    if len(_cache) > _CACHE_MAX_SIZE:
+        by_exp = sorted(_cache.items(), key=lambda kv: kv[1][1])
+        for k, _ in by_exp[:len(_cache) - _CACHE_MAX_SIZE]:
+            _cache.pop(k, None)
 
 
 def cache_get(key: str) -> Any:
@@ -172,6 +186,9 @@ def cache_get(key: str) -> Any:
 def cache_set(key: str, data: Any, ttl_key: str) -> None:
     if ttl_key not in CACHE_TTL:
         return
+    # Proactive cleanup before adding
+    if len(_cache) >= _CACHE_MAX_SIZE:
+        _cache_cleanup()
     expires = datetime.utcnow() + CACHE_TTL[ttl_key]
     _cache[key] = (data, expires)
 

@@ -1209,6 +1209,11 @@ async def run_daily_hunter(bot=None) -> None:
         _hunter_run_info["status"] = "error"
         _hunter_run_info["error"] = str(exc)
         logger.exception("Hunter v2: run failed")
+    finally:
+        # Free temp objects after heavy pipeline
+        import gc
+        gc.collect()
+        logger.info("Hunter: gc.collect() done")
 
 
 def get_hunter_status() -> Dict[str, Any]:

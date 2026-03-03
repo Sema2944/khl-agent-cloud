@@ -78,10 +78,11 @@ _BANNED_PHRASES = (
 # "выгодно" (="advantageous"), "проход" (="pass through", common in hockey)
 
 # -----------------------------
-# Per-user throttle state (process-local)
+# Per-user throttle state (process-local, bounded)
 # -----------------------------
 _PER_USER_LAST_CALL: Dict[int, float] = {}
 _PER_USER_LOCK = asyncio.Lock()
+_PER_USER_MAX = 500  # max tracked users; prune oldest when exceeded
 # -----------------------------
 # LLM Circuit Breaker (quota/429)
 # -----------------------------
@@ -250,6 +251,11 @@ async def _per_user_throttle(user_id: int) -> Optional[float]:
         if delta < LLM_PER_USER_MIN_INTERVAL_S:
             return LLM_PER_USER_MIN_INTERVAL_S - delta
         _PER_USER_LAST_CALL[user_id] = now
+        # Prune oldest entries if over limit
+        if len(_PER_USER_LAST_CALL) > _PER_USER_MAX:
+            oldest = sorted(_PER_USER_LAST_CALL, key=_PER_USER_LAST_CALL.get)[:_PER_USER_MAX // 2]
+            for uid in oldest:
+                _PER_USER_LAST_CALL.pop(uid, None)
         return None
 
 
