@@ -235,11 +235,11 @@ def _bootstrap_migrations_postgres() -> None:
         """))
         conn.execute(text("""CREATE INDEX IF NOT EXISTS ix_promo_activations_user ON promo_activations (user_id)"""))
 
-        # Seed default promo code BETLY2026
+        # Seed default promo code BETLY2026 (max_uses=100)
         conn.execute(text("""
             INSERT INTO promo_codes (code, max_uses, days)
-            VALUES ('BETLY2026', 20, 7)
-            ON CONFLICT (code) DO NOTHING
+            VALUES ('BETLY2026', 100, 7)
+            ON CONFLICT (code) DO UPDATE SET max_uses = 100
         """))
 
         # P3b: feedback survey
