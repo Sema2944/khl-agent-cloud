@@ -94,7 +94,9 @@ def _auth_headers() -> Dict[str, str]:
     key = _env("SPORT_API_KEY")
     if not key:
         return {}
-    hdr = _env("SPORT_API_KEY_HEADER", "Authorization")
+    # api-sport.ru official docs use X-API-Key header.
+    # Override with SPORT_API_KEY_HEADER env var only if your provider differs.
+    hdr = _env("SPORT_API_KEY_HEADER", "X-API-Key")
     pref = _env("SPORT_API_KEY_PREFIX", "")
     val = f"{pref}{key}".strip()
     return {hdr: val} if val else {}
@@ -321,6 +323,15 @@ class SportAPIClient:
         if r.status_code >= 400:
             txt = (r.text or "")[:800]
             err = SportAPIError(f"HTTP {r.status_code}: {txt}")
+            # 401: log actionable hint for admin (wrong key or wrong header)
+            if r.status_code == 401:
+                logger.warning(
+                    "api-sport.ru 401 Unauthorized at %s "
+                    "— verify SPORT_API_KEY is set and SPORT_API_KEY_HEADER='X-API-Key' "
+                    "(current header: %r)",
+                    url,
+                    _env("SPORT_API_KEY_HEADER", "X-API-Key"),
+                )
             # Don't alert on expected 404s (statistics/lineups for leagues that lack them)
             is_silent = (
                 r.status_code == 404
@@ -1141,6 +1152,8 @@ class SportAPIClient:
             return []
 
         # ── Hockey: try primary API first (api-sport.ru) ──
+        # api-sport.ru endpoint: /v2/hockey/matches  (slug = "hockey", not "ice-hockey")
+        # Auth: X-API-Key header (set SPORT_API_KEY_HEADER=X-API-Key, SPORT_API_KEY=<key>)
         params = {
             "date": day_s,
             "day": day_s,
@@ -1152,9 +1165,10 @@ class SportAPIClient:
             "endDate": day_s,
         }
 
-        candidates = [sport_slug]
-        for x in SPORT_ALIASES.get(sport_slug, []):
-            xx = (x or "").strip().lower()
+        # "hockey" must come FIRST — api-sport.ru uses /v2/hockey/... not /v2/ice-hockey/...
+        candidates: List[str] = ["hockey"]
+        for extra in ([sport_slug] + SPORT_ALIASES.get(sport_slug, [])):
+            xx = (extra or "").strip().lower()
             if xx and xx not in candidates:
                 candidates.append(xx)
 
@@ -1203,9 +1217,12 @@ class SportAPIClient:
             logger.debug("SportAPI fallback failed for %s: %s", sport_slug, fb_err)
 
         if last_err:
-            raise SportAPIError(f"matches_by_date failed for {sport_slug} {day_s}: {last_err}")
-
-        raise SportAPIError(f"matches_by_date empty for {sport_slug} {day_s}")
+            # Log for admin diagnostics; return empty list so user sees clean message
+            logger.warning(
+                "SportAPI hockey: all providers failed for %s on %s — last_err: %s",
+                sport_slug, day_s, last_err,
+            )
+        return []
 
     async def _fetch_tennis_espn_details(self, match_id: str) -> Optional[MatchDTO]:
         """Fetch single tennis match details from ESPN summary API."""
