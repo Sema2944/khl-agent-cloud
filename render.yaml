@@ -8,6 +8,7 @@ services:
     name: khl-agent-api
     runtime: python
     plan: free
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: PYTHONPATH=. python scripts/serve.py
     envVars:
