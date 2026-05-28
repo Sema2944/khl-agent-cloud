@@ -1192,11 +1192,22 @@ async def _render_sport_nav_root(user_id: int, sport_slug: str) -> Tuple[str, In
         api = SportAPIClient()
         matches = await api.matches_by_date(sport_slug, today)
     except SportAPIError as e:
+        logger.error("_render_sport_nav_root %s: %s", sport_slug, e)
+        # Alert admin with full error; show users a clean message only
+        try:
+            from ..alerting import send_alert
+            import asyncio
+            asyncio.ensure_future(send_alert(
+                "ERROR", f"sport_nav.{sport_slug}", e,
+                context={"sport": sport_slug, "date": today.isoformat()},
+            ))
+        except Exception:
+            pass
         text = (
-            f"🏟 Матчи сегодня (по МСК) — {title}\n"
+            f"🏟 {title}\n"
             f"Дата: {today.isoformat()}\n\n"
-            "Не удалось получить матчи из API.\n"
-            f"Причина: {str(e)[:250]}"
+            "⚠️ Данные по этому спорту временно недоступны.\n"
+            "Попробуйте другой спорт или вернитесь позже."
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ К спорту", callback_data="BACK:MATCHES_MENU")]])
         return text, kb

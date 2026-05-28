@@ -286,17 +286,19 @@ class SportAPIClient:
     def __init__(self) -> None:
         self.base = _env("SPORT_API_BASE", "").rstrip("/")
         if not self.base:
-            raise SportAPIError("SPORT_API_BASE is missing")
+            # SPORT_API_BASE is optional: api-sports.io is used for all sports.
+            # Only hockey will try api-sport.ru when both base + key are present.
+            logger.warning("SPORT_API_BASE not set — api-sport.ru disabled, using api-sports.io for all sports")
         self.headers = _auth_headers()
         self.timeout_s = _timeout()
 
         try:
             from urllib.parse import urlparse
 
-            u = urlparse(self.base)
+            u = urlparse(self.base) if self.base else type("_", (), {"scheme": "", "netloc": ""})()
             logger.info(
                 "SportAPI init: base=%r scheme=%r host=%r header=%r prefix=%r timeout=%.1f key_present=%s",
-                self.base,
+                self.base or "(not set)",
                 u.scheme,
                 u.netloc,
                 _env("SPORT_API_KEY_HEADER", "Authorization"),
@@ -450,9 +452,12 @@ class SportAPIClient:
 
 
     def _is_primary_api_sport(self, sport_slug: str) -> bool:
-        """Check if primary API (SPORT_API_BASE) supports this sport.
-        Currently api-sport.ru only works for ice-hockey."""
-        return sport_slug in {"ice-hockey", "hockey"}
+        """True only when api-sport.ru is both configured and authenticated.
+        Requires SPORT_API_BASE + SPORT_API_KEY to both be set.
+        Without them, hockey falls through to api-sports.io (same as other sports)."""
+        if sport_slug not in {"ice-hockey", "hockey"}:
+            return False
+        return bool(self.base and _env("SPORT_API_KEY"))
 
     async def _fetch_basketball_espn(self, day: date) -> List[MatchDTO]:
         """
@@ -1101,7 +1106,7 @@ class SportAPIClient:
             logger.info("mma: no fights on %s", day_s)
             return []
 
-        # ── For other non-hockey sports: go to api-sports.io ──
+        # ── For other non-hockey sports (and hockey when api-sport.ru is not configured) ──
         if not self._is_primary_api_sport(sport_slug):
             try:
                 fallback_matches = await self._fallback_api_sports(sport_slug, day)
@@ -1112,7 +1117,11 @@ class SportAPIClient:
                     )
                     return fallback_matches
                 else:
-                    logger.warning("SportAPI api-sports.io returned 0 matches for %s %s", sport_slug, day_s)
+                    logger.info(
+                        "SportAPI api-sports.io: 0 matches for %s on %s (off-season or no games today)",
+                        sport_slug, day_s,
+                    )
+                    return []
             except Exception as fb_err:
                 logger.exception("SportAPI api-sports.io failed for %s: %s", sport_slug, fb_err)
                 last_err = fb_err
@@ -1129,7 +1138,7 @@ class SportAPIClient:
                 except Exception:
                     pass
                 raise final_err
-            raise SportAPIError(f"matches_by_date: no matches for {sport_slug} on {day_s} (check API_SPORTS_KEY)")
+            return []
 
         # ── Hockey: try primary API first (api-sport.ru) ──
         params = {
