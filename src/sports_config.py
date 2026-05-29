@@ -162,11 +162,12 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            # NBA: string "YYYY-YYYY"; European leagues: INTEGER season (like volleyball)
-            12:  {"name": "NBA", "flag": "🇺🇸", "country": "USA", "season": "2025-2026", "priority": 1},
-            120: {"name": "Euroleague", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 1},
-            117: {"name": "Eurocup", "flag": "🇪🇺", "country": "Европа", "season": 2025, "priority": 2},
-            179: {"name": "VTB League", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
+            # NBA: string "YYYY-YYYY"; European leagues: INTEGER season (api-sports.io basketball v1)
+            12:  {"name": "NBA",         "flag": "🇺🇸", "country": "USA",    "season": "2025-2026", "priority": 1},
+            120: {"name": "Euroleague",  "flag": "🇪🇺", "country": "Европа", "season": 2025,        "priority": 1},
+            117: {"name": "Eurocup",     "flag": "🇪🇺", "country": "Европа", "season": 2025,        "priority": 2},
+            # VTB United League: corrected id 179→82, season format "YYYY-YYYY" (confirmed from api-sports.io data)
+            82:  {"name": "VTB League",  "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 2},
         },
         "odds_keys": [
             "basketball_nba",
