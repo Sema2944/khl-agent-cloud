@@ -1,8 +1,9 @@
 # src/daily_pro.py
 """
-Daily Hunter v2: AI-powered top picks generator.
+Daily Hunter v2.1: AI-powered top picks generator.
 Pipeline: fetch → filter top leagues → deterministic score → enrich odds →
-          AI analysis (top-10 only) → diversify → save to DB → broadcast.
+          team context (standings+form) → AI analysis (top-10 only) →
+          value filter (edge ≥ 3%) → diversify → save to DB → broadcast.
 Runs at 08:00 UTC via scheduler in service.py.
 """
 from __future__ import annotations
@@ -58,13 +59,19 @@ TOP_LEAGUES_KEYWORDS: Dict[str, List[str]] = {
     ],
     "ice-hockey": [
         "khl", "кхл", "nhl", "нхл", "shl", "liiga",
+        # Кубок Гагарина / плей-офф КХЛ
+        "gagarin", "кубок гагарина", "playoff", "play-off", "плей-офф",
     ],
     "basketball": [
         "nba", "нба", "euroleague", "евролига",
+        # Единая Лига ВТБ
+        "vtb", "втб", "единая лига", "united league",
     ],
     "tennis": [
         "atp", "wta", "grand slam", "australian open",
-        "roland garros", "wimbledon", "us open",
+        "roland garros", "french open", "wimbledon", "us open",
+        # ATP Masters 1000
+        "masters", "atp 500", "atp 1000",
     ],
     "mma": [
         "ufc",
@@ -201,12 +208,13 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 Страна: {country}
 Время: {start_time}
 Коэффициенты: {odds_text}
-{line_movement_text}
+{context_text}{line_movement_text}
 ЗАДАЧА:
 1. ОБЯЗАТЕЛЬНО дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
-2. Объясни в 2-3 предложениях ПОЧЕМУ — сила команд, форма, статистика, турнирная ситуация
-3. Если есть движение линии — учти его в анализе
-4. Оцени уверенность от 55% до 85%
+2. Объясни в 2-3 предложениях ПОЧЕМУ — сила команд, форма, позиция в таблице, турнирная ситуация
+3. Если есть таблица или форма — ИСПОЛЬЗУЙ позицию и последние 5 матчей в анализе
+4. Если есть движение линии — учти его в анализе
+5. Оцени уверенность от 55% до 85%
 
 Верни ТОЛЬКО JSON (без markdown, без ```):
 {{
@@ -219,10 +227,143 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 КРИТИЧЕСКИ ВАЖНО:
 - ВСЕГДА возвращай confidence >= 0.55. Не возвращай 0!
 - Если данных мало — ставь confidence 0.55-0.65, но ОБЯЗАТЕЛЬНО дай рекомендацию.
-- Используй силу команд, рейтинг, позицию в турнире для анализа.
+- Используй позицию в таблице, форму команд, рейтинг для анализа.
 - rec_odds: бери из коэффициентов выше. Если нет — оцени сам (1.50-3.00).
 - Без слов "ставь", "бери", "гарантия". Только аналитический материал.
 - Отвечай на русском."""
+
+
+# ---------------------------------------------------------------------------
+# Team context: standings + form (cached per league/day)
+# ---------------------------------------------------------------------------
+_standings_cache: Dict[str, Any] = {}  # key: "sport:league_id:season"
+
+
+def _extract_team_names(title: str):
+    """Split 'Team A — Team B' → ('Team A', 'Team B')."""
+    parts = title.split(" — ", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return title.strip(), ""
+
+
+async def _fetch_team_context(match: Dict[str, Any]) -> str:
+    """Return a short standings block for the LLM prompt.
+
+    Calls api-sports.io /standings for the league once per day (cached).
+    Extracts rank + form (last 5) for both teams.
+    Returns "" silently on any error or unsupported sport.
+
+    Example output:
+        Таблица:
+          #1 Arsenal | 89pt | Форма: WDWWL
+          #8 Chelsea | 65pt | Форма: LWDWW
+    """
+    sport = match.get("sport_slug", "")
+    if sport in ("tennis", "mma"):
+        return ""  # no standings for these sports
+
+    league_id = match.get("_league_id")
+    season = match.get("_season")
+    home_id = match.get("_home_id")
+    away_id = match.get("_away_id")
+    home_name, away_name = _extract_team_names(match.get("title", ""))
+
+    if not league_id or not season:
+        return ""
+
+    cache_key = f"{sport}:{league_id}:{season}"
+
+    if cache_key not in _standings_cache:
+        try:
+            from .sports_config import get_sport_config
+            cfg = get_sport_config(sport) or {}
+            base_url = cfg.get("api_base", "")
+            api_key = os.getenv("API_SPORTS_KEY", "")
+            if not base_url or not api_key:
+                _standings_cache[cache_key] = None
+            else:
+                import httpx as _httpx
+                headers = {"x-apisports-key": api_key}
+                async with _httpx.AsyncClient(timeout=_httpx.Timeout(8.0)) as client:
+                    r = await client.get(
+                        f"{base_url}/standings",
+                        params={"league": league_id, "season": season},
+                        headers=headers,
+                    )
+                _standings_cache[cache_key] = r.json() if r.status_code == 200 else None
+                logger.debug("Hunter context: standings %s → HTTP %d", cache_key, r.status_code)
+        except Exception as exc:
+            logger.debug("Hunter context: standings fetch error %s: %s", cache_key, exc)
+            _standings_cache[cache_key] = None
+
+    raw_data = _standings_cache.get(cache_key)
+    if not raw_data:
+        return ""
+
+    # Parse standings — handle football (nested) and hockey/basketball (flat)
+    teams: Dict[str, Dict[str, Any]] = {}   # name → {rank, form, points, id}
+    try:
+        for item in raw_data.get("response") or []:
+            # Football: {"league": {"standings": [[{rank, team, points, form}]]}}
+            league_obj = item.get("league") if isinstance(item, dict) else None
+            groups = (league_obj or {}).get("standings") if league_obj else None
+            if not groups and isinstance(item, list):
+                groups = [item]  # hockey / basketball flat list
+            for group in (groups or []):
+                for entry in (group if isinstance(group, list) else []):
+                    t = entry.get("team") or {}
+                    tid = t.get("id")
+                    tname = t.get("name", "")
+                    info = {
+                        "rank": entry.get("rank") or entry.get("position") or "?",
+                        "form": entry.get("form", ""),
+                        "points": entry.get("points", ""),
+                        "id": tid,
+                    }
+                    if tname:
+                        teams[tname] = info
+                    if tid:
+                        teams[str(tid)] = info
+    except Exception:
+        return ""
+
+    if not teams:
+        return ""
+
+    def _find(name: str, tid: Any) -> Optional[Dict]:
+        if tid and str(tid) in teams:
+            return teams[str(tid)]
+        if name in teams:
+            return teams[name]
+        nl = name.lower()
+        for k, v in teams.items():
+            if isinstance(k, str) and (nl in k.lower() or k.lower() in nl):
+                return v
+        return None
+
+    home_info = _find(home_name, home_id)
+    away_info = _find(away_name, away_id)
+    if not home_info and not away_info:
+        return ""
+
+    def _fmt(team_name: str, info: Optional[Dict]) -> str:
+        if not info:
+            return ""
+        rank = info.get("rank", "?")
+        pts = info.get("points", "")
+        form = info.get("form", "")
+        pts_s = f" | {pts}pt" if pts else ""
+        form_s = f" | Форма: {form}" if form else ""
+        return f"  #{rank} {team_name}{pts_s}{form_s}"
+
+    lines = ["Таблица:"]
+    for name, info in [(home_name, home_info), (away_name, away_info)]:
+        row = _fmt(name, info)
+        if row:
+            lines.append(row)
+
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +380,10 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
             sport_matches = []
             leagues_found: set = set()
             for m in items:
+                # Extract league/team IDs from raw API response for standings enrichment
+                raw_m = getattr(m, "raw", {}) or {}
+                league_obj = raw_m.get("league") or {}
+                teams_obj = raw_m.get("teams") or {}
                 entry = {
                     "match_id": str(m.id),
                     "sport_slug": getattr(m, "sport_slug", sport),
@@ -248,6 +393,11 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
                     "start_time": str(getattr(m, "start_time", "") or ""),
                     "status": str(getattr(m, "status", "") or "").lower(),
                     "odds": getattr(m, "odds_base", None),
+                    # IDs for standings/context enrichment (may be None for ESPN-sourced matches)
+                    "_league_id": league_obj.get("id"),
+                    "_season":    league_obj.get("season"),
+                    "_home_id":   (teams_obj.get("home") or {}).get("id"),
+                    "_away_id":   (teams_obj.get("away") or {}).get("id"),
                 }
                 sport_matches.append(entry)
                 leagues_found.add(entry["league"])
@@ -501,12 +651,17 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    context_text = match.get("_context_text", "")
+    if context_text:
+        context_text = context_text.rstrip("\n") + "\n"
+
     prompt = _HUNTER_ANALYSIS_PROMPT.format(
         title=match.get("title", ""),
         league=match.get("league", ""),
         country=match.get("country", ""),
         start_time=match.get("start_time", ""),
         odds_text=odds_text,
+        context_text=context_text,
         line_movement_text=line_movement_text,
     )
 
@@ -1059,7 +1214,22 @@ async def run_daily_hunter(bot=None) -> None:
             await _enrich_odds(m)
             await asyncio.sleep(0.3)
 
+        # 4b. Team context: standings + form from api-sports.io
+        _standings_cache.clear()  # fresh cache for today's run
+        ctx_ok = 0
+        for m in top_candidates:
+            try:
+                ctx = await _fetch_team_context(m)
+                m["_context_text"] = ctx
+                if ctx:
+                    ctx_ok += 1
+            except Exception:
+                m["_context_text"] = ""
+        logger.info("Hunter context: enriched %d/%d matches with standings+form",
+                    ctx_ok, len(top_candidates))
+
         # 5. AI analysis for top candidates
+        candidates_count = len(top_candidates)
         scored = []
         for m in top_candidates:
             result = await _ai_analyze_match(m)
@@ -1080,6 +1250,44 @@ async def run_daily_hunter(bot=None) -> None:
             valid.append(m)
         if skipped_list:
             logger.info("Hunter: AI skipped %d matches with empty analysis", len(skipped_list))
+
+        valid_after_ai = len(valid)
+
+        # 6b. VALUE filter: edge = confidence − implied_probability ≥ 3%
+        # Applied only when enough matches survive (otherwise results degrade).
+        high_value: List[Dict[str, Any]] = []
+        low_value: List[Dict[str, Any]] = []
+        for m in valid:
+            conf = m.get("confidence", 0.60)
+            rec_odds = _safe_float(m.get("rec_odds", 0))
+            if rec_odds > 1.0:
+                implied = 1.0 / rec_odds
+                edge = round(conf - implied, 3)
+                m["_edge"] = edge
+                if edge >= 0.03:
+                    high_value.append(m)
+                else:
+                    low_value.append(m)
+                    logger.info(
+                        "Hunter VALUE: skipped %s — conf=%.2f odds=%.2f edge=%.1f%%",
+                        m.get("title", "")[:35], conf, rec_odds, edge * 100,
+                    )
+            else:
+                m["_edge"] = 0.0
+                low_value.append(m)
+                logger.info("Hunter VALUE: skipped %s — no rec_odds", m.get("title", "")[:35])
+
+        if len(high_value) >= 2:
+            valid = high_value
+            logger.info(
+                "Hunter VALUE filter applied: %d high-value kept, %d low-value dropped",
+                len(high_value), len(low_value),
+            )
+        else:
+            logger.info(
+                "Hunter VALUE filter: only %d high-value matches — using all %d valid",
+                len(high_value), valid_after_ai,
+            )
 
         # Rank by AI confidence + league tier bonus
         # Premium leagues (CL, EL, NHL, NBA, UFC) get +0.10 effective boost,
@@ -1175,6 +1383,29 @@ async def run_daily_hunter(bot=None) -> None:
 
         for p in top3:
             p["pick_type"] = "top3"
+
+        # ── Hunter v2.1 run summary ─────────────────────────────────────────
+        logger.info(
+            "Hunter v2.1 SUMMARY | fetched=%d → top-leagues=%d → top10=%d "
+            "→ ai-valid=%d → value-filter=%d → final=%d",
+            len(matches),
+            len(filtered),
+            candidates_count,
+            valid_after_ai,
+            len(valid),
+            len(top3),
+        )
+        for i, p in enumerate(top3, 1):
+            edge_pct = round(p.get("_edge", 0) * 100, 1)
+            ctx_flag = "✓" if p.get("_context_text") else "✗"
+            logger.info(
+                "Hunter v2.1 pick #%d: %s | conf=%.0f%% | edge=%+.1f%% | ctx=%s | %s",
+                i, p.get("title", "")[:40],
+                p.get("confidence", 0) * 100,
+                edge_pct, ctx_flag,
+                p.get("recommendation", ""),
+            )
+        # ────────────────────────────────────────────────────────────────────
 
         logger.info("Hunter: selected %d picks: %s",
                     len(top3),
