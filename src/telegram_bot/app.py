@@ -1495,7 +1495,8 @@ def _build_welcome_pick_card(is_new: bool = True) -> tuple:
     return _truncate_tg(txt), InlineKeyboardMarkup(rows)
 
 
-
+async def handle_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /pro — показать экран PRO-подписки."""
     if not update.message:
         return
     txt = _text_buy_pro(update.effective_user.id if update.effective_user else 0)
