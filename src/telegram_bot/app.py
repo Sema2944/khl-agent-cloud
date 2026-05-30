@@ -1344,7 +1344,52 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception:
         logger.exception("handle_start: onboarding check failed")
 
-    if seen:
+    if not seen:
+        # ── SPRINT-1: new user — grant trial immediately, skip sport-picker ──
+        # 1. Mark as seen so we don't repeat the onboarding next time
+        try:
+            set_user_seen_intro(
+                user_id,
+                username=getattr(update.effective_user, "username", None),
+                first_name=getattr(update.effective_user, "first_name", None),
+                last_name=getattr(update.effective_user, "last_name", None),
+            )
+        except Exception:
+            logger.exception("handle_start: set_user_seen_intro failed")
+
+        # 2. Auto-grant 3-day trial (silent if already used)
+        _auto_grant_welcome_trial(user_id)
+
+        # 3. Send persistent keyboard (stays at bottom of chat)
+        first_name = getattr(update.effective_user, "first_name", None) or ""
+        greeting = f"Привет, {first_name}! 👋" if first_name else "Привет! 👋"
+        await update.message.reply_text(
+            f"{greeting}\n\nЯ — Betly AI. Вот лучший матч сегодня 👇",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+
+        # 4. Send first pick card immediately
+        card_text, card_kb = _build_welcome_pick_card(is_new=True)
+        await update.message.reply_text(card_text, reply_markup=card_kb, parse_mode="Markdown")
+        return
+
+    # ── Returning user ──────────────────────────────────────────────────────
+    user_is_pro = False
+    try:
+        user_is_pro = is_pro(user_id)
+    except Exception:
+        pass
+    in_trial = _is_in_hunter_trial(user_id)
+
+    if user_is_pro or in_trial:
+        # Show today's pick directly
+        await update.message.reply_text(
+            "С возвращением! 👋 Вот лучший матч сегодня 👇",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        card_text, card_kb = _build_welcome_pick_card(is_new=False)
+        await update.message.reply_text(card_text, reply_markup=card_kb, parse_mode="Markdown")
+    else:
         await update.message.reply_text(
             "Выбери спорт 👇\n\n"
             "Или используй меню:\n"
@@ -1353,18 +1398,104 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "🎁 Есть промокод? Введи /promo КОД",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
-        return
-
-    # Show onboarding for new users
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Начать", callback_data="ONBOARD:START")],
-        [InlineKeyboardButton("ℹ️ Как это работает", callback_data="ONBOARD:HELP")],
-    ])
-    await update.message.reply_text(ONBOARDING_WELCOME, reply_markup=kb)
 
 
-async def handle_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /pro — показать экран PRO-подписки."""
+def _auto_grant_welcome_trial(user_id: int) -> bool:
+    """Grant 3-day PRO trial for brand-new users.
+
+    Returns True if trial was newly granted, False if already used or any error.
+    Does NOT raise — silent failure is safer than breaking /start.
+    """
+    try:
+        from ..user_store import get_user_by_tg_id
+        from sqlalchemy import text as sa_text
+        from sqlmodel import Session as SMSession
+        from ..db import engine
+        u = get_user_by_tg_id(user_id)
+        if u is None or getattr(u, "trial_started_at", None) is not None:
+            return False  # trial already used or user not found
+        from ..pro_db import grant_pro
+        grant_pro(user_id, days=3)
+        with SMSession(engine) as s:
+            s.exec(
+                sa_text("UPDATE users SET trial_started_at = NOW() WHERE tg_user_id = :uid"),
+                params={"uid": user_id},
+            )
+            s.commit()
+        logger.info("handle_start: auto-granted 3-day trial to user %s", user_id)
+        return True
+    except Exception:
+        logger.exception("_auto_grant_welcome_trial failed")
+        return False
+
+
+def _build_welcome_pick_card(is_new: bool = True) -> tuple:
+    """Build (text, InlineKeyboardMarkup) for the welcome first-pick card.
+
+    Shows today's best Hunter pick (pick_type='top3') if available,
+    otherwise falls back to HUNTER_EXAMPLE_TEXT.
+    Returns a tuple (text, keyboard) ready to send.
+    """
+    picks = _get_today_picks()
+    top3 = [p for p in picks if p.get("pick_type") == "top3"]
+
+    if top3:
+        p = top3[0]
+        conf = int(float(p.get("confidence", 0)) * 100)
+        sport = p.get("sport_slug", "")
+        emoji = _HUNTER_SPORT_EMOJI.get(sport, "🏆")
+        title = (p.get("title") or "Матч")[:50]
+        league = p.get("league", "")
+        start = _extract_hhmm(p.get("start_time", ""))
+        rec = p.get("recommendation", "")
+        summary = _truncate_at_sentence(p.get("analysis_text") or "", 220)
+
+        lt = ""
+        if league:
+            lt = f"🏆 {league}"
+        if start:
+            lt += f" | {start} MSK" if lt else f"   {start} MSK"
+
+        lines = [
+            "🎯 Лучший матч дня — от AI",
+            "",
+            f"{emoji} *{title}*",
+        ]
+        if lt:
+            lines.append(f"   {lt}")
+        if rec:
+            lines.append(f"   🎯 Рекомендация: {rec}")
+        if summary:
+            lines.append(f"   💡 {summary}")
+        lines.append(f"   ✅ Уверенность AI: {conf}%")
+        lines.append("")
+        if is_new:
+            lines.append("🎁 3 дня PRO активированы автоматически.")
+        lines.append("ℹ️ Аналитический материал, не является прогнозом.")
+
+        txt = "\n".join(lines)
+        mid = p.get("match_id", "")
+        sport_slug = p.get("sport_slug", "ice-hockey")
+        short_title = title[:25]
+        rows = [
+            [InlineKeyboardButton(f"🔍 Полный анализ: {short_title}", callback_data=f"MATCH:{sport_slug}:{mid}")],
+            [InlineKeyboardButton("🎯 Все топ-матчи дня", callback_data="MENU:HUNTER")],
+            [InlineKeyboardButton("📊 Анализ матчей", callback_data="MENU:MATCHES")],
+        ]
+    else:
+        # No picks yet — show example with trial banner
+        txt = HUNTER_EXAMPLE_TEXT
+        if is_new:
+            txt = "🎁 3 дня PRO активированы автоматически.\n\n" + txt
+        rows = [
+            [InlineKeyboardButton("🎯 Охотник (обновить)", callback_data="MENU:HUNTER")],
+            [InlineKeyboardButton("📊 Анализ матчей", callback_data="MENU:MATCHES")],
+        ]
+
+    return _truncate_tg(txt), InlineKeyboardMarkup(rows)
+
+
+
     if not update.message:
         return
     txt = _text_buy_pro(update.effective_user.id if update.effective_user else 0)
@@ -2392,16 +2523,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         except Exception:
             logger.exception("set_user_seen_intro failed")
+        # Grant trial if not yet used
+        _auto_grant_welcome_trial(user_id)
         # Remove inline buttons from onboarding message
         try:
-            await q.edit_message_text(MAIN_MENU_TEXT)
+            await q.edit_message_text(
+                "🎁 3 дня PRO активированы!\n\nВот лучший матч сегодня 👇"
+            )
         except Exception:
             pass
-        # Send new message with persistent reply keyboard
-        await q.message.reply_text(
-            "Выбери спорт 👇",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        # Send pick card + persistent keyboard
+        await q.message.reply_text("Меню 👇", reply_markup=MAIN_MENU_KEYBOARD)
+        card_text, card_kb = _build_welcome_pick_card(is_new=True)
+        await q.message.reply_text(card_text, reply_markup=card_kb, parse_mode="Markdown")
         return
 
     # ONBOARD:HELP
