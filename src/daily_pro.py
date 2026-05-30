@@ -211,8 +211,8 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 {context_text}{line_movement_text}
 ЗАДАЧА:
 1. Дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
-2. Объясни в 2-3 предложениях ПОЧЕМУ — сила команд, форма, позиция в таблице, турнирная ситуация
-3. Если есть таблица или форма — ИСПОЛЬЗУЙ позицию и последние 5 матчей в анализе
+2. Объясни в 2-3 предложениях ПОЧЕМУ — {analysis_basis}
+{context_instruction}
 4. Если есть движение линии — учти его в анализе
 5. Оцени уверенность от 55% до 85%
 
@@ -229,7 +229,7 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 - Если коэффициентов нет ("нет данных") — rec_odds = 0, recommendation ТОЛЬКО на основе позиций команд.
 - Если данных о командах недостаточно для анализа — верни confidence=0.55, recommendation="" (пустая строка).
 - Пустая recommendation лучше выдуманной рекомендации.
-- Используй позицию в таблице, форму команд, рейтинг для анализа.
+- {context_bias_guard}
 - Без слов "ставь", "бери", "гарантия". Только аналитический материал.
 - Отвечай на русском."""
 
@@ -700,6 +700,19 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
     context_text = match.get("_context_text", "")
     if context_text:
         context_text = context_text.rstrip("\n") + "\n"
+        # Context confirmed → instruct LLM to use it
+        analysis_basis = "сила команд, форма, позиция в таблице, турнирная ситуация"
+        context_instruction = "3. ИСПОЛЬЗУЙ позицию и последние 5 матчей из таблицы выше в анализе"
+        context_bias_guard = "Используй позицию в таблице, форму команд, рейтинг для анализа."
+    else:
+        # No verified context → forbid hallucinating form/standings
+        analysis_basis = "класс команд, их турнирная ситуация, коэффициенты"
+        context_instruction = (
+            "3. Данных о таблице и форме команд нет — НЕ упоминай позиции, "
+            "серию матчей или форму в анализе. Опирайся только на коэффициенты "
+            "и общеизвестный класс команд."
+        )
+        context_bias_guard = "НЕ придумывай форму, позиции в таблице или последние результаты — этих данных нет."
 
     prompt = _HUNTER_ANALYSIS_PROMPT.format(
         title=match.get("title", ""),
@@ -709,6 +722,9 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
         odds_text=odds_text,
         context_text=context_text,
         line_movement_text=line_movement_text,
+        analysis_basis=analysis_basis,
+        context_instruction=context_instruction,
+        context_bias_guard=context_bias_guard,
     )
 
     try:
@@ -921,6 +937,7 @@ def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
             logger.info("Hunter: saved %d picks for %s", len(picks), pick_date)
     except Exception:
         logger.exception("Hunter: save_picks failed")
+        raise  # propagate so callers know DB write failed
 
 
 # ---------------------------------------------------------------------------
@@ -1202,8 +1219,12 @@ async def _broadcast_to_pro_users(bot, picks: List[Dict[str, Any]], pick_date: d
 # ---------------------------------------------------------------------------
 # MAIN PIPELINE
 # ---------------------------------------------------------------------------
-async def run_daily_hunter(bot=None) -> None:
-    """Main entry point for daily hunter job (v2)."""
+async def run_daily_hunter(bot=None) -> list:
+    """Main entry point for daily hunter job (v2).
+
+    Returns the top3 pick list on success, [] if no picks were produced,
+    or [] on error (error is logged and stored in _hunter_run_info).
+    """
     logger.info("Hunter v2: starting daily run, bot=%s, channel=%s",
                 "provided" if bot else "None", CHANNEL_USERNAME or "(not set)")
     _hunter_run_info["status"] = "running"
@@ -1451,7 +1472,7 @@ async def run_daily_hunter(bot=None) -> None:
             logger.warning("Hunter: no picks at all after all fallbacks — aborting")
             _hunter_run_info["status"] = "done"
             _hunter_run_info["picks_count"] = 0
-            return
+            return []
 
         logger.info("Hunter: FINAL %d picks selected", len(top3))
 
@@ -1512,11 +1533,13 @@ async def run_daily_hunter(bot=None) -> None:
         _hunter_run_info["users_sent"] = sent
         _hunter_run_info["status"] = "done"
         logger.info("Hunter v2: done — %d picks, sent to %d users", len(top3), sent)
+        return list(top3)
 
     except Exception as exc:
         _hunter_run_info["status"] = "error"
         _hunter_run_info["error"] = str(exc)
         logger.exception("Hunter v2: run failed")
+        return []
     finally:
         # Free temp objects after heavy pipeline
         import gc

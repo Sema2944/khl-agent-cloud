@@ -1562,18 +1562,28 @@ async def handle_hunter_refresh(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         from ..daily_pro import run_daily_hunter
-        await run_daily_hunter(bot=context.bot)
+        returned_top3 = await run_daily_hunter(bot=context.bot)
     except Exception:
         logger.exception("hunter_refresh failed")
         await update.message.reply_text("❌ Ошибка при генерации. Смотри логи.")
         return
 
-    # Show fresh picks
-    picks = _get_today_picks()
-    top3 = [p for p in picks if p.get("pick_type") == "top3"]
-    if not top3:
-        await update.message.reply_text("⚠️ Пайплайн отработал, но пиков нет (нет подходящих матчей).")
-        return
+    # Use the value returned by the pipeline — it comes from in-memory top3
+    # so it is always consistent with what was broadcasted, regardless of DB state.
+    if not returned_top3:
+        # Pipeline produced nothing. Double-check DB in case an older run has picks.
+        db_picks = _get_today_picks()
+        db_top3 = [p for p in db_picks if p.get("pick_type") == "top3"]
+        if not db_top3:
+            await update.message.reply_text("⚠️ Пайплайн отработал, но пиков нет (нет подходящих матчей).")
+            return
+        # Stale DB picks exist — show them
+        top3 = db_top3
+        picks = db_picks
+    else:
+        top3 = returned_top3
+        # Re-read DB for formatting (includes express if saved); fall back to in-memory
+        picks = _get_today_picks() or returned_top3
 
     txt = _format_hunter_picks_text(picks)
     rows = []
