@@ -210,7 +210,7 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 Коэффициенты: {odds_text}
 {context_text}{line_movement_text}
 ЗАДАЧА:
-1. ОБЯЗАТЕЛЬНО дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
+1. Дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
 2. Объясни в 2-3 предложениях ПОЧЕМУ — сила команд, форма, позиция в таблице, турнирная ситуация
 3. Если есть таблица или форма — ИСПОЛЬЗУЙ позицию и последние 5 матчей в анализе
 4. Если есть движение линии — учти его в анализе
@@ -225,10 +225,11 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 }}
 
 КРИТИЧЕСКИ ВАЖНО:
-- ВСЕГДА возвращай confidence >= 0.55. Не возвращай 0!
-- Если данных мало — ставь confidence 0.55-0.65, но ОБЯЗАТЕЛЬНО дай рекомендацию.
+- НЕ придумывай команды, форму, статистику или коэффициенты — используй ТОЛЬКО данные выше.
+- Если коэффициентов нет ("нет данных") — rec_odds = 0, recommendation ТОЛЬКО на основе позиций команд.
+- Если данных о командах недостаточно для анализа — верни confidence=0.55, recommendation="" (пустая строка).
+- Пустая recommendation лучше выдуманной рекомендации.
 - Используй позицию в таблице, форму команд, рейтинг для анализа.
-- rec_odds: бери из коэффициентов выше. Если нет — оцени сам (1.50-3.00).
 - Без слов "ставь", "бери", "гарантия". Только аналитический материал.
 - Отвечай на русском."""
 
@@ -369,6 +370,35 @@ async def _fetch_team_context(match: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Fetch & Filter
 # ---------------------------------------------------------------------------
+
+def _is_verified_match(m: Dict[str, Any]) -> bool:
+    """Return True only if the match has minimum required verified fields.
+
+    Guards against phantom/garbage entries that arrive when an API returns
+    partial data (empty title, unknown match_id, etc.).
+    """
+    title = (m.get("title") or "").strip()
+    league = (m.get("league") or "").strip()
+    match_id = (m.get("match_id") or "").strip()
+
+    # Must look like "Team A — Team B"
+    if " — " not in title:
+        return False
+    home, away = title.split(" — ", 1)
+    if not home.strip() or not away.strip():
+        return False
+
+    # Must have a real league name
+    if not league or league.lower() in ("unknown", "other", "none", ""):
+        return False
+
+    # Must have a real match_id (not placeholder)
+    if not match_id or match_id.lower() in ("unknown", "none", ""):
+        return False
+
+    return True
+
+
 async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
     """Fetch matches across all hunter sports for today (MSK)."""
     today = datetime.now(MSK).date()
@@ -398,6 +428,8 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
                     "_season":    league_obj.get("season"),
                     "_home_id":   (teams_obj.get("home") or {}).get("id"),
                     "_away_id":   (teams_obj.get("away") or {}).get("id"),
+                    # Data quality audit trail
+                    "_data_source": "api-sports.io" if league_obj.get("id") else "espn/unknown",
                 }
                 sport_matches.append(entry)
                 leagues_found.add(entry["league"])
@@ -412,12 +444,13 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
 
 
 def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep only scheduled matches from top leagues."""
+    """Keep only scheduled matches from top leagues with verified minimum fields."""
     result = []
     # Diagnostic counters per sport
     sport_raw: Dict[str, int] = {}
     sport_filtered: Dict[str, int] = {}
     sport_status_skip: Dict[str, int] = {}
+    unverified_skip = 0
 
     for m in matches:
         status = m.get("status", "")
@@ -434,12 +467,22 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if any(x in league for x in ["friendly", "women", "youth", "u18", "u20", "u21"]):
             continue
 
+        # Guardrail: skip matches without verified minimum fields
+        if not _is_verified_match(m):
+            unverified_skip += 1
+            logger.debug("Hunter filter: unverified match dropped — title=%r league=%r id=%r",
+                         m.get("title", "")[:30], m.get("league", ""), m.get("match_id", ""))
+            continue
+
         # Top-league filter
         if not _is_top_league(sport, m.get("league", "")):
             continue
 
         result.append(m)
         sport_filtered[sport] = sport_filtered.get(sport, 0) + 1
+
+    if unverified_skip:
+        logger.warning("Hunter filter: dropped %d unverified matches (no title/league/teams)", unverified_skip)
 
     # Log diagnostics per sport
     for sport in sorted(sport_raw.keys()):
@@ -452,7 +495,7 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
 
     # Fallback: if too few matches pass the top-league filter,
-    # relax and include all non-friendly matches
+    # relax but KEEP the verified + no-friendly guards
     if len(result) < 6:
         logger.info("Hunter: only %d top-league matches, relaxing filter", len(result))
         relaxed = []
@@ -462,6 +505,9 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if status not in {"notstarted", "scheduled", "fixture", "ns", ""}:
                 continue
             if any(x in league for x in ["friendly", "women", "youth", "u18", "u20", "u21"]):
+                continue
+            # Keep verified guard even in relaxed mode
+            if not _is_verified_match(m):
                 continue
             relaxed.append(m)
         return relaxed
@@ -1214,6 +1260,34 @@ async def run_daily_hunter(bot=None) -> None:
             await _enrich_odds(m)
             await asyncio.sleep(0.3)
 
+        # 4a. Data quality gate — require verified minimum fields after odds enrichment
+        import datetime as _dt_module
+        verified_at_ts = _dt_module.datetime.now(MSK).isoformat(timespec="seconds")
+        dq_ok = []
+        dq_dropped = []
+        for m in top_candidates:
+            if not _is_verified_match(m):
+                dq_dropped.append(m)
+                logger.warning("Hunter DQ gate: dropping %r — missing title/league/teams",
+                                m.get("title", "")[:40])
+                continue
+            m["_verified_at"] = verified_at_ts
+            m["_data_source"] = m.get("_data_source", "unknown")
+            dq_ok.append(m)
+
+        if dq_dropped:
+            logger.warning("Hunter DQ gate: dropped %d/%d candidates after verified-check",
+                           len(dq_dropped), len(top_candidates))
+        top_candidates = dq_ok
+
+        if not top_candidates:
+            logger.warning("Hunter DQ gate: 0 verified candidates — aborting (no reliable data today)")
+            _hunter_run_info["status"] = "done"
+            _hunter_run_info["picks_count"] = 0
+            _hunter_run_info["users_sent"] = 0
+            _hunter_run_info["users_total"] = 0
+            return
+
         # 4b. Team context: standings + form from api-sports.io
         _standings_cache.clear()  # fresh cache for today's run
         ctx_ok = 0
@@ -1398,11 +1472,14 @@ async def run_daily_hunter(bot=None) -> None:
         for i, p in enumerate(top3, 1):
             edge_pct = round(p.get("_edge", 0) * 100, 1)
             ctx_flag = "✓" if p.get("_context_text") else "✗"
+            has_odds = "✓" if p.get("odds_parsed") else "✗"
+            src = p.get("_data_source", "?")
+            vat = (p.get("_verified_at") or "")[-8:]  # HH:MM:SS part only
             logger.info(
-                "Hunter v2.1 pick #%d: %s | conf=%.0f%% | edge=%+.1f%% | ctx=%s | %s",
+                "Hunter v2.1 pick #%d: %s | conf=%.0f%% | edge=%+.1f%% | ctx=%s | odds=%s | src=%s | vat=%s | %s",
                 i, p.get("title", "")[:40],
                 p.get("confidence", 0) * 100,
-                edge_pct, ctx_flag,
+                edge_pct, ctx_flag, has_odds, src, vat,
                 p.get("recommendation", ""),
             )
         # ────────────────────────────────────────────────────────────────────
