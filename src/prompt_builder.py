@@ -219,38 +219,111 @@ LIVE КЭФЫ:
 
 def build_enriched_context_text(ctx: MatchContext) -> str:
     """
-    Build a compact text block with all available data.
-    Used to append to existing prompts for enrichment.
+    Build a detailed text block with all available data for LLM enrichment.
+    Used to append to existing prompts.
+    Principle: every piece of data gets a concrete number or label.
     """
     parts = []
 
+    # ── Кэфы и движение линии ──────────────────────────────────────────────
     if ctx.has_odds():
         o = ctx.odds
-        parts.append(
-            f"Линия: {ctx.home_team} {o.home_win}"
-            + (f" (откр {o.home_win_open})" if o.home_win_open else "")
-            + f" | {ctx.away_team} {o.away_win}"
-            + (f" (откр {o.away_win_open})" if o.away_win_open else "")
-        )
+        home_line = f"{ctx.home_team} {o.home_win}"
+        away_line = f"{ctx.away_team} {o.away_win}"
+
+        # Определяем направление движения линии
+        movement = ""
+        if o.home_win_open and o.home_win and abs(o.home_win - o.home_win_open) >= 0.03:
+            if o.home_win < o.home_win_open:
+                pct = round((o.home_win_open - o.home_win) / o.home_win_open * 100, 1)
+                movement = f" ↓ {o.home_win_open}→{o.home_win} (-{pct}%, рынок на хозяев)"
+            else:
+                pct = round((o.home_win - o.home_win_open) / o.home_win_open * 100, 1)
+                movement = f" ↑ {o.home_win_open}→{o.home_win} (+{pct}%, рынок на гостей)"
+
+        line_str = f"Линия: {home_line} | {away_line}"
+        if o.draw:
+            line_str += f" | X {o.draw}"
+        if movement:
+            line_str += f" | {movement}"
+        if o.bookmaker:
+            line_str += f" [{o.bookmaker}]"
+        parts.append(line_str)
+
         if o.total_line:
-            parts.append(f"Тотал: {o.total_line} (б {o.total_over} / м {o.total_under})")
+            parts.append(
+                f"Тотал {o.total_line}: больше {o.total_over} / меньше {o.total_under}"
+                + (f" (откр {o.total_over_open})" if o.total_over_open else "")
+            )
 
+    # ── Форма команд ───────────────────────────────────────────────────────
     if ctx.has_form():
-        parts.append(f"Форма {ctx.home_team}: {ctx.home_form.last_10}, дома {ctx.home_form.home_record}")
-        parts.append(f"Форма {ctx.away_team}: {ctx.away_form.last_10}, гости {ctx.away_form.away_record}")
+        hf = ctx.home_form
+        af = ctx.away_form
 
+        def _form_line(team: str, f) -> str:
+            parts_f = [f"Форма {team}: {f.last_10}"]
+            if f.home_record:
+                parts_f.append(f"дома {f.home_record}" if team == ctx.home_team else f"гости {f.away_record}")
+            if f.streak:
+                parts_f.append(f"серия {f.streak}")
+            goals_parts = []
+            if f.goals_per_game:
+                goals_parts.append(f"{f.goals_per_game:.1f} заб")
+            if f.goals_against_per_game:
+                goals_parts.append(f"{f.goals_against_per_game:.1f} проп")
+            if goals_parts:
+                parts_f.append(f"голы/игру: {' / '.join(goals_parts)}")
+            return " | ".join(parts_f)
+
+        parts.append(_form_line(ctx.home_team, hf))
+        # Away: use away_record for guests
+        af_line = f"Форма {ctx.away_team}: {af.last_10}"
+        if af.away_record:
+            af_line += f" | гости {af.away_record}"
+        if af.streak:
+            af_line += f" | серия {af.streak}"
+        goals_parts = []
+        if af.goals_per_game:
+            goals_parts.append(f"{af.goals_per_game:.1f} заб")
+        if af.goals_against_per_game:
+            goals_parts.append(f"{af.goals_against_per_game:.1f} проп")
+        if goals_parts:
+            af_line += f" | голы/игру: {' / '.join(goals_parts)}"
+        parts.append(af_line)
+
+    # ── H2H ───────────────────────────────────────────────────────────────
     if ctx.has_h2h():
         h = ctx.h2h
-        parts.append(f"H2H: {h.home_wins}W-{h.draws}D-{h.away_wins}W из {h.total_games}, ср.тотал {h.avg_total}")
+        h2h_str = (
+            f"H2H ({h.total_games} матчей): "
+            f"{ctx.home_team} {h.home_wins}W — {h.draws}D — {h.away_wins}W {ctx.away_team}"
+        )
+        if h.avg_total:
+            h2h_str += f" | ср.тотал {h.avg_total}"
+        if h.last_result:
+            h2h_str += f" | посл. матч: {h.last_result}"
+        parts.append(h2h_str)
 
+    # ── LIVE статистика ────────────────────────────────────────────────────
     if ctx.has_live_stats():
         ls = ctx.live_stats
-        parts.append(f"Броски: {ls.shots_home}-{ls.shots_away}")
+        live_parts = []
+        if ls.shots_home or ls.shots_away:
+            live_parts.append(f"броски {ls.shots_home}-{ls.shots_away}")
         if ls.faceoffs_home:
-            parts.append(f"Вбрасывания: {ls.faceoffs_home}%-{ls.faceoffs_away}%")
+            live_parts.append(f"вбрасывания {ls.faceoffs_home}%-{ls.faceoffs_away}%")
+        if ls.hits_home or ls.hits_away:
+            live_parts.append(f"хиты {ls.hits_home}-{ls.hits_away}")
+        if ls.penalties_home or ls.penalties_away:
+            live_parts.append(f"удаления {ls.penalties_home}м-{ls.penalties_away}м")
+        if live_parts:
+            parts.append("Статистика LIVE: " + " | ".join(live_parts))
 
+    # ── Новости ────────────────────────────────────────────────────────────
     if ctx.news:
-        titles = [n.get("title", "") for n in ctx.news[:3]]
-        parts.append("Новости: " + " | ".join(titles))
+        titles = [n.get("title", "").strip() for n in ctx.news[:3] if n.get("title")]
+        if titles:
+            parts.append("Новости: " + " | ".join(titles))
 
     return "\n".join(parts)

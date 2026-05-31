@@ -261,39 +261,32 @@ def _fallback_analysis(
     if status and not score:
         lines.append(f"Статус: {status}")
 
-    # «Псевдо-AI» советы (универсально и безопасно)
+    # Базовый анализ на основе доступных данных матча
     if mode.startswith("pre"):
-        lines += [
-            "",
-            "Что проверить перед стартом:",
-            "• составы/травмы/вратари (для хоккея — критично)",
-            "• мотивацию (турнирная ситуация, серия, дерби)",
-            "• движение линии за 60–120 минут до матча",
-            "",
-            "Риск-стоп:",
-            "• резкое падение коэффициентов без новостей — лучше пропустить",
-        ]
+        if score:
+            lines += ["", "Матч уже начался. Для актуального разбора нажмите LIVE."]
+        else:
+            # Добавляем конкретику только если есть данные
+            lines.append("")
+            lines.append("Данные для анализа временно недоступны.")
+            lines.append("Попробуйте обновить через 30 секунд.")
     else:
         lines += [
             "",
             "На что смотреть в LIVE:",
-            "• темп и моменты (счёт может не отражать игру)",
-            "• удаления/карточки и кто доминирует",
-            "• реакция коэффициентов на ключевые события",
-            "",
-            "Риск-стоп:",
-            "• не «догонять» после серии минусов",
-            "• если данных мало — дождаться паузы/следующего отрезка",
+            "• темп — кто больше атакует последние 5 минут",
+            "• движение линии — если кэф на победу резко упал, рынок получил информацию",
         ]
 
     return {
         "title": title,
         "summary": "\n".join(lines).strip(),
+        "recommendation": "",
+        "confidence": 0,
+        "key_facts": [],
         "risks": [
-            "Не ставьте на эмоциях и не увеличивайте сумму после неудач.",
-            "Если информации мало или линия ведёт себя странно — пропускайте матч.",
+            "Минимум данных — воздержитесь от ставки до появления актуальных данных.",
         ],
-        "cta": "Хочешь — нажми «Обновить LIVE» через пару минут, данные могут подтянуться.",
         "disclaimer": "Аналитический материал, не является рекомендацией.",
         "_fallback": True,
         "_reason": reason,
@@ -1299,18 +1292,30 @@ def _build_ui_prompt(
     prev = prev_snapshot or {}
 
     guard = (
-        "Ты — спортивный аналитик (хоккей/футбол и др.). "
-        "Твоя задача: дать краткий, структурированный разбор матча на основе переданных данных. "
-        "Не выдумывай факты (составы/травмы/коэффициенты), если их нет во входе. "
-        "Пиши по-русски, деловой стиль, без воды. "
-        "Верни только JSON по схеме ниже."
+        "Ты — профессиональный спортивный аналитик.\n"
+        "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:\n"
+        "1. Используй ТОЛЬКО данные из промпта. Не выдумывай кэфы, форму, составы.\n"
+        "2. Каждый аргумент в key_facts подкрепляй КОНКРЕТНОЙ ЦИФРОЙ из данных "
+        "(например: 'кэф 1.72', 'форма 6W-2L', 'H2H 4-1 в пользу хозяев', 'серия 3 победы').\n"
+        "3. ЗАПРЕЩЕНЫ пустые фразы: 'данные неполные', 'возможны сюрпризы', "
+        "'проверьте самостоятельно', 'составы неизвестны', 'высокая конкуренция', "
+        "'равные шансы' — если есть реальные данные, используй их.\n"
+        "4. recommendation: дай конкретный выбор (П1/П2/X/ТБ/ТМ). "
+        "Оставь пустым ТОЛЬКО если данных < 30%.\n"
+        "5. confidence: 55–60% = 1 слабый фактор; 65–70% = 2 фактора; "
+        "75–80% = 3 фактора совпадают; 82–85% = форма+H2H+линия — все совпадают.\n"
+        "6. Пиши по-русски, деловой стиль.\n"
+        "7. Верни только JSON по схеме ниже."
     )
 
     if mode == "pre":
         focus = (
-            "Фокус PRE: что важно проверить ДО матча и какие сценарии возможны. "
-            "Если есть стартовое время — упомяни окно 60–120 минут до начала для проверки составов/вратарей. "
-            "Если матч уже идёт/завершён — честно укажи это в summary."
+            "Фокус PRE-анализа (до матча):\n"
+            "— ФОРМА: кто в лучшей серии, голы за/против, дома/гости рекорд\n"
+            "— H2H: общий счёт встреч, средний тотал, кто выигрывает чаще\n"
+            "— ЛИНИЯ: кэфы и движение (кэф упал → рынок ставит сюда)\n"
+            "— ВЫВОД: recommendation на основе совпадения форма+H2H+линия\n"
+            "— Если матч уже идёт/завершён — честно укажи это в summary"
         )
     else:
         focus = (
@@ -1320,7 +1325,7 @@ def _build_ui_prompt(
             "Если статус/счёт есть во входе — отрази их."
         )
 
-    depth = "Коротко (overview): 5–10 строк суммарно, упор на практический чек-лист и риски."
+    depth = "Объём: 4–6 конкретных key_facts, 1–2 риска. Каждый факт — цифра или конкретный аргумент."
 
     # Remove internal keys from match_meta before sending to LLM
     meta_clean = {k: v for k, v in match_meta.items() if not k.startswith("_")}
@@ -1425,11 +1430,12 @@ def _build_pro_live_prompt(
     )
 _SCHEMA_UI_PRE = """
 {
-  "title": "string",
-  "summary": "string",
-  "context": ["string"],
-  "insights": ["string"],
-  "risks": ["string"],
+  "title": "string — заголовок с командами и лигой",
+  "summary": "string — 2-3 предложения с конкретными фактами и цифрами из данных",
+  "recommendation": "string — П1 / П2 / X / ТБ N.N / ТМ N.N — пусто только если данных < 30%",
+  "confidence": "integer — 55..85 процентов, 0 если данных недостаточно",
+  "key_facts": ["string — конкретный аргумент с цифрой: кэф, форма, H2H, серия"],
+  "risks": ["string — конкретный риск с условием"],
   "disclaimer": "string"
 }
 """.strip()
@@ -1475,21 +1481,49 @@ def _render_ui_json(analysis: Dict[str, Any], *, mode: str, action: str) -> str:
         return "AI недоступен."
 
     is_pro_live = (mode == "live" and action == "pro")
+    is_pre = (mode == "pre")
     title = str(analysis.get("title") or "").strip() or ("🟢 LIVE" if mode == "live" else "📊 Обзор")
     lines: list[str] = [title]
 
     if analysis.get("summary"):
         lines += ["", str(analysis["summary"]).strip()]
 
+    # ── PRE: рекомендация + уверенность (главный блок) ─────────────────────
+    if is_pre:
+        rec = str(analysis.get("recommendation") or "").strip()
+        conf_raw = analysis.get("confidence")
+        try:
+            conf = int(conf_raw) if conf_raw is not None else 0
+        except (ValueError, TypeError):
+            conf = 0
+
+        if rec and conf > 0:
+            lines += ["", f"🎯 Рекомендация: {rec}"]
+            lines.append(f"📊 Уверенность: {conf}%")
+        elif rec:
+            lines += ["", f"🎯 Рекомендация: {rec}"]
+
     # PRO LIVE: live_state — текущее состояние матча
     if is_pro_live and analysis.get("live_state"):
         lines += ["", f"📍 {str(analysis['live_state']).strip()}"]
 
-    ctx = analysis.get("context") or []
-    if ctx:
-        lines.append("")
-        for x in ctx[:6]:
-            lines.append(f"• {x}")
+    # ── PRE: key_facts (аргументы с цифрами) ────────────────────────────────
+    if is_pre:
+        key_facts = analysis.get("key_facts") or []
+        # Fallback: also support old "context" / "insights" fields
+        if not key_facts:
+            key_facts = analysis.get("context") or analysis.get("insights") or []
+        if key_facts:
+            lines += ["", "✅ Аргументы"]
+            for f in key_facts[:6]:
+                lines.append(f"• {f}")
+    else:
+        # LIVE: context block
+        ctx = analysis.get("context") or []
+        if ctx:
+            lines.append("")
+            for x in ctx[:6]:
+                lines.append(f"• {x}")
 
     # PRO LIVE: key_events — ключевые события
     key_events = analysis.get("key_events") or []
@@ -1512,9 +1546,9 @@ def _render_ui_json(analysis: Dict[str, Any], *, mode: str, action: str) -> str:
         for b in bets[:4]:
             lines.append(f"• {b}")
 
-    # Also render insights if present (regular LIVE schema)
+    # Regular LIVE: insights
     insights = analysis.get("insights") or []
-    if not is_pro_live and insights:
+    if not is_pro_live and not is_pre and insights:
         lines += ["", "💡 Инсайты"]
         for i in insights[:4]:
             lines.append(f"• {i}")
