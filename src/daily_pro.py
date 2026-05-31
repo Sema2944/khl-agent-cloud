@@ -1446,6 +1446,7 @@ async def run_daily_hunter(bot=None) -> list:
                 # Give minimal confidence and a generic recommendation
                 if not m.get("recommendation"):
                     odds_p = m.get("odds_parsed", {})
+                    has_any_odds = bool(odds_p)
                     if odds_p.get("home") and odds_p.get("away"):
                         # Auto-generate: pick the favourite
                         h = _safe_float(odds_p.get("home"))
@@ -1458,11 +1459,55 @@ async def run_daily_hunter(bot=None) -> list:
                                 m["recommendation"] = "П2"
                                 m["rec_odds"] = a
                             m["confidence"] = 0.60
-                            m["analysis_text"] = m.get("analysis_text") or "Матч из топ-лиги."
+                            m["analysis_text"] = (
+                                m.get("analysis_text")
+                                or "Нет сильного value-сигнала — матч для наблюдения. "
+                                "Рекомендация выбрана по фавориту линии."
+                            )
+                            m["risk"] = "средний"
+                    elif odds_p.get("total_over") and odds_p.get("total_under"):
+                        over = _safe_float(odds_p.get("total_over"))
+                        under = _safe_float(odds_p.get("total_under"))
+                        line = _safe_float(odds_p.get("total_line"))
+                        if over > 1.0 and under > 1.0 and line > 0:
+                            if over < under:
+                                m["recommendation"] = f"ТБ {line:g}"
+                                m["rec_odds"] = over
+                            else:
+                                m["recommendation"] = f"ТМ {line:g}"
+                                m["rec_odds"] = under
+                            m["confidence"] = 0.60
+                            m["risk"] = "средний"
+                            m["analysis_text"] = (
+                                m.get("analysis_text")
+                                or "Нет сильного value-сигнала — матч для наблюдения. "
+                                "Рекомендация выбрана по фавориту линии тотала."
+                            )
+                    elif has_any_odds:
+                        m["recommendation"] = "AI-анализ без ставки"
+                        m["rec_odds"] = 0
+                        m["confidence"] = 0.60
+                        m["risk"] = "низкий/средний"
+                        m["analysis_text"] = (
+                            m.get("analysis_text")
+                            or "Нет сильного value-сигнала — матч для наблюдения. "
+                            "Коэффициенты есть, но без надёжного перекоса для ставки."
+                        )
+                    else:
+                        # Real, verified match without reliable odds/AI signal.
+                        # Keep it as an observation pick so Hunter never looks empty.
+                        m["recommendation"] = "Пропуск ставки / только наблюдение"
+                        m["rec_odds"] = 0
+                        m["confidence"] = 0.55
+                        m["risk"] = "низкий/средний"
+                        m["analysis_text"] = (
+                            m.get("analysis_text")
+                            or "Нет сильного value-сигнала — матч для наблюдения. "
+                            "Матч реальный и прошёл проверку данных, но линия/AI не дали "
+                            "достаточно надёжной ставки."
+                        )
                 if m.get("confidence", 0) <= 0:
                     m["confidence"] = 0.60
-                if not m.get("recommendation"):
-                    continue
                 top3.append(m)
                 used_ids.add(m.get("match_id"))
                 logger.info("Hunter: filled slot with AI-skipped: %s (score=%.0f)",
