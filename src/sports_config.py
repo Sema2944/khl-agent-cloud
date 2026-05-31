@@ -63,6 +63,15 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
             94:  {"name": "Primeira Liga", "flag": "🇵🇹", "country": "Португалия", "season": 2025, "priority": 2},
             # Нидерланды
             88:  {"name": "Eredivisie", "flag": "🇳🇱", "country": "Нидерланды", "season": 2025, "priority": 2},
+            # ── Летние лиги (hotfix 31.05.2026) ─────────────────────────────
+            # Европейские топ-лиги в паузе (май–август). Скандинавские лиги
+            # используют calendar year (season=2026), не осень-весна.
+            # Segunda División сейчас в плей-офф за выход в Примеру (season=2025).
+            113: {"name": "Allsvenskan",      "flag": "🇸🇪", "country": "Швеция",   "season": 2026, "priority": 3},
+            244: {"name": "Veikkausliiga",    "flag": "🇫🇮", "country": "Финляндия", "season": 2026, "priority": 3},
+            103: {"name": "Eliteserien",      "flag": "🇳🇴", "country": "Норвегия",  "season": 2026, "priority": 3},
+            71:  {"name": "Série A",          "flag": "🇧🇷", "country": "Бразилия",  "season": 2026, "priority": 3},
+            141: {"name": "Segunda División", "flag": "🇪🇸", "country": "Испания",   "season": 2025, "priority": 3},
         },
         # Odds API sport keys
         "odds_keys": [

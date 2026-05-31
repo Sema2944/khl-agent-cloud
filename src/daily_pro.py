@@ -56,6 +56,8 @@ TOP_LEAGUES_KEYWORDS: Dict[str, List[str]] = {
         "champions league", "лига чемпионов",
         "europa league", "лига европы",
         "conference league",
+        # Летние лиги (hotfix 31.05.2026 — пока топ-лиги Европы в паузе)
+        "allsvenskan", "veikkausliiga", "eliteserien", "segunda división", "segunda division",
     ],
     "ice-hockey": [
         "khl", "кхл", "nhl", "нхл", "shl", "liiga",
