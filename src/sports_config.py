@@ -40,6 +40,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
             # api-sports.io football: season = год начала (2025-26 сезон = season 2025)
             # Россия
             235: {"name": "РПЛ", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
+            236: {"name": "ФНЛ / First League", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
             237: {"name": "Кубок России", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
             # Англия
             39:  {"name": "Premier League", "flag": "🏴", "country": "Англия", "season": 2025, "priority": 1},
@@ -110,9 +111,10 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
         },
         "match_param": "id",
         "leagues": {
-            50:  {"name": "KHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
+            35:  {"name": "KHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 1},
             57:  {"name": "NHL", "flag": "🇺🇸", "country": "USA/Canada", "season": 2025, "priority": 1},
-            48:  {"name": "VHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
+            36:  {"name": "VHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
+            37:  {"name": "MHL", "flag": "🇷🇺", "country": "Россия", "season": 2025, "priority": 2},
             56:  {"name": "SHL", "flag": "🇸🇪", "country": "Швеция", "season": 2025, "priority": 2},
             51:  {"name": "Liiga", "flag": "🇫🇮", "country": "Финляндия", "season": 2025, "priority": 2},
             52:  {"name": "Extraliga", "flag": "🇨🇿", "country": "Чехия", "season": 2025, "priority": 3},
@@ -177,6 +179,7 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
             117: {"name": "Eurocup",     "flag": "🇪🇺", "country": "Европа", "season": 2025,        "priority": 2},
             # VTB United League: corrected id 179→82, season format "YYYY-YYYY" (confirmed from api-sports.io data)
             82:  {"name": "VTB League",  "flag": "🇷🇺", "country": "Россия", "season": "2025-2026", "priority": 2},
+            159: {"name": "Russian Cup", "flag": "🇷🇺", "country": "Россия", "season": 2025,        "priority": 2},
         },
         "odds_keys": [
             "basketball_nba",
