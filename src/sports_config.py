@@ -381,8 +381,10 @@ def get_sport_labels() -> Dict[str, str]:
 
 
 def get_default_sports() -> List[str]:
-    """Return list of enabled sport slugs (ordered)."""
-    return list(get_enabled_sports().keys())
+    """Return product-focused sport slugs for the main UI."""
+    focused = ["football", "basketball", "ice-hockey"]
+    enabled = get_enabled_sports()
+    return [slug for slug in focused if slug in enabled]
 
 
 def _dynamic_season(configured_season: Any, sport_slug: str = "") -> Any:

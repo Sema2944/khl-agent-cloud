@@ -117,10 +117,9 @@ except Exception:
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("⚽ Футбол"), KeyboardButton("🏀 Баскетбол")],
-        [KeyboardButton("🏒 Хоккей"), KeyboardButton("🎾 Теннис")],
-        [KeyboardButton("🥊 MMA"), KeyboardButton("🏐 Волейбол")],
-        [KeyboardButton("🏎 Формула-1"), KeyboardButton("🔴 LIVE")],
-        [KeyboardButton("🌟 PRO")],
+        [KeyboardButton("🏒 Хоккей"), KeyboardButton("🔴 LIVE")],
+        [KeyboardButton("🌟 PRO"), KeyboardButton("👤 Профиль")],
+        [KeyboardButton("ℹ️ О боте")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -131,10 +130,6 @@ _REPLY_SPORT_MAP = {
     "⚽ Футбол": "football",
     "🏀 Баскетбол": "basketball",
     "🏒 Хоккей": "ice-hockey",
-    "🎾 Теннис": "tennis",
-    "🥊 MMA": "mma",
-    "🏐 Волейбол": "volleyball",
-    "🏎 Формула-1": "formula1",
 }
 
 # ---------------------------------------------------------------------------
@@ -143,7 +138,7 @@ _REPLY_SPORT_MAP = {
 _ALL_LIVE_CACHE: Optional[tuple] = None  # (timestamp, live_dict, upcoming_list)
 _ALL_LIVE_TTL = 45
 
-_LIVE_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "mma"]
+_LIVE_SPORTS = ["football", "basketball", "ice-hockey"]
 
 _LIVE_STATUS_KEYWORDS = {"live", "1h", "2h", "ht", "3h", "ot", "so", "in progress",
                           "inprogress", "in_progress", "playing", "p1", "p2", "p3",
@@ -2383,6 +2378,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb_buy_pro(),
         )
+        return
+
+    if text_raw.strip() == "👤 Профиль":
+        reply = await call_agent_local(user_id, "профиль")
+        txt = _truncate_tg(reply)
+        await update.message.reply_text(
+            _safe_markdown(txt),
+            reply_markup=MAIN_MENU_KEYBOARD,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if text_raw.strip() == "ℹ️ О боте":
+        await update.message.reply_text(ABOUT_TEXT, reply_markup=MAIN_MENU_KEYBOARD)
         return
 
     # быстрый вход в матчи

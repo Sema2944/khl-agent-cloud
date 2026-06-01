@@ -44,7 +44,7 @@ _hunter_run_info: Dict[str, Any] = {
     "error": None,
 }
 
-HUNTER_SPORTS = ["ice-hockey", "football", "basketball", "tennis", "mma"]
+HUNTER_SPORTS = ["football", "basketball", "ice-hockey"]
 
 # ---------------------------------------------------------------------------
 # TOP LEAGUES — only matches from these leagues are eligible for Hunter
