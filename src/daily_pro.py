@@ -137,6 +137,36 @@ def _extract_hour_msk(start_time: str) -> Optional[int]:
     return None
 
 
+_WATCH_ONLY_RECOMMENDATIONS = {
+    "пропуск ставки / только наблюдение",
+    "ai-анализ без ставки",
+}
+
+
+def _is_watch_only_recommendation(rec: str) -> bool:
+    return (rec or "").strip().lower() in _WATCH_ONLY_RECOMMENDATIONS
+
+
+def _is_real_recommendation(rec: str) -> bool:
+    text = (rec or "").strip().upper()
+    if not text or _is_watch_only_recommendation(text):
+        return False
+    return bool(
+        re.search(r"(^|\s)(П1|П2|ТБ|ТМ|ФОРА|X2|1X|Ф1|Ф2|X)(\s|$|[+\-])", text)
+    )
+
+
+def _format_match_time(match: Dict[str, Any]) -> str:
+    hhmm = _extract_hhmm(match.get("start_time", ""))
+    if not hhmm:
+        return ""
+    if match.get("sport_slug") == "tennis":
+        hour = int(hhmm.split(":", 1)[0])
+        if 0 <= hour <= 5:
+            return "время уточняется"
+    return f"{hhmm} MSK"
+
+
 def _extract_moneyline(odds_raw: Any) -> Dict[str, Any]:
     """Extract home/draw/away odds from various API response formats."""
     if not odds_raw or not isinstance(odds_raw, dict):
@@ -855,12 +885,16 @@ def _extract_rec_from_odds(odds: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Express builder
 # ---------------------------------------------------------------------------
-def _build_express(top3: List[Dict[str, Any]], pick_date: date) -> Dict[str, Any]:
-    """Build express pick from top-3 recommendations."""
+def _build_express(real_picks: List[Dict[str, Any]], pick_date: date) -> Optional[Dict[str, Any]]:
+    """Build express pick from real betting recommendations only."""
+    legs_source = [p for p in real_picks if _is_real_recommendation(p.get("recommendation", ""))]
+    if len(legs_source) < 2:
+        return None
+
     legs = []
     total_odds = 1.0
 
-    for p in top3:
+    for p in legs_source:
         rec = p.get("recommendation", "")
         odds = _safe_float(p.get("rec_odds", 0))
         # Smart title: "Chelsea — Burnley" → "Chelsea-Burnley", truncate if needed
@@ -878,8 +912,8 @@ def _build_express(top3: List[Dict[str, Any]], pick_date: date) -> Dict[str, Any
         "match_id": f"express_{pick_date.isoformat()}",
         "sport_slug": "multi",
         "title": "Экспресс дня",
-        "league": ", ".join(p.get("league", "")[:20] for p in top3),
-        "confidence": min((p.get("confidence", 0) for p in top3), default=0),
+        "league": ", ".join(p.get("league", "")[:20] for p in legs_source),
+        "confidence": min((p.get("confidence", 0) for p in legs_source), default=0),
         "analysis_text": " + ".join(legs),
         "recommendation": f"КЭФ {total_odds:.2f}" if total_odds > 1.0 else "",
         "start_time": "",
@@ -959,9 +993,11 @@ def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
 def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
     """Build the Hunter broadcast message in the new rich format."""
     top3 = [p for p in picks if p.get("pick_type") == "top3"]
+    watch_only = [p for p in picks if p.get("pick_type") == "watch"]
+    top_label = f"ТОП-{len(top3)} событий дня" if len(top3) != 3 else "ТОП-3 события дня"
 
     lines = [
-        f"🎯 Охотник — Топ матчи дня",
+        f"🎯 Охотник — {top_label}",
         f"{pick_date.strftime('%d.%m.%Y')} | Подобрано AI",
         "",
     ]
@@ -972,7 +1008,7 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
         emoji = SPORT_EMOJI.get(sport, "🏆")
         title = p.get("title", "Матч")
         league = p.get("league", "")
-        start = _extract_hhmm(p.get("start_time", ""))
+        start = _format_match_time(p)
         rec = p.get("recommendation", "")
         rec_odds = _safe_float(p.get("rec_odds", 0))
         summary = _truncate_at_sentence(p.get("analysis_text") or "", 200)
@@ -984,7 +1020,7 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
         if league:
             league_time = f"   🏆 {league}"
         if start:
-            league_time += f" | {start} MSK" if league_time else f"   {start} MSK"
+            league_time += f" | {start}" if league_time else f"   {start}"
         if league_time:
             lines.append(league_time)
 
@@ -1044,6 +1080,24 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
         lines.append(f"   ✅ Уверенность: {conf}%")
         lines.append("")
 
+    if watch_only:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("👀 Матчи для наблюдения")
+        for p in watch_only[:3]:
+            emoji = SPORT_EMOJI.get(p.get("sport_slug", ""), "🏆")
+            title = p.get("title", "Матч")
+            league = p.get("league", "")
+            start = _format_match_time(p)
+            meta = ""
+            if league:
+                meta = f"   🏆 {league}"
+            if start:
+                meta += f" | {start}" if meta else f"   {start}"
+            lines.append(f"   {emoji} {title}")
+            if meta:
+                lines.append(meta)
+        lines.append("")
+
     # Express
     express = [p for p in picks if p.get("pick_type") == "express"]
     if express:
@@ -1066,9 +1120,10 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
 def _format_channel_teaser(picks: List[Dict[str, Any]], pick_date: date) -> str:
     """Build teaser message for channel: matches only, no recommendations."""
     top3 = [p for p in picks if p.get("pick_type") == "top3"]
+    top_label = f"ТОП-{len(top3)} событий дня" if len(top3) != 3 else "ТОП-3 события дня"
 
     lines = [
-        f"🎯 Охотник — Топ матчи дня",
+        f"🎯 Охотник — {top_label}",
         f"{pick_date.strftime('%d.%m.%Y')} | Подобрано AI",
         "",
     ]
@@ -1078,7 +1133,7 @@ def _format_channel_teaser(picks: List[Dict[str, Any]], pick_date: date) -> str:
         emoji = SPORT_EMOJI.get(sport, "🏆")
         title = p.get("title", "Матч")
         league = p.get("league", "")
-        start = _extract_hhmm(p.get("start_time", ""))
+        start = _format_match_time(p)
 
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"{i}️⃣ {emoji} {title}")
@@ -1087,7 +1142,7 @@ def _format_channel_teaser(picks: List[Dict[str, Any]], pick_date: date) -> str:
         if league:
             league_time = f"   🏆 {league}"
         if start:
-            league_time += f" | {start} MSK" if league_time else f"   {start} MSK"
+            league_time += f" | {start}" if league_time else f"   {start}"
         if league_time:
             lines.append(league_time)
 
@@ -1360,6 +1415,20 @@ async def run_daily_hunter(bot=None) -> list:
             logger.info("Hunter: AI skipped %d matches with empty analysis", len(skipped_list))
 
         valid_after_ai = len(valid)
+        watch_only: List[Dict[str, Any]] = []
+        real_valid = []
+        for m in valid:
+            if _is_real_recommendation(m.get("recommendation", "")):
+                real_valid.append(m)
+            else:
+                m["pick_type"] = "watch"
+                watch_only.append(m)
+                logger.info(
+                    "Hunter QUALITY: moved non-bet recommendation to watch-only %s rec=%r",
+                    m.get("title", "")[:35],
+                    m.get("recommendation", ""),
+                )
+        valid = real_valid
 
         # 6b. VALUE filter: edge = confidence − implied_probability ≥ 3%
         # Applied only when enough matches survive (otherwise results degrade).
@@ -1519,12 +1588,18 @@ async def run_daily_hunter(bot=None) -> list:
                         )
                 if m.get("confidence", 0) <= 0:
                     m["confidence"] = 0.60
-                top3.append(m)
-                used_ids.add(m.get("match_id"))
-                logger.info("Hunter: filled slot with AI-skipped: %s (score=%.0f)",
-                            m.get("title", "")[:40], m.get("det_score", 0))
-                if len(top3) == 3:
-                    break
+                if _is_real_recommendation(m.get("recommendation", "")):
+                    top3.append(m)
+                    used_ids.add(m.get("match_id"))
+                    logger.info("Hunter: filled slot with AI-skipped: %s (score=%.0f)",
+                                m.get("title", "")[:40], m.get("det_score", 0))
+                    if len(top3) == 3:
+                        break
+                else:
+                    m["pick_type"] = "watch"
+                    watch_only.append(m)
+                    logger.info("Hunter QUALITY: watch-only kept out of top picks: %s",
+                                m.get("title", "")[:40])
 
         if not top3:
             logger.warning("Hunter: no picks at all after all fallbacks — aborting")
@@ -1536,6 +1611,8 @@ async def run_daily_hunter(bot=None) -> list:
 
         for p in top3:
             p["pick_type"] = "top3"
+        for p in watch_only:
+            p["pick_type"] = "watch"
 
         # ── Hunter v2.1 run summary ─────────────────────────────────────────
         logger.info(
@@ -1569,9 +1646,18 @@ async def run_daily_hunter(bot=None) -> list:
 
         # 8. Build express
         picks = list(top3)
-        if len(top3) >= 2:
+        picks.extend(watch_only[:3])
+        express_legs = len([p for p in top3 if _is_real_recommendation(p.get("recommendation", ""))])
+        logger.info(
+            "Hunter QUALITY: real_picks=%d watch_only=%d express_legs=%d",
+            len(top3),
+            len(watch_only),
+            express_legs,
+        )
+        if express_legs >= 2:
             express = _build_express(top3, today)
-            picks.append(express)
+            if express:
+                picks.append(express)
 
         # 9. Save to DB
         logger.info("Hunter STEP 6 saving=%d top3=%d", len(picks), len(top3))

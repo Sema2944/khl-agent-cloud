@@ -245,6 +245,17 @@ def _extract_hhmm(start_time: str) -> str:
     return ""
 
 
+def _format_hunter_match_time(p: dict) -> str:
+    hhmm = _extract_hhmm(p.get("start_time", ""))
+    if not hhmm:
+        return ""
+    if p.get("sport_slug") == "tennis":
+        hour = int(hhmm.split(":", 1)[0])
+        if 0 <= hour <= 5:
+            return "время уточняется"
+    return f"{hhmm} MSK"
+
+
 def _truncate_at_sentence(text: str, limit: int = 200) -> str:
     """Truncate text at the last complete sentence within limit."""
     if not text or len(text) <= limit:
@@ -491,10 +502,12 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
 
     top3 = [p for p in picks if p.get("pick_type") == "top3"]
     express = [p for p in picks if p.get("pick_type") == "express"]
+    watch_only = [p for p in picks if p.get("pick_type") == "watch"]
+    top_label = f"ТОП-{len(top3)} событий дня" if len(top3) != 3 else "ТОП-3 события дня"
 
     today = _dt.now(_ZI("Europe/Moscow")).date()
     lines = [
-        "🎯 Охотник — Топ матчи дня",
+        f"🎯 Охотник — {top_label}",
         f"{today.strftime('%d.%m.%Y')} | Подобрано AI",
         "",
     ]
@@ -505,7 +518,7 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
         emoji = _HUNTER_SPORT_EMOJI.get(sport, "🏆")
         title = (p.get("title") or "Матч")[:50]
         league = p.get("league", "")
-        start = _extract_hhmm(p.get("start_time", ""))
+        start = _format_hunter_match_time(p)
         rec = p.get("recommendation", "")
         summary = _truncate_at_sentence(p.get("analysis_text") or "", 200)
 
@@ -517,7 +530,7 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
         if league:
             lt = f"   🏆 {league}"
         if start:
-            lt += f" | {start} MSK" if lt else f"   {start} MSK"
+            lt += f" | {start}" if lt else f"   {start}"
         if lt:
             lines.append(lt)
 
@@ -549,6 +562,24 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
             lines.append(f"   💡 {summary}")
 
         lines.append(f"   ✅ Уверенность: {conf}%")
+        lines.append("")
+
+    if watch_only:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("👀 Матчи для наблюдения")
+        for p in watch_only[:3]:
+            emoji = _HUNTER_SPORT_EMOJI.get(p.get("sport_slug", ""), "🏆")
+            title = (p.get("title") or "Матч")[:50]
+            league = p.get("league", "")
+            start = _format_hunter_match_time(p)
+            meta = ""
+            if league:
+                meta = f"   🏆 {league}"
+            if start:
+                meta += f" | {start}" if meta else f"   {start}"
+            lines.append(f"   {emoji} {title}")
+            if meta:
+                lines.append(meta)
         lines.append("")
 
     # Express
@@ -1446,7 +1477,7 @@ def _build_welcome_pick_card(is_new: bool = True) -> tuple:
         emoji = _HUNTER_SPORT_EMOJI.get(sport, "🏆")
         title = (p.get("title") or "Матч")[:50]
         league = p.get("league", "")
-        start = _extract_hhmm(p.get("start_time", ""))
+        start = _format_hunter_match_time(p)
         rec = p.get("recommendation", "")
         summary = _truncate_at_sentence(p.get("analysis_text") or "", 220)
 
@@ -1454,7 +1485,7 @@ def _build_welcome_pick_card(is_new: bool = True) -> tuple:
         if league:
             lt = f"🏆 {league}"
         if start:
-            lt += f" | {start} MSK" if lt else f"   {start} MSK"
+            lt += f" | {start}" if lt else f"   {start}"
 
         lines = [
             "🎯 Лучший матч дня — от AI",
