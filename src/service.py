@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session
 
@@ -26,6 +26,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="KHL AI Betting Agent API")
+
+
+def require_agent_api_key(x_agent_api_key: Optional[str] = Header(default=None)) -> None:
+    expected = (os.getenv("AGENT_API_KEY") or "").strip()
+    if not expected or (x_agent_api_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="forbidden")
 
 
 @app.get("/__health")
@@ -358,7 +364,7 @@ async def on_shutdown():
 
 
 @app.post("/agent/query", response_model=QueryResponse)
-async def agent_query(req: QueryRequest):
+async def agent_query(req: QueryRequest, _: None = Depends(require_agent_api_key)):
     text = req.text
     logger.info("/agent/query: user_id=%s, text=%r", req.user_id, text)
 
@@ -381,13 +387,22 @@ async def agent_query(req: QueryRequest):
 
 
 @app.get("/agent/last-bets")
-def api_last_bets(user_id: int, limit: int = 5, session: Session = Depends(get_session)):
+def api_last_bets(
+    user_id: int,
+    limit: int = 5,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     bets = get_last_bets(session, user_id, limit)
     return {"bets": [b.model_dump() for b in bets]}
 
 
 @app.post("/agent/add-bet")
-def api_add_bet(bet: BetCreate, session: Session = Depends(get_session)):
+def api_add_bet(
+    bet: BetCreate,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     b = add_bet(
         session=session,
         user_id=bet.user_id,
@@ -401,7 +416,11 @@ def api_add_bet(bet: BetCreate, session: Session = Depends(get_session)):
 
 
 @app.post("/agent/settle-bet")
-def api_settle_bet(data: BetSettle, session: Session = Depends(get_session)):
+def api_settle_bet(
+    data: BetSettle,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     b = settle_bet(session, data.user_id, data.bet_id, data.result)
     if b is None:
         return {"status": "not_found_or_bad_result"}
@@ -409,7 +428,11 @@ def api_settle_bet(data: BetSettle, session: Session = Depends(get_session)):
 
 
 @app.get("/agent/stats")
-def api_user_stats(user_id: int, session: Session = Depends(get_session)):
+def api_user_stats(
+    user_id: int,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     s = get_user_stats(session, user_id)
     return {
         "total_bets": s.total_bets,
@@ -423,23 +446,41 @@ def api_user_stats(user_id: int, session: Session = Depends(get_session)):
 
 
 @app.get("/agent/bank")
-def api_user_bank(user_id: int, session: Session = Depends(get_session)):
+def api_user_bank(
+    user_id: int,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     return {"bank": get_user_bank(session, user_id)}
 
 
 @app.post("/agent/bank/set")
-def api_set_user_bank(user_id: int, amount: float, session: Session = Depends(get_session)):
+def api_set_user_bank(
+    user_id: int,
+    amount: float,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     u = set_user_bank(session, user_id, amount)
     return {"status": "ok", "bank": u.bank}
 
 
 @app.post("/agent/bank/change")
-def api_change_user_bank(user_id: int, amount: float, session: Session = Depends(get_session)):
+def api_change_user_bank(
+    user_id: int,
+    amount: float,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     u = change_user_bank(session, user_id, amount)
     return {"status": "ok", "bank": u.bank}
 
 
 @app.get("/agent/all-bets")
-def api_all_bets(user_id: int, session: Session = Depends(get_session)):
+def api_all_bets(
+    user_id: int,
+    _: None = Depends(require_agent_api_key),
+    session: Session = Depends(get_session),
+):
     bets = get_all_bets(session, user_id)
     return {"bets": [b.model_dump() for b in bets]}

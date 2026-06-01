@@ -1640,11 +1640,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
 
     trial_banner = ""
     if mode == "live" and action == "pro":
-        # DB may be unavailable — never let DB errors kill LIVE response
+        # DB must confirm PRO/trial access for LIVE PRO.
         try:
             user_is_pro = is_pro(user_id)
         except Exception:
-            logger.exception("is_pro DB error — defaulting to non-PRO, trial allowed through")
+            logger.exception("is_pro DB error — defaulting to non-PRO")
             user_is_pro = False
 
         if not user_is_pro:
@@ -1655,11 +1655,11 @@ async def _run_ui_llm(user_id: int, match_id: str, mode: str, action: str) -> st
                     if not trial_used:
                         if _consume_trial_live(session, user_id):
                             trial_banner = "🎁 Trial LIVE PRO активирован (1/1)\n\n"
-                        # _consume_trial_live returns False ONLY on DB error (never "already used")
-                        # Do NOT set trial_used = True on DB error — let user through
+                        else:
+                            trial_used = True
             except Exception:
-                logger.exception("DB unavailable for trial LIVE check — allowing LIVE PRO (trial not deducted)")
-                trial_used = False  # DB down → пропускаем пользователя, не ломаем ответ
+                logger.exception("DB unavailable for trial LIVE check — denying LIVE PRO")
+                trial_used = True
 
         if not user_is_pro and trial_used:
             teaser_action = "overview"

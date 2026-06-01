@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-import socket
 from typing import Generator
-from urllib.parse import urlparse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -30,18 +28,6 @@ def _normalize_db_url(url: str) -> str:
 
 
 DATABASE_URL = _normalize_db_url(DATABASE_URL)
-parsed = urlparse(DATABASE_URL)
-logger.info(
-    "DB runtime host=%s db=%s driver=%s",
-    parsed.hostname or "(none)",
-    parsed.path or "",
-    parsed.scheme or "",
-)
-if parsed.hostname:
-    try:
-        logger.info("DB DNS host=%s ip=%s", parsed.hostname, socket.gethostbyname(parsed.hostname))
-    except Exception as e:
-        logger.exception("DB DNS resolve failed host=%s: %s", parsed.hostname, e)
 
 engine = create_engine(
     DATABASE_URL,

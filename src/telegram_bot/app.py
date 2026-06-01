@@ -2248,7 +2248,7 @@ async def _handle_live_button(update: Update, user_id: int) -> None:
             "🌟 Оформи PRO — от 299₽/неделю",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
-                [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:trial")],
+                [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:TRIAL")],
             ]),
         )
         return
@@ -2484,7 +2484,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # PRO:<tariff_key> — send invoice for payment (ЮKassa or Stars)
-    if data.startswith("PRO:") and data != "PRO:TRIAL":
+    if data.startswith("PRO:") and data.upper() != "PRO:TRIAL":
         tariff_key = data.split(":", 1)[1].strip().lower()
         try:
             from .payments import send_invoice
@@ -2496,7 +2496,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # PRO:TRIAL — активация бесплатного пробного периода
-    if data == "PRO:TRIAL":
+    if data.upper() == "PRO:TRIAL":
         trial_ok = False
         try:
             from ..user_store import get_user_by_tg_id
@@ -2911,7 +2911,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "🌟 Оформи PRO — от 299₽/неделю",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🌟 Оформить PRO", callback_data="MENU:PREMIUM")],
-                        [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:trial")],
+                        [InlineKeyboardButton("🎁 Попробовать 3 дня бесплатно", callback_data="PRO:TRIAL")],
                     ]),
                 )
             except Exception:
