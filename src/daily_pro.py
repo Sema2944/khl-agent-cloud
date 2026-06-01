@@ -895,14 +895,17 @@ def _build_express(top3: List[Dict[str, Any]], pick_date: date) -> Dict[str, Any
 def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
     """Save top picks to daily_picks table (v2 with new columns)."""
     try:
+        logger.info("Hunter SAVE step: _save_picks called picks=%d date=%s", len(picks), pick_date)
         with Session(engine) as s:
+            logger.info("Hunter SAVE step: deleting existing daily_picks for %s", pick_date)
             s.exec(
                 text("DELETE FROM daily_picks WHERE pick_date = :d"),
                 params={"d": pick_date.isoformat()},
             )
             s.commit()
+            logger.info("Hunter SAVE step: delete committed for %s", pick_date)
 
-            for p in picks:
+            for i, p in enumerate(picks, 1):
                 odds_json_str = ""
                 odds_data = p.get("odds_parsed") or {}
                 if odds_data:
@@ -911,6 +914,13 @@ def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
                     except Exception:
                         odds_json_str = ""
 
+                logger.info(
+                    "Hunter SAVE step: insert #%d type=%s match_id=%s title=%r",
+                    i,
+                    p.get("pick_type", "top3"),
+                    p.get("match_id", ""),
+                    (p.get("title", "") or "")[:60],
+                )
                 s.exec(
                     text("""
                         INSERT INTO daily_picks
@@ -936,6 +946,7 @@ def _save_picks(picks: List[Dict[str, Any]], pick_date: date) -> None:
                     },
                 )
             s.commit()
+            logger.info("Hunter SAVE step: insert commit ok rows=%d date=%s", len(picks), pick_date)
             logger.info("Hunter: saved %d picks for %s", len(picks), pick_date)
     except Exception:
         logger.exception("Hunter: save_picks failed")
@@ -1563,6 +1574,7 @@ async def run_daily_hunter(bot=None) -> list:
             picks.append(express)
 
         # 9. Save to DB
+        logger.info("Hunter STEP 6 saving=%d top3=%d", len(picks), len(top3))
         _save_picks(picks, today)
         _hunter_run_info["picks_count"] = len(top3)  # only top3, not express
 

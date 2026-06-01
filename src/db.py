@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from typing import Generator
+from urllib.parse import urlparse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -28,6 +30,18 @@ def _normalize_db_url(url: str) -> str:
 
 
 DATABASE_URL = _normalize_db_url(DATABASE_URL)
+parsed = urlparse(DATABASE_URL)
+logger.info(
+    "DB runtime host=%s db=%s driver=%s",
+    parsed.hostname or "(none)",
+    parsed.path or "",
+    parsed.scheme or "",
+)
+if parsed.hostname:
+    try:
+        logger.info("DB DNS host=%s ip=%s", parsed.hostname, socket.gethostbyname(parsed.hostname))
+    except Exception as e:
+        logger.exception("DB DNS resolve failed host=%s: %s", parsed.hostname, e)
 
 engine = create_engine(
     DATABASE_URL,
@@ -369,6 +383,15 @@ def init_db() -> None:
 
         if _is_postgres():
             _bootstrap_migrations_postgres()
+
+        with engine.connect() as conn:
+            if _is_postgres():
+                exists = conn.execute(text("SELECT to_regclass('public.daily_picks') IS NOT NULL")).scalar()
+            else:
+                exists = conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_picks'")
+                ).scalar() is not None
+            logger.info("DB table daily_picks exists=%s", bool(exists))
 
         logger.info("DB initialized successfully.")
     except Exception as e:
