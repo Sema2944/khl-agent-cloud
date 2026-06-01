@@ -119,6 +119,15 @@ def _first_str(*vals: Any) -> str:
     return ""
 
 
+def _espn_tennis_draw_tour(name: str) -> str:
+    lower = str(name or "").lower()
+    if any(x in lower for x in ("women's", "womens", "women singles", "women doubles")):
+        return "WTA"
+    if any(x in lower for x in ("men's", "mens", "men singles", "men doubles")):
+        return "ATP"
+    return ""
+
+
 def _get_team_name(team_obj: Any, fallback: str) -> str:
     if isinstance(team_obj, dict):
         tr = team_obj.get("translations") or team_obj.get("translation") or {}
@@ -571,6 +580,15 @@ class SportAPIClient:
     ) -> List[MatchDTO]:
         """Extract tennis matches from an ESPN competitions array."""
         result: List[MatchDTO] = []
+        draw_tour = _espn_tennis_draw_tour(tournament)
+        if draw_tour and draw_tour != tour_name:
+            logger.warning(
+                "ESPN Tennis: dropped inconsistent draw endpoint=%s tournament=%r inferred=%s",
+                tour_name,
+                tournament,
+                draw_tour,
+            )
+            return result
         for comp in comps:
             try:
                 mid = str(comp.get("id") or ev.get("id") or "unknown")

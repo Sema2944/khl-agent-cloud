@@ -409,15 +409,13 @@ def _is_verified_match(m: Dict[str, Any]) -> bool:
     Guards against phantom/garbage entries that arrive when an API returns
     partial data (empty title, unknown match_id, etc.).
     """
-    title = (m.get("title") or "").strip()
     league = (m.get("league") or "").strip()
     match_id = (m.get("match_id") or "").strip()
 
-    # Must look like "Team A — Team B"
-    if " — " not in title:
+    home, away = _match_teams(m)
+    if not home or not away:
         return False
-    home, away = title.split(" — ", 1)
-    if not home.strip() or not away.strip():
+    if _is_placeholder_team(home) or _is_placeholder_team(away):
         return False
 
     # Must have a real league name
@@ -429,6 +427,52 @@ def _is_verified_match(m: Dict[str, Any]) -> bool:
         return False
 
     return True
+
+
+def _match_teams(m: Dict[str, Any]) -> tuple[str, str]:
+    home = str(m.get("home_team") or "").strip()
+    away = str(m.get("away_team") or "").strip()
+    if home and away:
+        return home, away
+
+    title = str(m.get("title") or "").strip()
+    parts = re.split(r"\s+(?:\u2014|\u2013|-|vs\.?|v)\s+", title, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return "", ""
+    return parts[0].strip(), parts[1].strip()
+
+
+def _is_placeholder_team(name: str) -> bool:
+    clean = re.sub(r"\s+", " ", str(name or "").strip()).lower()
+    return clean in {"", "tbd", "unknown", "none", "null", "n/a", "home", "away"}
+
+
+def _match_dedupe_key(m: Dict[str, Any]) -> tuple[str, str, str]:
+    home, away = _match_teams(m)
+    start_time = str(m.get("start_time") or "").strip()
+    return (home.casefold(), away.casefold(), start_time)
+
+
+def _dedupe_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[tuple[str, str, str]] = set()
+    out: List[Dict[str, Any]] = []
+    duplicates = 0
+    for m in matches:
+        key = _match_dedupe_key(m)
+        if key in seen:
+            duplicates += 1
+            logger.debug(
+                "Hunter filter: duplicate match dropped title=%r league=%r start=%r",
+                m.get("title", "")[:80],
+                m.get("league", ""),
+                m.get("start_time", ""),
+            )
+            continue
+        seen.add(key)
+        out.append(m)
+    if duplicates:
+        logger.warning("Hunter filter: dropped %d duplicate matches", duplicates)
+    return out
 
 
 async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
@@ -542,9 +586,9 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not _is_verified_match(m):
                 continue
             relaxed.append(m)
-        return relaxed
+        return _dedupe_matches(relaxed)
 
-    return result
+    return _dedupe_matches(result)
 
 
 # ---------------------------------------------------------------------------
