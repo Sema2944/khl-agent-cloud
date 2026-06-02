@@ -131,7 +131,7 @@ def _is_summer_friendlies_match(match: Dict[str, Any]) -> bool:
 def _cap_summer_friendlies_confidence(match: Dict[str, Any], confidence: float) -> float:
     if not match.get("_summer_mode") or not _is_summer_friendlies_match(match):
         return confidence
-    return min(0.70, max(0.55, confidence))
+    return min(0.65, max(0.55, confidence))
 
 
 def _safe_float(v: Any) -> float:
@@ -181,6 +181,7 @@ def _extract_hour_msk(start_time: str) -> Optional[int]:
 _WATCH_ONLY_RECOMMENDATIONS = {
     "пропуск ставки / только наблюдение",
     "ai-анализ без ставки",
+    "watch",
 }
 
 
@@ -282,6 +283,7 @@ _HUNTER_ANALYSIS_PROMPT = """Ты — AI-аналитик спортивных �
 Время: {start_time}
 Коэффициенты: {odds_text}
 {context_text}{line_movement_text}
+{summer_mode_instruction}
 ЗАДАЧА:
 1. Дай одну КОНКРЕТНУЮ рекомендацию (П1, П2, X, ТБ N, ТМ N, или комбинацию)
 2. Объясни в 2-3 предложениях ПОЧЕМУ — {analysis_basis}
@@ -855,6 +857,11 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
         odds_text=odds_text,
         context_text=context_text,
         line_movement_text=line_movement_text,
+        summer_mode_instruction=(
+            "SUMMER MODE: это товарищеский матч. Если нет коэффициентов/формы, НЕ придумывай ставку "
+            "и НЕ придумывай коэффициенты. Разрешено вернуть recommendation=\"WATCH\", rec_odds=0, "
+            "confidence от 0.55 до 0.65 и короткий комментарий, почему матч только для наблюдения.\n"
+        ) if match.get("_summer_mode") else "",
         analysis_basis=analysis_basis,
         context_instruction=context_instruction,
         context_bias_guard=context_bias_guard,
@@ -910,6 +917,18 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
             # Fallback: extract from odds if still empty
             if not recommendation:
                 recommendation = _extract_rec_from_odds(odds_parsed)
+
+            if match.get("_summer_mode"):
+                if not recommendation:
+                    recommendation = "WATCH"
+                    rec_odds = 0
+                if recommendation.upper() == "WATCH":
+                    rec_odds = 0
+                    if not summary:
+                        summary = (
+                            "Товарищеский матч. Недостаточно данных для ставки. "
+                            "Интерес представляет проверка состава и мотивации сборных."
+                        )
 
             # Adjust confidence based on line movement
             try:
