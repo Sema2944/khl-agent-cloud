@@ -46,7 +46,13 @@ _hunter_run_info: Dict[str, Any] = {
 
 HUNTER_SPORTS = ["football", "basketball", "ice-hockey"]
 
-_HUNTER_EXCLUDED_LEAGUE_KEYWORDS = ("friendly", "friendlies", "women", "youth", "u18", "u20", "u21")
+_HUNTER_FRIENDLIES_KEYWORDS = ("friendly", "friendlies")
+_HUNTER_EXCLUDED_LEAGUE_KEYWORDS = ("women", "youth", "u18", "u20", "u21")
+_HUNTER_RU_FOOTBALL_SUMMER_LEAGUES = {
+    "rpl": ("рпл", "rpl", "russian premier"),
+    "fnl": ("фнл", "first league"),
+    "cup": ("кубок россии", "russian cup"),
+}
 
 # ---------------------------------------------------------------------------
 # TOP LEAGUES — only matches from these leagues are eligible for Hunter
@@ -93,6 +99,39 @@ def _is_top_league(sport: str, league: str) -> bool:
     lg = (league or "").lower()
     keywords = TOP_LEAGUES_KEYWORDS.get(sport, [])
     return any(kw in lg for kw in keywords)
+
+
+def _is_not_started_status(status: str) -> bool:
+    return (status or "") in {"notstarted", "scheduled", "fixture", "ns", ""}
+
+
+def _is_friendlies_league(league: str) -> bool:
+    lg = (league or "").lower()
+    return any(x in lg for x in _HUNTER_FRIENDLIES_KEYWORDS)
+
+
+def _summer_mode_ru_football_counts(matches: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {key: 0 for key in _HUNTER_RU_FOOTBALL_SUMMER_LEAGUES}
+    for m in matches:
+        if m.get("sport_slug") != "football":
+            continue
+        if not _is_not_started_status(m.get("status", "")):
+            continue
+        league = (m.get("league") or "").lower()
+        for key, keywords in _HUNTER_RU_FOOTBALL_SUMMER_LEAGUES.items():
+            if any(kw in league for kw in keywords):
+                counts[key] += 1
+    return counts
+
+
+def _is_summer_friendlies_match(match: Dict[str, Any]) -> bool:
+    return match.get("sport_slug") == "football" and _is_friendlies_league(match.get("league", ""))
+
+
+def _cap_summer_friendlies_confidence(match: Dict[str, Any], confidence: float) -> float:
+    if not match.get("_summer_mode") or not _is_summer_friendlies_match(match):
+        return confidence
+    return min(0.70, max(0.55, confidence))
 
 
 def _safe_float(v: Any) -> float:
@@ -524,6 +563,12 @@ async def _fetch_all_matches_today() -> List[Dict[str, Any]]:
 def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep only scheduled matches from top leagues with verified minimum fields."""
     result = []
+    summer_counts = _summer_mode_ru_football_counts(matches)
+    summer_mode = all(v == 0 for v in summer_counts.values())
+    logger.info(
+        "Hunter Summer Mode: rpl=%d fnl=%d cup=%d enabled=%s",
+        summer_counts["rpl"], summer_counts["fnl"], summer_counts["cup"], summer_mode,
+    )
     # Diagnostic counters per sport
     sport_raw: Dict[str, int] = {}
     sport_filtered: Dict[str, int] = {}
@@ -537,12 +582,15 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         sport_raw[sport] = sport_raw.get(sport, 0) + 1
 
         # Only pre-match (not started)
-        if status not in {"notstarted", "scheduled", "fixture", "ns", ""}:
+        if not _is_not_started_status(status):
             sport_status_skip[sport] = sport_status_skip.get(sport, 0) + 1
             continue
 
         # Skip friendlies, women, youth
+        summer_friendlies = summer_mode and _is_summer_friendlies_match(m)
         if any(x in league for x in _HUNTER_EXCLUDED_LEAGUE_KEYWORDS):
+            continue
+        if _is_friendlies_league(league) and not summer_friendlies:
             continue
 
         # Guardrail: skip matches without verified minimum fields
@@ -553,9 +601,11 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         # Top-league filter
-        if not _is_top_league(sport, m.get("league", "")):
+        if not summer_friendlies and not _is_top_league(sport, m.get("league", "")):
             continue
 
+        if summer_friendlies:
+            m["_summer_mode"] = True
         result.append(m)
         sport_filtered[sport] = sport_filtered.get(sport, 0) + 1
 
@@ -580,13 +630,18 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for m in matches:
             status = m.get("status", "")
             league = (m.get("league") or "").lower()
-            if status not in {"notstarted", "scheduled", "fixture", "ns", ""}:
+            if not _is_not_started_status(status):
                 continue
+            summer_friendlies = summer_mode and _is_summer_friendlies_match(m)
             if any(x in league for x in _HUNTER_EXCLUDED_LEAGUE_KEYWORDS):
+                continue
+            if _is_friendlies_league(league) and not summer_friendlies:
                 continue
             # Keep verified guard even in relaxed mode
             if not _is_verified_match(m):
                 continue
+            if summer_friendlies:
+                m["_summer_mode"] = True
             relaxed.append(m)
         return _dedupe_matches(relaxed)
 
@@ -866,6 +921,14 @@ async def _ai_analyze_match(match: Dict[str, Any]) -> Dict[str, Any]:
                                 adj, match.get("title", "")[:30])
             except Exception:
                 pass
+
+            capped_confidence = _cap_summer_friendlies_confidence(match, confidence)
+            if capped_confidence != confidence:
+                logger.info(
+                    "Hunter Summer Mode: capped friendly confidence %.2f -> %.2f for %s",
+                    confidence, capped_confidence, match.get("title", "")[:30],
+                )
+                confidence = capped_confidence
 
             logger.info("Hunter AI result: %s → conf=%.2f rec=%r odds=%.2f",
                         match.get("title", "")[:30], confidence, recommendation, rec_odds)
