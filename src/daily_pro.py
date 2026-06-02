@@ -1192,6 +1192,13 @@ def _format_hunter_message(picks: List[Dict[str, Any]], pick_date: date) -> str:
     if watch_only:
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append("👀 Матчи для наблюдения")
+        if any(_is_friendlies_league(p.get("league", "")) for p in watch_only):
+            lines.append(
+                "Товарищеские матчи менее предсказуемы: возможна ротация составов, "
+                "эксперименты тренеров и низкая мотивация. AI показывает их для наблюдения, "
+                "но не включает в ТОП-ставки без сильного сигнала."
+            )
+            lines.append("")
         for p in watch_only[:3]:
             emoji = SPORT_EMOJI.get(p.get("sport_slug", ""), "🏆")
             title = p.get("title", "Матч")

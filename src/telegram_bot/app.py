@@ -562,6 +562,13 @@ def _format_hunter_picks_text(picks: list, in_trial: bool = False) -> str:
     if watch_only:
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
         lines.append("👀 Матчи для наблюдения")
+        if any("friendly" in (p.get("league", "") or "").lower() or "friendlies" in (p.get("league", "") or "").lower() for p in watch_only):
+            lines.append(
+                "Товарищеские матчи менее предсказуемы: возможна ротация составов, "
+                "эксперименты тренеров и низкая мотивация. AI показывает их для наблюдения, "
+                "но не включает в ТОП-ставки без сильного сигнала."
+            )
+            lines.append("")
         for p in watch_only[:3]:
             emoji = _HUNTER_SPORT_EMOJI.get(p.get("sport_slug", ""), "🏆")
             title = (p.get("title") or "Матч")[:50]
