@@ -64,6 +64,8 @@ SPORTS_CONFIG: Dict[str, Dict[str, Any]] = {
             94:  {"name": "Primeira Liga", "flag": "🇵🇹", "country": "Португалия", "season": 2025, "priority": 2},
             # Нидерланды
             88:  {"name": "Eredivisie", "flag": "🇳🇱", "country": "Нидерланды", "season": 2025, "priority": 2},
+            # National teams friendlies: display in schedule/LIVE, filtered out from Hunter/PRO.
+            10:  {"name": "Friendlies",       "flag": "🌍", "country": "International", "season": 2026, "priority": 3},
             # ── Летние лиги (hotfix 31.05.2026) ─────────────────────────────
             # Европейские топ-лиги в паузе (май–август). Скандинавские лиги
             # используют calendar year (season=2026), не осень-весна.

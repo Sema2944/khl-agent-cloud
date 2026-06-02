@@ -46,6 +46,8 @@ _hunter_run_info: Dict[str, Any] = {
 
 HUNTER_SPORTS = ["football", "basketball", "ice-hockey"]
 
+_HUNTER_EXCLUDED_LEAGUE_KEYWORDS = ("friendly", "friendlies", "women", "youth", "u18", "u20", "u21")
+
 # ---------------------------------------------------------------------------
 # TOP LEAGUES — only matches from these leagues are eligible for Hunter
 # ---------------------------------------------------------------------------
@@ -540,7 +542,7 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         # Skip friendlies, women, youth
-        if any(x in league for x in ["friendly", "women", "youth", "u18", "u20", "u21"]):
+        if any(x in league for x in _HUNTER_EXCLUDED_LEAGUE_KEYWORDS):
             continue
 
         # Guardrail: skip matches without verified minimum fields
@@ -580,7 +582,7 @@ def _filter_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             league = (m.get("league") or "").lower()
             if status not in {"notstarted", "scheduled", "fixture", "ns", ""}:
                 continue
-            if any(x in league for x in ["friendly", "women", "youth", "u18", "u20", "u21"]):
+            if any(x in league for x in _HUNTER_EXCLUDED_LEAGUE_KEYWORDS):
                 continue
             # Keep verified guard even in relaxed mode
             if not _is_verified_match(m):
